@@ -28,9 +28,7 @@ class UserSerializer(serializers.ModelSerializer):
           raise serializers.ValidationError("This email is already registered.")
       return value
   
-  
-class PendingUserSerializer(serializers.ModelSerializer):
+class PendingInviteSerializer(serializers.ModelSerializer):
     class Meta:
         model = PendingInvite
-        fields = ('id','email','token','company','department','role','status','created_at','expires_at')
-        read_only_fields = ('token','status','created_at','expires_at')
+        fields = ['email', 'department', 'role']

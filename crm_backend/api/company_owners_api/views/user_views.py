@@ -1,5 +1,5 @@
 from rest_framework import viewsets,status
-from ..serializers.user_serializers import UserSerializer,PendingUserSerializer
+from ..serializers.user_serializers import UserSerializer,PendingInviteSerializer
 from rest_framework.decorators import action
 from users.models import PendingInvite
 from utils.api_response import api_response
@@ -12,6 +12,13 @@ from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
 from django.utils.crypto import get_random_string
 from rest_framework.decorators import action
+from utils.Invitation_email import send_invitation_email
+from company.models import Company
+from django.shortcuts import get_object_or_404
+from datetime import timedelta
+from users.models import CompanyUserProfile
+from company.models import Company
+from django.utils import timezone
 
 User = get_user_model()
 class AuthViewSet(viewsets.ViewSet):
@@ -126,49 +133,107 @@ class AuthViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def send_invite(self, request):
-        serializer = PendingUserSerializer(data=request.data)
+        serializer = PendingInviteSerializer(data=request.data)
         if not serializer.is_valid():
             return api_response(
-                message='Inviation Failed',
+                message='Invitation Failed',
                 status_code=status.HTTP_400_BAD_REQUEST,
                 success=False,
                 errors=serializer.errors
             )
-        email = request.data.get('email')
-        company_id = request.data.get('company_id')
-        department_id = request.data.get('department_id')
-        role = request.data.get('role')
+        print(request.user)
+        company_owner = Company.objects.filter(owner=request.user).first()
+        dept_leader = CompanyUserProfile.objects.filter(user=request.user).first()
 
-        if User.objects.filter(email=email).exists():
+        # Check permission: must be either owner or department leader
+        if not company_owner and not (dept_leader and dept_leader.role == CompanyUserProfile.Role.DEPARTMENT_LEADER):
             return api_response(
-                message="Invalid refresh token",
+                message="Sorry, you don't have permission to send invitations.",
                 status_code=status.HTTP_400_BAD_REQUEST,
                 success=False,
-                errors={"error":"User with this email already exists"}
+                errors={"error": "You don't have permission to add a new user."}
             )
 
+        # Decide the company from whichever user type matched
+        current_user_company = company_owner or (dept_leader.company if dept_leader else None)
+
+        
+        validated = serializer.validated_data
+        email = validated['email']
+        company = current_user_company
+        department = validated.get('department')
+        role = validated['role']
+        if CompanyUserProfile.objects.filter(user__email=email).exists() :
+            return api_response(
+                message="the user is already registered for this company",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                success=False,
+                errors={"error": "User with this email already exists in the company."}
+            )
+
+        if PendingInvite.objects.filter(email=email).exists():
+            pendingEmployee = PendingInvite.objects.filter(email=email).order_by('created_at').first()
+            print(pendingEmployee.is_expired())
+            if pendingEmployee and not pendingEmployee.is_expired():
+                return api_response(
+                    message="Invitation already sent for this email.",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    errors={"error": "Invitation already sent for this email and not expired yet."}
+                )
+
+
+            else :
+                token = get_random_string(length=48)
+
+                invite = PendingInvite.objects.create(
+                    email=email,
+                    token=token,
+                    company=company,
+                    department=department,
+                    role=role,
+                    status=PendingInvite.Status.Pending
+                )
+
+                invite_link = f"http://your-frontend.com/invite/accept?token={invite.token}"
+
+                send_invitation_email(
+                    email_recipient=email,
+                    inviter_name=request.user.get_username() or request.user.username,
+                    company_name=company.name,
+                    invitation_link=invite_link
+                )
+
+                return api_response(
+                    message="Invitation Sent Successfully",
+                    status_code=status.HTTP_200_OK,
+                    success=True,
+                    data={"email": invite.email, "token": invite.token}
+                )
+        
         token = get_random_string(length=48)
 
         invite = PendingInvite.objects.create(
             email=email,
             token=token,
-            company_id=company_id,
-            department_id=department_id,
-            role=role
+            company=company,
+            department=department,
+            role=role,
+            status=PendingInvite.Status.Pending
         )
 
         invite_link = f"http://your-frontend.com/invite/accept?token={invite.token}"
 
-        send_mail(
-            subject="You're invited to join a company on Workroom",
-            message=f"Click the link to join: {invite_link}",
-            from_email="noreply@workroom.com",
-            recipient_list=[email]
+        send_invitation_email(
+            email_recipient=email,
+            inviter_name=request.user.get_username() or request.user.username,
+            company_name=company.name,
+            invitation_link=invite_link
         )
-        
+
         return api_response(
-            message="Invalid refresh token",
-            status_code=status.HTTP_400_BAD_REQUEST,
-            success=False,
-            data=f"Invitation sent successfully to {invite.email}."
+            message="Invitation Sent Successfully",
+            status_code=status.HTTP_200_OK,
+            success=True,
+            data={"email": invite.email, "token": invite.token}
         )

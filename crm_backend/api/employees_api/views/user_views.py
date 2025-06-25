@@ -7,18 +7,19 @@ from django.contrib.auth import get_user_model
 from rest_framework.decorators import action
 from company.models import Company
 from users.models import CompanyUserProfile
+from rest_framework.permissions import AllowAny
 
 User = get_user_model()
 class AuthViewSet(viewsets.ViewSet):
 
-  @action(detail=False, methods=["post"])
+  @action(detail=False, methods=["post"],permission_classes=[AllowAny],authentication_classes=[])
   def accept_invite(self, request):
       token = request.data.get('token')
       password = request.data.get('password')
       username = request.data.get('username')
 
       try:
-          invite = PendingInvite.objects.get(token=token, status='pending')
+          invite = PendingInvite.objects.get(token=token, status='Pending')
       except PendingInvite.DoesNotExist:
             return api_response(
                 message="Invalid refresh token",
@@ -49,7 +50,7 @@ class AuthViewSet(viewsets.ViewSet):
       invite.save()
 
       return  api_response(
-                message="Invalid refresh token",
+                message="User registered successfully!!!",
                 status_code=status.HTTP_400_BAD_REQUEST,
                 success=False,
                 data=f"Successfully Registered"

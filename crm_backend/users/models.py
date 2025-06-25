@@ -60,6 +60,8 @@ class CompanyUserProfile(models.Model):
     def __str__(self):
         return f"{self.user.username} ({self.company.name})"
 
+def default_expiration():
+    return timezone.now() + timedelta(days=2)
 
 class PendingInvite(models.Model):
     class Role(models.TextChoices):
@@ -78,10 +80,10 @@ class PendingInvite(models.Model):
     role = models.CharField(max_length=200, choices=Role.choices, default=Role.Owner)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.Pending)
     created_at = models.DateTimeField(auto_now_add=True)
-    expires_at = models.DateTimeField(default=timezone.now() + timedelta(days=2))  # 2-day expiry
+    expires_at = models.DateTimeField(default=default_expiration)  
 
     def is_expired(self):
-        return timezone.now() > self.expires_at
+        return timezone.now() >= self.expires_at
 
     def __str__(self):
         return f"{self.email} - {self.company.name} - {self.status}"

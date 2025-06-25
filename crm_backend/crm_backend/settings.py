@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import environ
 import dj_database_url
+from datetime import timedelta
 # Initialize environ
 env = environ.Env(
     # Set casting and default values
@@ -85,7 +86,7 @@ ROOT_URLCONF = 'crm_backend.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -160,6 +161,10 @@ REST_FRAMEWORK = {
     'PAGE_SIZE': 10,
     'DEFAULT_SCHEMA_CLASS': 'rest_framework.schemas.coreapi.AutoSchema',
 }
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=50),
+    # 'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+}
 
 # CORS settings
 CORS_ALLOWED_ORIGINS = env('CORS_ALLOWED_ORIGINS')
@@ -168,3 +173,10 @@ CORS_ALLOWED_ORIGINS = env('CORS_ALLOWED_ORIGINS')
 STRIPE_PUBLISHABLE_KEY = env('STRIPE_PUBLISHABLE_KEY')
 STRIPE_SECRET_KEY = env('STRIPE_SECRET_KEY')
 STRIPE_WEBHOOK_SECRET = env('STRIPE_WEBHOOK_SECRET') 
+
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_HOST_USER = env('COMPANY_EMAIL')
+EMAIL_HOST_PASSWORD = env('EMAIL_PASSWORD')
+EMAIL_PORT = env('EMAIL_PORT')
+EMAIL_USE_TLS = True
