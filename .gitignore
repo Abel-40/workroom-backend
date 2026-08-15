@@ -52,3 +52,10 @@ coverage.xml
 # System
 .DS_Store
 Thumbs.db
+
+CLAUDE.md
+ARCHITECTURE.md
+DEVELOPMENT_RULES.md
+IMPLEMENTATION_PLAN.md
+V1_SCOPE.md
+AI_SERVICE_SPEC.md

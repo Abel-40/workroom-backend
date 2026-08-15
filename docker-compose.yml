@@ -1,0 +1,8 @@
+services:
+  crud-bd:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    image: crud-bd:v1
+    
+    

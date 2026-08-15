@@ -1,3 +1,4 @@
+from django.conf import settings
 from rest_framework import viewsets,status
 from ..serializers.user_serializers import UserSerializer,PendingInviteSerializer
 from rest_framework.decorators import action
@@ -84,8 +85,8 @@ class AuthViewSet(viewsets.ViewSet):
             key='refresh_token',
             value=str(refresh),
             httponly=True,
-            secure=True,
-            samesite='Strict',
+            secure=not settings.DEBUG,
+            samesite='Lax',
         )
         return response
 
@@ -114,10 +115,10 @@ class AuthViewSet(viewsets.ViewSet):
             
             response.set_cookie(
                 key='refresh_token',
-                value=str(refresh), 
+                value=str(refresh),
                 httponly=True,
-                secure=True,
-                samesite='Strict',
+                secure=not settings.DEBUG,
+                samesite='Lax',
                 max_age=7*24*60*60
             )
 
