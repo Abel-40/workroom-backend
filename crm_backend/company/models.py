@@ -3,15 +3,16 @@ from django.conf import settings
 from django.utils import timezone
 from datetime import timedelta
 from plans.models import Plan
+from utils.models import UUIDModel
 
-class Sector(models.Model):
+class Sector(UUIDModel):
     name = models.CharField(max_length=100, unique=True)
     description = models.TextField(blank=True)
-    
+
     def __str__(self):
         return self.name
 
-class Company(models.Model):
+class Company(UUIDModel):
     SECTOR_CHOICES = [
         ('software', 'Software'),
         ('finance', 'Finance'),
@@ -29,7 +30,13 @@ class Company(models.Model):
         on_delete=models.CASCADE,
         related_name='owned_company'
     )
-    sector = models.OneToOneField(Sector,on_delete=models.SET_NULL,blank=True,null=True)
+    sector = models.ForeignKey(
+        Sector,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='companies',
+    )
     
     # Subscription-related fields
     plan = models.ForeignKey(Plan, on_delete=models.SET_NULL, null=True, blank=True)

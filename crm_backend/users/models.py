@@ -4,6 +4,7 @@ from django.conf import settings
 import uuid
 from django.utils import timezone
 from datetime import timedelta
+from utils.models import UUIDModel
 class UserManger(BaseUserManager):
   def create_user(self,email,password,username):
     if email is None:
@@ -24,6 +25,7 @@ class UserManger(BaseUserManager):
     return user
   
 class User(AbstractUser):
+  id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
   email = models.EmailField(unique=True,max_length=200)
   username = models.CharField(max_length=100,unique=False)
   USERNAME_FIELD = "email"
@@ -33,7 +35,7 @@ class User(AbstractUser):
     return self.username
   
 
-class CompanyUserProfile(models.Model):
+class CompanyUserProfile(UUIDModel):
       
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='company_profiles')
     company = models.ForeignKey('company.Company', on_delete=models.CASCADE, related_name='company_user_profiles')
@@ -63,7 +65,7 @@ class CompanyUserProfile(models.Model):
 def default_expiration():
     return timezone.now() + timedelta(days=2)
 
-class PendingInvite(models.Model):
+class PendingInvite(UUIDModel):
     class Role(models.TextChoices):
         Owner = 'Owner', 'Owner'
         DEPARTMENT_LEADER = 'DL', 'Department Leader'

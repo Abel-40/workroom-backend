@@ -5,7 +5,8 @@ serialization on Pydantic.  Keep HTTP payload types here, separate from Django
 ORM models and business logic.
 """
 
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
 from ninja import Schema
 from pydantic import Field
@@ -33,22 +34,27 @@ class SignInIn(Schema):
 
 
 class CompanyRegistrationIn(Schema):
+    """``owner`` is intentionally absent: ownership is derived from the
+    authenticated request, never accepted from the client (see Rule 3)."""
+
     name: str = Field(min_length=1, max_length=255)
-    owner: int = Field(gt=0)
-    sector: int = Field(gt=0)
+    sector: UUID
 
 
 class SelectionIn(Schema):
-    company_id: int = Field(gt=0)
-    selected_types: list[int] = Field(default_factory=list)
+    company_id: UUID
+    selected_types: list[UUID] = Field(default_factory=list)
     use_all_default_task_types: bool = False
     use_all_default_departments: bool = False
 
 
 class InviteIn(Schema):
+    """``role`` excludes 'Owner': a company has exactly one owner, established
+    at registration, and invitations must not be able to mint a second one."""
+
     email: str = Field(min_length=3, max_length=254)
-    department: int | None = Field(default=None, gt=0)
-    role: str = Field(default='Owner', max_length=200)
+    department: UUID | None = None
+    role: Literal['DL', 'DM'] = 'DM'
 
 
 class AcceptInviteIn(Schema):
@@ -58,4 +64,4 @@ class AcceptInviteIn(Schema):
 
 
 class CheckoutIn(Schema):
-    plan_id: int = Field(gt=0)
+    plan_id: UUID

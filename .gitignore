@@ -21,6 +21,7 @@ Pipfile.lock
 # VSCode & PyCharm
 .vscode/
 .idea/
+tempCodeRunnerFile.py
 
 # virtual env
 venv/
@@ -28,10 +29,6 @@ venv/
 # Static and media
 staticfiles/
 media/
-
-# Migrations (optional to ignore if you recreate them often)
-**/migrations/
-!**/migrations/__init__.py
 
 # Coverage reports
 htmlcov/

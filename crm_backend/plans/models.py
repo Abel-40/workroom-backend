@@ -1,7 +1,8 @@
 from django.db import models
+from utils.models import UUIDModel
 
 # Create your models here.
-class Plan(models.Model):
+class Plan(UUIDModel):
     """Predefined subscription plans created by the SaaS owner"""
     name = models.CharField(max_length=100, unique=True)
     price = models.DecimalField(max_digits=8, decimal_places=2, default=0.00)

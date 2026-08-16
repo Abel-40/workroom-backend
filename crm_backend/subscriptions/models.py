@@ -1,7 +1,8 @@
 from django.db import models
 from django.utils import timezone
+from utils.models import UUIDModel
 
-class Subscription(models.Model):
+class Subscription(UUIDModel):
     STATUS_CHOICES = [
         ('trialing', 'Trialing'),
         ('active', 'Active'),

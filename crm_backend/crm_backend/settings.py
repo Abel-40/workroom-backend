@@ -11,16 +11,19 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import os
-from pathlib import Path
-import environ
-import dj_database_url
 from datetime import timedelta
+from pathlib import Path
+
+import dj_database_url
+import environ
+
 # Initialize environ
 env = environ.Env(
     # Set casting and default values
     DEBUG=(bool, False),
     ALLOWED_HOSTS=(list, ['localhost', '127.0.0.1', '0.0.0.0']),
     CORS_ALLOWED_ORIGINS=(list, ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:5173', 'http://127.0.0.1:5173']),
+    CSRF_TRUSTED_ORIGINS=(list, ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:5173', 'http://127.0.0.1:5173']),
 )
 
 # Read .env file
@@ -107,6 +110,9 @@ WSGI_APPLICATION = 'crm_backend.wsgi.application'
 DATABASES = {
     'default': dj_database_url.parse(env('DATABASE_URL'))
 }
+# Async Django views should not retain persistent connections. Let the database
+# driver/pool manage connections instead.
+DATABASES['default']['CONN_MAX_AGE'] = 0
 
 
 # Password validation
@@ -168,17 +174,38 @@ SIMPLE_JWT = {
 # CORS settings
 CORS_ALLOWED_ORIGINS = env('CORS_ALLOWED_ORIGINS')
 CORS_ALLOW_CREDENTIALS = True
-CSRF_TRUSTED_ORIGINS = [
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    'http://localhost:5173',
-    'http://127.0.0.1:5173',
-]
+CSRF_TRUSTED_ORIGINS = env('CSRF_TRUSTED_ORIGINS')
+
+# Production security settings. DEBUG must be explicitly false via env in any
+# real deployment; these only take effect there so local HTTP development is
+# unaffected. Full deployment hardening (rate limiting, HSTS tuning, reverse
+# proxy headers, etc.) is completed in Phase 11.
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_BROWSER_XSS_FILTER = True
+    X_FRAME_OPTIONS = 'DENY'
+    SECURE_HSTS_SECONDS = 60 * 60 * 24 * 7
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
 
 # Stripe settings
 STRIPE_PUBLISHABLE_KEY = env('STRIPE_PUBLISHABLE_KEY')
 STRIPE_SECRET_KEY = env('STRIPE_SECRET_KEY')
 STRIPE_WEBHOOK_SECRET = env('STRIPE_WEBHOOK_SECRET') 
+
+# Celery / Redis. Transport only -- Django owns all authoritative state
+# (DEVELOPMENT_RULES Rule 5); a task can run twice, so task bodies must stay
+# idempotent (Rule 8).
+CELERY_BROKER_URL = env('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = env('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TASK_ALWAYS_EAGER = env.bool('CELERY_TASK_ALWAYS_EAGER', default=False)
+CELERY_TASK_EAGER_PROPAGATES = True
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'
