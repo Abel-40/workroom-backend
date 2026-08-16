@@ -142,6 +142,9 @@ class Task(UUIDModel):
     priority = models.CharField(max_length=20, choices=PRIORITY.choices, default=PRIORITY.MEDIUM)
     estimated_time = models.DurationField(blank=True, null=True)
     spent_time = models.DurationField(blank=True, null=True)
+    # Logical ordering only (e.g. AI-suggested sequence); not a dependency
+    # graph -- V1 doesn't model task-to-task dependencies.
+    sequence = models.PositiveIntegerField(default=0)
     is_deleted = models.BooleanField(default=False)
 
     def __str__(self):

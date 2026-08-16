@@ -207,6 +207,12 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TASK_ALWAYS_EAGER = env.bool('CELERY_TASK_ALWAYS_EAGER', default=False)
 CELERY_TASK_EAGER_PROPAGATES = True
 
+# FastAPI AI service (Phase 6/7). Django never calls this synchronously from
+# a request -- only the Celery worker does (ai_agent/tasks.py).
+WORKROOM_AI_SERVICE_URL = env('WORKROOM_AI_SERVICE_URL', default='http://localhost:8001')
+WORKROOM_AI_SERVICE_TOKEN = env('WORKROOM_AI_SERVICE_TOKEN', default='')
+WORKROOM_AI_SERVICE_TIMEOUT = env.float('WORKROOM_AI_SERVICE_TIMEOUT', default=90.0)
+
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'
 EMAIL_HOST_USER = env('COMPANY_EMAIL')

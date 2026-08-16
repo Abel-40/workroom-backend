@@ -14,6 +14,7 @@ from company.models import Company, Sector
 from departments_and_teams.models import Department
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
+from notifications_and_activity.models import Notification
 from rest_framework_simplejwt.tokens import RefreshToken
 from users.models import CompanyUserProfile, PendingInvite, User
 
@@ -366,3 +367,57 @@ class AIGenerationSecurityTests(TwoCompanyTestCase):
         generation_id = created.json()['data']['generation']['id']
         response = self.client.get(f'/api/ai/generations/{generation_id}/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
+
+
+class NotificationTests(TwoCompanyTestCase):
+    """Phase 9: notification isolation and the events that create one."""
+
+    def test_user_cannot_see_another_users_notifications(self):
+        Notification.objects.create(recipient=self.owner_a, type=Notification.Type.TASK_ASSIGNED, title='For A only')
+        response = self.client.get('/api/notifications/', **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['meta']['count'], 0)
+
+    def test_user_cannot_mark_another_users_notification_as_read(self):
+        notification = Notification.objects.create(
+            recipient=self.owner_a, type=Notification.Type.TASK_ASSIGNED, title='For A only',
+        )
+        response = self.client.post(f'/api/notifications/{notification.id}/read/', **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 404)
+        notification.refresh_from_db()
+        self.assertFalse(notification.is_read)
+
+    def test_task_assignment_notifies_the_assignee(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/projects/{project['id']}/tasks/", json.dumps({'title': 'Build login page'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertTrue(Notification.objects.filter(
+            recipient=self.member_a, type=Notification.Type.TASK_ASSIGNED,
+        ).exists())
+
+    def test_task_completion_notifies_the_creator_but_not_the_assignee_completing_it(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/projects/{project['id']}/tasks/", json.dumps({'title': 'Build login page'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertTrue(Notification.objects.filter(
+            recipient=self.owner_a, type=Notification.Type.TASK_COMPLETED,
+        ).exists())
+        self.assertFalse(Notification.objects.filter(
+            recipient=self.member_a, type=Notification.Type.TASK_COMPLETED,
+        ).exists())

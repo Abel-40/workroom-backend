@@ -5,10 +5,17 @@ server-side company/role state (see company.services) rather than trusting
 any client-supplied company/project/department id at face value.
 """
 
+import re
+import uuid
+from datetime import timedelta
+
+from asgiref.sync import sync_to_async
 from company.services import get_company_role, get_member_company, is_company_member
 from departments_and_teams.models import Department, Team
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.db.models import Q
+from notifications_and_activity.services import notify_task_assigned, notify_task_completed
 from users.models import CompanyUserProfile
 
 from .models import Attachment, Project, Task, TaskType
@@ -279,6 +286,8 @@ async def assign_task(user, task, assignee_id):
         return None, error
     task.assigned_to = assignee
     await task.asave(update_fields=['assigned_to', 'updated_at'])
+    if assignee is not None:
+        await sync_to_async(notify_task_assigned, thread_sensitive=True)(task)
     return task, None
 
 
@@ -287,8 +296,11 @@ async def update_task_status(user, task, status):
         return None, 'forbidden'
     if status not in Task.STATUS.values:
         return None, 'invalid_status'
+    was_done = task.status == Task.STATUS.DONE
     task.status = status
     await task.asave(update_fields=['status', 'updated_at'])
+    if status == Task.STATUS.DONE and not was_done:
+        await sync_to_async(notify_task_completed, thread_sensitive=True)(task)
     return task, None
 
 
@@ -298,6 +310,103 @@ async def archive_task(user, task) -> bool:
     task.is_deleted = True
     await task.asave(update_fields=['is_deleted'])
     return True
+
+
+# --------------------------------------------------------------------------
+# AI-generated task persistence (Phase 8)
+# --------------------------------------------------------------------------
+
+_EFFORT_PATTERN = re.compile(
+    r'^\s*(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|d|day|days|m|min|mins|minute|minutes)\s*$', re.IGNORECASE,
+)
+_EFFORT_UNITS = {
+    'h': 'hours', 'hr': 'hours', 'hrs': 'hours', 'hour': 'hours', 'hours': 'hours',
+    'd': 'days', 'day': 'days', 'days': 'days',
+    'm': 'minutes', 'min': 'minutes', 'mins': 'minutes', 'minute': 'minutes', 'minutes': 'minutes',
+}
+
+
+def _parse_estimated_effort(text: str):
+    """'4h' / '2 days' / '30m' -> timedelta, or None if unparseable.
+
+    Effort is auxiliary metadata, not structural: an unparseable value is
+    dropped rather than failing the whole generation over a formatting
+    quirk in one field.
+    """
+    if not text:
+        return None
+    match = _EFFORT_PATTERN.match(text)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = _EFFORT_UNITS[match.group(2).lower()]
+    return timedelta(**{unit: amount})
+
+
+def persist_ai_generated_tasks(generation, plan_data: dict) -> int:
+    """Validate an AI-generated plan against this company's real
+    department/task-type records and persist it as real Tasks
+    (source=AI_GENERATED). Runs in one transaction: either the whole plan
+    lands or none of it does. Raises ValueError on any structural problem --
+    Django re-validates independently of the AI service's own validation
+    (Rule 9), and the AI is never allowed to invent a department, task type,
+    or assignee that wasn't explicitly supplied to it.
+
+    Sync, not async: called from the sync Celery worker (ai_agent/tasks.py).
+    """
+    project = generation.project
+    tasks_data = plan_data.get('tasks') or []
+    if not tasks_data:
+        raise ValueError('AI service returned an empty task list.')
+
+    company_department_ids = set(Department.objects.filter(company=project.company).values_list('id', flat=True))
+    company_task_type_ids = set(TaskType.objects.filter(company=project.company).values_list('id', flat=True))
+
+    known_temp_ids = set()
+    for item in tasks_data:
+        if not item.get('temporary_id') or not item.get('title'):
+            raise ValueError('AI-generated task is missing temporary_id or title.')
+        known_temp_ids.add(item['temporary_id'])
+
+    to_create = []
+    for item in tasks_data:
+        for dep in item.get('dependency_ids') or []:
+            if dep not in known_temp_ids:
+                raise ValueError(f"Task '{item['temporary_id']}' references an unknown dependency id.")
+
+        department_id = None
+        raw_department_id = item.get('suggested_department_id')
+        if raw_department_id:
+            department_id = uuid.UUID(str(raw_department_id))
+            if department_id not in company_department_ids:
+                raise ValueError(f"Task '{item['temporary_id']}' suggested a department outside this company.")
+
+        task_type_id = None
+        raw_task_type_id = item.get('suggested_task_type_id')
+        if raw_task_type_id:
+            task_type_id = uuid.UUID(str(raw_task_type_id))
+            if task_type_id not in company_task_type_ids:
+                raise ValueError(f"Task '{item['temporary_id']}' suggested a task type outside this company.")
+
+        priority = item.get('priority') or Task.PRIORITY.MEDIUM
+        if priority not in Task.PRIORITY.values:
+            priority = Task.PRIORITY.MEDIUM
+
+        # assigned_to is intentionally never set here: the AI must not
+        # invent an assignee (CLAUDE.md AI Rules / Phase 8 rules).
+        to_create.append(Task(
+            project=project, department_id=department_id, task_type_id=task_type_id,
+            title=item['title'][:255], description=item.get('description') or '',
+            priority=priority, sequence=item.get('sequence') or 0,
+            estimated_time=_parse_estimated_effort(item.get('estimated_effort') or ''),
+            created_by=generation.requested_by, source=Task.SOURCE.AI_GENERATED,
+            deadline=project.deadline,
+        ))
+
+    with transaction.atomic():
+        Task.objects.bulk_create(to_create)
+
+    return len(to_create)
 
 
 # --------------------------------------------------------------------------

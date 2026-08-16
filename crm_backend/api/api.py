@@ -16,6 +16,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.http import JsonResponse
 from ninja import NinjaAPI
+from notifications_and_activity.services import notify_invitation_accepted
 from plans.models import Plan
 from projects_and_tasks.models import DefaultTaskType, TaskType
 from rest_framework_simplejwt.exceptions import TokenError
@@ -29,6 +30,7 @@ from utils.tokens import generate_token, hash_token
 from .auth import JWTBearerAuth
 from .routers.ai import router as ai_router
 from .routers.documents import router as documents_router
+from .routers.notifications import router as notifications_router
 from .routers.projects import router as projects_router
 from .routers.tasks import router as tasks_router
 from .schemas import (
@@ -58,6 +60,7 @@ api.add_router('/projects', projects_router)
 api.add_router('', tasks_router)
 api.add_router('', documents_router)
 api.add_router('', ai_router)
+api.add_router('/notifications', notifications_router)
 
 payload = api_response
 logger = logging.getLogger(__name__)
@@ -88,7 +91,9 @@ def accept_invite_in_transaction(token: str, password: str, username: str):
         CompanyUserProfile.objects.create(
             user=user, company=invite.company, department=invite.department, role=invite.role,
         )
+        company = invite.company
         invite.delete()
+        notify_invitation_accepted(user, company)
         return user, None
 
 
