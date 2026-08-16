@@ -1,5 +1,7 @@
 from django.core.management.base import BaseCommand
+
 from plans.models import Plan
+
 
 class Command(BaseCommand):
     help = "Seed default subscription plans into the Plan model"
@@ -61,6 +63,6 @@ class Command(BaseCommand):
         for plan_data in plans:
             plan, created = Plan.objects.get_or_create(name=plan_data["name"], defaults=plan_data)
             if created:
-                self.stdout.write(self.style.SUCCESS(f"✓ Created: {plan.name}"))
+                self.stdout.write(self.style.SUCCESS(f"Created: {plan.name}"))
             else:
-                self.stdout.write(self.style.WARNING(f"⟳ Already exists: {plan.name}"))
+                self.stdout.write(self.style.WARNING(f"Already exists: {plan.name}"))
