@@ -1,6 +1,8 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from .models import User, CompanyUserProfile,PendingInvite
+
+from .models import CompanyUserProfile, PendingInvite, User
+
 
 @admin.register(User)
 class CustomUserAdmin(UserAdmin):
@@ -30,4 +32,6 @@ class CompanyUserProfileAdmin(admin.ModelAdmin):
 
 @admin.register(PendingInvite)
 class PendingInviteAdmin(admin.ModelAdmin):
-    list_display = ('id','email','company','department','role','token','created_at','expires_at','status')
+    list_display = ('id', 'email', 'company', 'department', 'role', 'status', 'email_sent', 'created_at', 'expires_at')
+    list_filter = ('status', 'email_sent', 'role')
+    search_fields = ('email',)

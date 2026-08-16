@@ -6,6 +6,7 @@ coverage). Phases 1-5 add project/task/document/AI-generation coverage,
 focused on cross-tenant rejection over raw endpoint coverage.
 """
 
+import hashlib
 import json
 from unittest.mock import patch
 
@@ -14,7 +15,7 @@ from departments_and_teams.models import Department
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from rest_framework_simplejwt.tokens import RefreshToken
-from users.models import CompanyUserProfile, User
+from users.models import CompanyUserProfile, PendingInvite, User
 
 
 def auth_header(user):
@@ -123,6 +124,67 @@ class InvitationRoleTests(TestCase):
             content_type='application/json', **auth_header(self.outsider),
         )
         self.assertEqual(response.status_code, 403)
+
+
+class InvitationTokenSecurityTests(TestCase):
+    """utils.tokens: only a hash is ever persisted, and accepting an invite
+    must delete the row rather than leave an 'Accepted' one behind."""
+
+    def setUp(self):
+        sector = Sector.objects.create(name='Software')
+        self.owner = User.objects.create_user(email='owner@example.com', username='owner', password='Kx9#mQ2vLp8Z')
+        self.company = Company.objects.create(name='Acme', owner=self.owner, sector=sector)
+
+    def send_invite_and_get_raw_token(self, email='invitee@example.com'):
+        with patch('api.api.send_invitation_email') as mock_send:
+            self.client.post(
+                '/api/auth/send_invite/', {'email': email},
+                content_type='application/json', **auth_header(self.owner),
+            )
+        raw_token = mock_send.call_args.args[-1].split('token=')[-1]
+        return raw_token
+
+    def test_raw_token_is_never_stored_in_the_database(self):
+        raw_token = self.send_invite_and_get_raw_token()
+        invite = PendingInvite.objects.get(email='invitee@example.com')
+        self.assertNotEqual(invite.token_hash, raw_token)
+        self.assertEqual(invite.token_hash, hashlib.sha256(raw_token.encode()).hexdigest())
+
+    def test_accept_invite_rejects_wrong_token(self):
+        self.send_invite_and_get_raw_token()
+        response = self.client.post(
+            '/api/emp/accept_invite/',
+            {'token': 'not-the-real-token', 'password': 'Kx9#mQ2vLp8Z', 'username': 'invitee'},
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_accept_invite_deletes_the_pending_invite_row(self):
+        raw_token = self.send_invite_and_get_raw_token()
+        self.assertEqual(PendingInvite.objects.filter(email='invitee@example.com').count(), 1)
+        response = self.client.post(
+            '/api/emp/accept_invite/',
+            {'token': raw_token, 'password': 'Kx9#mQ2vLp8Z', 'username': 'invitee'},
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(PendingInvite.objects.filter(email='invitee@example.com').count(), 0)
+
+    def test_send_invite_sets_email_sent_true_on_success(self):
+        self.send_invite_and_get_raw_token()
+        invite = PendingInvite.objects.get(email='invitee@example.com')
+        self.assertTrue(invite.email_sent)
+
+    def test_send_invite_marks_email_sent_false_on_delivery_failure(self):
+        with patch('api.api.send_invitation_email', side_effect=RuntimeError('smtp down')):
+            response = self.client.post(
+                '/api/auth/send_invite/', {'email': 'invitee@example.com'},
+                content_type='application/json', **auth_header(self.owner),
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['data']['email_sent'])
+        invite = PendingInvite.objects.get(email='invitee@example.com')
+        self.assertFalse(invite.email_sent)
 
 
 class SignupPasswordValidationTests(TestCase):

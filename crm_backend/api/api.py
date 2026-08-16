@@ -1,5 +1,6 @@
 """Async Django Ninja API with Pydantic schemas and async ORM access."""
 
+import logging
 from uuid import UUID
 
 import stripe
@@ -14,7 +15,6 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.http import JsonResponse
-from django.utils.crypto import get_random_string
 from ninja import NinjaAPI
 from plans.models import Plan
 from projects_and_tasks.models import DefaultTaskType, TaskType
@@ -24,6 +24,7 @@ from subscriptions.models import Subscription
 from users.models import CompanyUserProfile, PendingInvite
 from utils.api_response import api_response
 from utils.Invitation_email import send_invitation_email
+from utils.tokens import generate_token, hash_token
 
 from .auth import JWTBearerAuth
 from .routers.ai import router as ai_router
@@ -59,6 +60,7 @@ api.add_router('', documents_router)
 api.add_router('', ai_router)
 
 payload = api_response
+logger = logging.getLogger(__name__)
 
 
 def user_data(user):
@@ -72,7 +74,7 @@ def accept_invite_in_transaction(token: str, password: str, username: str):
     """Transactions are sync-only in Django, so keep this multi-write flow atomic."""
     with transaction.atomic():
         invite = PendingInvite.objects.select_for_update().filter(
-            token=token, status=PendingInvite.Status.Pending,
+            token_hash=hash_token(token), status=PendingInvite.Status.Pending,
         ).first()
         if invite is None:
             return None, 'invalid'
@@ -86,8 +88,7 @@ def accept_invite_in_transaction(token: str, password: str, username: str):
         CompanyUserProfile.objects.create(
             user=user, company=invite.company, department=invite.department, role=invite.role,
         )
-        invite.status = PendingInvite.Status.Accepted
-        invite.save(update_fields=['status'])
+        invite.delete()
         return user, None
 
 
@@ -245,15 +246,26 @@ async def send_invite(request, data: InviteIn):
     ).order_by('-created_at').afirst()
     if existing and not existing.is_expired():
         return payload('Invitation already sent for this email.', 400, False)
+    raw_token = generate_token()
     invite = await PendingInvite.objects.acreate(
-        email=data.email, token=get_random_string(48), company=company,
+        email=data.email, token_hash=hash_token(raw_token), company=company,
         department_id=data.department, role=data.role,
     )
     frontend_url = getattr(settings, 'FRONTEND_URL', 'http://your-frontend.com').rstrip('/')
-    await sync_to_async(send_invitation_email, thread_sensitive=True)(
-        data.email, request.auth.get_username(), company.name, f'{frontend_url}/invite/accept?token={invite.token}',
-    )
-    return payload('Invitation sent successfully', 200, True, {'email': invite.email})
+    try:
+        await sync_to_async(send_invitation_email, thread_sensitive=True)(
+            data.email, request.auth.get_username(), company.name,
+            f'{frontend_url}/invite/accept?token={raw_token}',
+        )
+    except Exception:
+        logger.exception('invite_email.send_failed', extra={'invite_id': str(invite.id)})
+        return payload(
+            'Invitation created, but the email could not be sent. It will be retried automatically.',
+            200, True, {'email': invite.email, 'email_sent': False},
+        )
+    invite.email_sent = True
+    await invite.asave(update_fields=['email_sent'])
+    return payload('Invitation sent successfully', 200, True, {'email': invite.email, 'email_sent': True})
 
 
 @api.post('/emp/accept_invite/', response={201: ApiResponse, 400: ApiResponse})

@@ -1,10 +1,13 @@
-from django.db import models
-from django.contrib.auth.models import BaseUserManager,AbstractUser
-from django.conf import settings
 import uuid
-from django.utils import timezone
 from datetime import timedelta
+
+from django.conf import settings
+from django.contrib.auth.models import AbstractUser, BaseUserManager
+from django.db import models
+from django.utils import timezone
 from utils.models import UUIDModel
+
+
 class UserManger(BaseUserManager):
   def create_user(self,email,password,username):
     if email is None:
@@ -70,19 +73,24 @@ class PendingInvite(UUIDModel):
         Owner = 'Owner', 'Owner'
         DEPARTMENT_LEADER = 'DL', 'Department Leader'
         DEPARTMENT_MEMBER = 'DM', 'Department Member'
-        
+
     class Status(models.TextChoices):
-        Pending = 'Pending','Pending'
-        Accepted = 'Accepted','Accepted'
-        Expired = 'Expired','Expired'
+        # No Accepted state: an accepted invite is deleted outright (see
+        # api.accept_invite_in_transaction), not marked and kept around.
+        Pending = 'Pending', 'Pending'
+        Expired = 'Expired', 'Expired'
+
     email = models.EmailField()
-    token = models.CharField(max_length=64, unique=True, default=uuid.uuid4)
+    # Only the hash is stored; the raw token is emailed to the invitee and
+    # never persisted (see utils/tokens.py).
+    token_hash = models.CharField(max_length=64, unique=True)
     company = models.ForeignKey('company.Company', on_delete=models.CASCADE)
     department = models.ForeignKey('departments_and_teams.Department', on_delete=models.SET_NULL, null=True)
     role = models.CharField(max_length=200, choices=Role.choices, default=Role.Owner)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.Pending)
+    email_sent = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
-    expires_at = models.DateTimeField(default=default_expiration)  
+    expires_at = models.DateTimeField(default=default_expiration)
 
     def is_expired(self):
         return timezone.now() >= self.expires_at
