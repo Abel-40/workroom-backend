@@ -11,12 +11,10 @@ __pycache__/
 *.sqlite3
 db.sqlite3
 
-# Pipenv
-Pipfile.lock
-
 # Env files
 .env
 .env.*
+!.env.example
 
 # VSCode & PyCharm
 .vscode/

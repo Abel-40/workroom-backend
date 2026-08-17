@@ -10,3 +10,4 @@ select = ["E", "F", "I", "UP"]
 line-length = 120
 target-version = ["py313"]
 extend-exclude = "migrations"
+skip-string-normalization = true

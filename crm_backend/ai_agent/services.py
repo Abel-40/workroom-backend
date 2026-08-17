@@ -19,7 +19,12 @@ async def request_project_plan(user, project):
         return None, 'forbidden'
     generation = await AIGeneration.objects.acreate(project=project, requested_by=user)
     try:
-        await sync_to_async(process_ai_generation.delay, thread_sensitive=False)(str(generation.id))
+        # thread_sensitive=True: under CELERY_TASK_ALWAYS_EAGER (tests),
+        # .delay() runs the task body inline on whatever thread this runs
+        # on -- it must be the same thread/connection as the just-created,
+        # not-yet-committed generation row, or the task's own query for it
+        # returns nothing. See api/api.py::send_invite for the same fix.
+        await sync_to_async(process_ai_generation.delay, thread_sensitive=True)(str(generation.id))
     except Exception:
         generation.status = AIGeneration.STATUS.FAILED
         generation.error_message = 'Failed to queue the AI generation job.'

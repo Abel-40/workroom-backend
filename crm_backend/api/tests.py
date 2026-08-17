@@ -30,16 +30,22 @@ class TwoCompanyTestCase(TestCase):
 
     def setUp(self):
         sector = Sector.objects.create(name='Software')
-        self.owner_a = User.objects.create_user(email='owner-a@example.com', username='owner-a', password='Kx9#mQ2vLp8Z')
+        self.owner_a = User.objects.create_user(
+            email='owner-a@example.com', username='owner-a', password='Kx9#mQ2vLp8Z',
+        )
         self.company_a = Company.objects.create(name='Company A', owner=self.owner_a, sector=sector)
         self.department_a = Department.objects.create(name='Engineering', company=self.company_a)
-        self.member_a = User.objects.create_user(email='member-a@example.com', username='member-a', password='Kx9#mQ2vLp8Z')
+        self.member_a = User.objects.create_user(
+            email='member-a@example.com', username='member-a', password='Kx9#mQ2vLp8Z',
+        )
         CompanyUserProfile.objects.create(
             user=self.member_a, company=self.company_a, department=self.department_a,
             role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
         )
 
-        self.owner_b = User.objects.create_user(email='owner-b@example.com', username='owner-b', password='Kx9#mQ2vLp8Z')
+        self.owner_b = User.objects.create_user(
+            email='owner-b@example.com', username='owner-b', password='Kx9#mQ2vLp8Z',
+        )
         self.company_b = Company.objects.create(name='Company B', owner=self.owner_b, sector=sector)
 
     def create_project(self, owner=None, **overrides):
@@ -102,7 +108,9 @@ class InvitationRoleTests(TestCase):
         self.sector = Sector.objects.create(name='Software')
         self.owner = User.objects.create_user(email='owner@example.com', username='owner', password='Kx9#mQ2vLp8Z')
         self.company = Company.objects.create(name='Acme', owner=self.owner, sector=self.sector)
-        self.outsider = User.objects.create_user(email='outsider@example.com', username='outsider', password='Kx9#mQ2vLp8Z')
+        self.outsider = User.objects.create_user(
+            email='outsider@example.com', username='outsider', password='Kx9#mQ2vLp8Z',
+        )
 
     def test_invite_cannot_grant_owner_role(self):
         """A company must never gain a second Owner-role profile via invitation."""
@@ -137,7 +145,7 @@ class InvitationTokenSecurityTests(TestCase):
         self.company = Company.objects.create(name='Acme', owner=self.owner, sector=sector)
 
     def send_invite_and_get_raw_token(self, email='invitee@example.com'):
-        with patch('api.api.send_invitation_email') as mock_send:
+        with patch('users.tasks.send_invitation_email') as mock_send:
             self.client.post(
                 '/api/auth/send_invite/', {'email': email},
                 content_type='application/json', **auth_header(self.owner),
@@ -177,7 +185,7 @@ class InvitationTokenSecurityTests(TestCase):
         self.assertTrue(invite.email_sent)
 
     def test_send_invite_marks_email_sent_false_on_delivery_failure(self):
-        with patch('api.api.send_invitation_email', side_effect=RuntimeError('smtp down')):
+        with patch('users.tasks.send_invitation_email', side_effect=RuntimeError('smtp down')):
             response = self.client.post(
                 '/api/auth/send_invite/', {'email': 'invitee@example.com'},
                 content_type='application/json', **auth_header(self.owner),

@@ -12,10 +12,11 @@ from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Q
 from django.http import JsonResponse
 from ninja import NinjaAPI
+from ninja.errors import HttpError
 from notifications_and_activity.services import notify_invitation_accepted
 from plans.models import Plan
 from projects_and_tasks.models import DefaultTaskType, TaskType
@@ -23,12 +24,14 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from subscriptions.models import Subscription
 from users.models import CompanyUserProfile, PendingInvite
+from users.tasks import send_invite_email_task
 from utils.api_response import api_response
-from utils.Invitation_email import send_invitation_email
+from utils.rate_limit import rate_limit
 from utils.tokens import generate_token, hash_token
 
 from .auth import JWTBearerAuth
 from .routers.ai import router as ai_router
+from .routers.analytics import router as analytics_router
 from .routers.documents import router as documents_router
 from .routers.notifications import router as notifications_router
 from .routers.projects import router as projects_router
@@ -61,9 +64,20 @@ api.add_router('', tasks_router)
 api.add_router('', documents_router)
 api.add_router('', ai_router)
 api.add_router('/notifications', notifications_router)
+api.add_router('/analytics', analytics_router)
 
 payload = api_response
 logger = logging.getLogger(__name__)
+
+
+@api.exception_handler(HttpError)
+def handle_http_error(request, exc: HttpError):
+    """Keep raised HttpErrors (e.g. utils.rate_limit's 429s) in the app's
+    normal response envelope instead of Ninja's default {"detail": ...}."""
+    return api.create_response(
+        request, {'success': False, 'message': str(exc), 'statusCode': exc.status_code, 'data': {}},
+        status=exc.status_code,
+    )
 
 
 def user_data(user):
@@ -98,6 +112,7 @@ def accept_invite_in_transaction(token: str, password: str, username: str):
 
 
 @api.post('/auth/signup/', response={201: ApiResponse, 400: ApiResponse})
+@rate_limit('signup', limit=10, window_seconds=3600)
 async def signup(request, data: SignUpIn):
     if await User.objects.filter(email__iexact=data.email).aexists():
         return payload('Validation error', 400, False, errors={'email': ['This email is already registered.']})
@@ -114,6 +129,7 @@ async def signup(request, data: SignUpIn):
 
 
 @api.post('/auth/signin/', response={200: ApiResponse, 401: ApiResponse})
+@rate_limit('signin', limit=10, window_seconds=300)
 async def signin(request, data: SignInIn):
     user = await sync_to_async(authenticate, thread_sensitive=True)(
         request, username=data.email, password=data.password,
@@ -167,7 +183,10 @@ async def get_all_sectors(request):
     return payload('Sectors retrieved successfully', 200, True, {'sectors': sectors})
 
 
-@api.post('/department/create_departments_from_defaults/', auth=auth, response={201: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+@api.post(
+    '/department/create_departments_from_defaults/', auth=auth,
+    response={201: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
 async def create_departments_from_defaults(request, data: SelectionIn):
     company = await Company.objects.select_related('owner', 'sector').filter(id=data.company_id).afirst()
     if company is None:
@@ -202,7 +221,10 @@ async def get_default_department_types(request, sector_id: UUID):
     return payload('Department types retrieved successfully', 200, True, {'department_types': departments})
 
 
-@api.post('/default_task_type/default_task_type/', auth=auth, response={201: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+@api.post(
+    '/default_task_type/default_task_type/', auth=auth,
+    response={201: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
 async def create_task_types_from_defaults(request, data: SelectionIn):
     company = await Company.objects.select_related('owner', 'sector').filter(id=data.company_id).afirst()
     if company is None:
@@ -238,6 +260,7 @@ async def get_default_task_types(request, sector_id: UUID):
 
 
 @api.post('/auth/send_invite/', auth=auth, response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse})
+@rate_limit('send_invite', limit=30, window_seconds=3600, key_func=lambda r: str(r.auth.id))
 async def send_invite(request, data: InviteIn):
     company = await get_managed_company(request.auth)
     if company is None:
@@ -256,30 +279,37 @@ async def send_invite(request, data: InviteIn):
         email=data.email, token_hash=hash_token(raw_token), company=company,
         department_id=data.department, role=data.role,
     )
-    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://your-frontend.com').rstrip('/')
-    try:
-        await sync_to_async(send_invitation_email, thread_sensitive=True)(
-            data.email, request.auth.get_username(), company.name,
-            f'{frontend_url}/invite/accept?token={raw_token}',
-        )
-    except Exception:
-        logger.exception('invite_email.send_failed', extra={'invite_id': str(invite.id)})
-        return payload(
-            'Invitation created, but the email could not be sent. It will be retried automatically.',
-            200, True, {'email': invite.email, 'email_sent': False},
-        )
-    invite.email_sent = True
-    await invite.asave(update_fields=['email_sent'])
-    return payload('Invitation sent successfully', 200, True, {'email': invite.email, 'email_sent': True})
+    # Email delivery runs on the Celery 'simple' queue, off the request
+    # thread (Phase 9/11). The response can't know the outcome synchronously
+    # in production -- email_sent reflects whatever's true immediately after
+    # dispatch (still False in a real deployment; the task hasn't run yet).
+    # thread_sensitive=True matters here: under CELERY_TASK_ALWAYS_EAGER
+    # (tests), .delay() runs the whole task body inline, including its own
+    # DB queries -- those must stay on the same thread/connection as the
+    # rest of this request/transaction, not a pooled thread with a separate
+    # connection that can't see the just-created, not-yet-committed invite.
+    await sync_to_async(send_invite_email_task.delay, thread_sensitive=True)(
+        str(invite.id), raw_token, request.auth.get_username(),
+    )
+    await invite.arefresh_from_db(fields=['email_sent'])
+    message = (
+        'Invitation sent successfully' if invite.email_sent
+        else 'Invitation created. The email is being sent and will be retried automatically if it fails.'
+    )
+    return payload(message, 200, True, {'email': invite.email, 'email_sent': invite.email_sent})
 
 
 @api.post('/emp/accept_invite/', response={201: ApiResponse, 400: ApiResponse})
+@rate_limit('accept_invite', limit=10, window_seconds=600)
 async def accept_invite(request, data: AcceptInviteIn):
     user, error = await sync_to_async(accept_invite_in_transaction, thread_sensitive=True)(
         data.token, data.password, data.username,
     )
     if error:
-        message = 'An account with this email already exists.' if error == 'existing_user' else 'Invalid or expired invitation token.'
+        message = (
+            'An account with this email already exists.' if error == 'existing_user'
+            else 'Invalid or expired invitation token.'
+        )
         return payload(message, 400, False)
     return payload('User registered successfully.', 201, True, {'user': user_data(user)})
 
@@ -305,7 +335,9 @@ async def start_checkout(request, data: CheckoutIn):
             subscription.stripe_customer_id = customer.id
             await subscription.asave(update_fields=['stripe_customer_id', 'updated_at'])
         else:
-            customer = await sync_to_async(stripe.Customer.retrieve, thread_sensitive=False)(subscription.stripe_customer_id)
+            customer = await sync_to_async(stripe.Customer.retrieve, thread_sensitive=False)(
+                subscription.stripe_customer_id,
+            )
         frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:3000').rstrip('/')
         session = await sync_to_async(stripe.checkout.Session.create, thread_sensitive=False)(
             customer=customer.id, payment_method_types=['card'],
@@ -332,3 +364,23 @@ async def get_my_subscription(request):
         'canceled_at': subscription.canceled_at.isoformat() if subscription.canceled_at else None,
         'is_active': subscription.is_active(), 'on_trial': subscription.on_trial(),
     })
+
+
+def _check_database() -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT 1')
+        return cursor.fetchone() == (1,)
+
+
+@api.get('/health/', response={200: ApiResponse, 503: ApiResponse})
+async def check_server_health(request):
+    """Readiness check (Phase 11): reports unhealthy if the database isn't
+    reachable, rather than an unconditional 'running'."""
+    try:
+        db_ok = await sync_to_async(_check_database, thread_sensitive=True)()
+    except Exception:
+        logger.exception('health_check.database_unreachable')
+        db_ok = False
+    if not db_ok:
+        return payload('Service unavailable.', 503, False, {'database': 'down'})
+    return payload('Service healthy.', 200, True, {'database': 'up'})

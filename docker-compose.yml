@@ -1,8 +1,130 @@
+x-fastapi-and-worker-base: &base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  volumes:
+    - .:/workroom-bd
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+# .env's DATABASE_URL/REDIS_URL point at localhost, correct for host-based
+# (venv) dev. Inside a container "localhost" is the container itself, not
+# the db/redis services -- every Django-based service below overrides both
+# to the in-network hostnames instead of editing .env.
+x-django-network-env: &django-network-env
+  DATABASE_URL: postgresql://${DB_USERNAME}:${DB_PASSWORD}@db:5432/${DB_NAME}
+  REDIS_URL: redis://redis:6379/0
+
 services:
-  crud-bd:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-    image: crud-bd:v1
-    
-    
+  crud_bd:
+    <<: *base
+    container_name: workroom-bd
+    image: workroom-bd:1.0
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *django-network-env
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')",
+        ]
+      interval: 1m30s
+      timeout: 30s
+      retries: 5
+      start_period: 40s
+    # migrate: single dev instance, so auto-migrate-on-boot is safe here.
+    # Production (the Dockerfile's own CMD, used when this image runs
+    # without compose) deliberately does NOT auto-migrate -- see
+    # DEPLOYMENT.md for the manual release-step rationale.
+    command: sh -c "python manage.py migrate --noinput && python manage.py collectstatic --noinput && uvicorn crm_backend.asgi:application --host 0.0.0.0 --port 8000 --reload --reload-exclude 'staticfiles/*'"
+
+  celery_worker_simple:
+    <<: *base
+    container_name: workroom-celery-simple
+    image: workroom-bd:1.0
+    restart: unless-stopped
+    environment:
+      <<: *django-network-env
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A crm_backend inspect ping -d simple-worker@workroom --timeout 5 | grep -q OK"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    command: celery -A crm_backend worker -Q simple --concurrency=4 --loglevel=info -n simple-worker@workroom
+
+  celery_worker_heavy:
+    <<: *base
+    container_name: workroom-celery-heavy
+    image: workroom-bd:1.0
+    restart: unless-stopped
+    environment:
+      <<: *django-network-env
+      # Reaches the sibling workroom-ai compose project via the host,
+      # keeping the two stacks independently deployable instead of needing
+      # a shared external Docker network.
+      WORKROOM_AI_SERVICE_URL: http://host.docker.internal:8001
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A crm_backend inspect ping -d heavy-worker@workroom --timeout 5 | grep -q OK"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    command: celery -A crm_backend worker -Q heavy --concurrency=2 --loglevel=info -n heavy-worker@workroom
+
+  celery_beat:
+    <<: *base
+    container_name: workroom-celery-beat
+    image: workroom-bd:1.0
+    restart: unless-stopped
+    environment:
+      <<: *django-network-env
+    # Schedule file goes to /tmp, not the bind-mounted repo path, so this
+    # runtime state never lands in the git working tree.
+    command: celery -A crm_backend beat --loglevel=info -s /tmp/celerybeat-schedule
+
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: workroom-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USERNAME}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+  redis:
+    image: redis:7.4-alpine
+    container_name: workroom-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  pg_data:
+  redis_data:

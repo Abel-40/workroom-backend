@@ -24,4 +24,10 @@ EXPOSE 8000
 
 WORKDIR /workroom-bd/crm_backend
 
-CMD ["uvicorn", "crm_backend.asgi:application", "--host", "0.0.0.0", "--port", "8000"]
+# Standalone-deployment default (no docker-compose). docker-compose.yml
+# overrides this with `uvicorn --reload` for local hot-reload dev; this is
+# what runs if the image is deployed on its own (e.g. a PaaS without
+# compose). Deliberately does NOT run migrate/collectstatic here -- those
+# are a separate release step, see DEPLOYMENT.md.
+CMD ["gunicorn", "crm_backend.asgi:application", "-k", "uvicorn_worker.UvicornWorker", \
+     "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "60"]

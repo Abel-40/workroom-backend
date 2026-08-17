@@ -16,6 +16,7 @@ from pathlib import Path
 
 import dj_database_url
 import environ
+from celery.schedules import crontab
 
 # Initialize environ
 env = environ.Env(
@@ -75,6 +76,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
+    'utils.middleware.RequestIDMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -153,6 +156,22 @@ STATIC_URL = 'static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 MEDIA_URL = 'media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# WhiteNoise serves collected static files (mainly /admin/) directly from
+# the ASGI app -- uvicorn/gunicorn don't auto-serve static/ the way
+# `runserver` does in DEBUG. Media (user uploads) is unaffected; it stays on
+# local disk for V1 and isn't served through this.
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage'},
+}
+
+# Defense-in-depth above projects_and_tasks.services.MAX_DOCUMENT_SIZE_BYTES
+# (10MB): make sure Django's own request-parsing layer doesn't reject a
+# legitimate upload before the app-level content-type/size check even runs.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 12 * 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = 12 * 1024 * 1024
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
@@ -175,6 +194,12 @@ SIMPLE_JWT = {
 CORS_ALLOWED_ORIGINS = env('CORS_ALLOWED_ORIGINS')
 CORS_ALLOW_CREDENTIALS = True
 CSRF_TRUSTED_ORIGINS = env('CSRF_TRUSTED_ORIGINS')
+
+# Used to build invite-accept and Stripe Checkout success/cancel links
+# (api/api.py, users/tasks.py, users/services.py). Was previously read via
+# getattr(settings, 'FRONTEND_URL', ...) with no assignment here, so it was
+# silently always the hardcoded fallback regardless of .env -- fixed.
+FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:3000')
 
 # Production security settings. DEBUG must be explicitly false via env in any
 # real deployment; these only take effect there so local HTTP development is
@@ -207,6 +232,25 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TASK_ALWAYS_EAGER = env.bool('CELERY_TASK_ALWAYS_EAGER', default=False)
 CELERY_TASK_EAGER_PROPAGATES = True
 
+# Two queues (Phase 11): 'heavy' for slow/external-call work (AI generation),
+# 'simple' for everything else. Keeps a slow LLM call from starving quick
+# jobs like invite email delivery, and vice versa -- each gets its own
+# worker process in docker-compose.yml.
+CELERY_TASK_DEFAULT_QUEUE = 'simple'
+CELERY_TASK_ROUTES = {
+    'ai_agent.tasks.process_ai_generation': {'queue': 'heavy'},
+}
+CELERY_BEAT_SCHEDULE = {
+    'retry-pending-invite-emails': {
+        'task': 'users.tasks.retry_pending_invite_emails_task',
+        'schedule': crontab(minute='*/15'),
+    },
+}
+
+# utils/rate_limit.py guard on signup/signin/invite endpoints. Off by
+# default in tests (conftest.py) so the suite never needs a real Redis.
+RATE_LIMIT_ENABLED = env.bool('RATE_LIMIT_ENABLED', default=True)
+
 # FastAPI AI service (Phase 6/7). Django never calls this synchronously from
 # a request -- only the Celery worker does (ai_agent/tasks.py).
 WORKROOM_AI_SERVICE_URL = env('WORKROOM_AI_SERVICE_URL', default='http://localhost:8001')
@@ -219,3 +263,32 @@ EMAIL_HOST_USER = env('COMPANY_EMAIL')
 EMAIL_HOST_PASSWORD = env('EMAIL_PASSWORD')
 EMAIL_PORT = env('EMAIL_PORT')
 EMAIL_USE_TLS = True
+
+# Structured logging (Phase 11). request_id comes from utils/middleware.py
+# via utils/logging.py's filter; '-' outside a request (e.g. management
+# commands) or inside a Celery task (which uses its own correlation keys).
+LOG_LEVEL = env('LOG_LEVEL', default='INFO')
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'filters': {
+        'request_id': {'()': 'utils.logging.RequestIDFilter'},
+    },
+    'formatters': {
+        'structured': {
+            'format': '%(asctime)s level=%(levelname)s logger=%(name)s request_id=%(request_id)s %(message)s',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'structured',
+            'filters': ['request_id'],
+        },
+    },
+    'root': {'handlers': ['console'], 'level': LOG_LEVEL},
+    'loggers': {
+        'django': {'handlers': ['console'], 'level': LOG_LEVEL, 'propagate': False},
+        'celery': {'handlers': ['console'], 'level': LOG_LEVEL, 'propagate': False},
+    },
+}

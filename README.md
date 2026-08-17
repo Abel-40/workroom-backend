@@ -39,7 +39,8 @@ Invalid request bodies automatically return a structured `422` response that ide
 - Uvicorn ASGI server
 - SimpleJWT access/refresh tokens
 - Stripe Checkout
-- Pipenv dependency management
+- Celery + Redis for background jobs (see DEPLOYMENT.md)
+- `requirements.txt` (pinned) is the single dependency source of truth
 
 ## Development checks
 
@@ -48,7 +49,7 @@ Invalid request bodies automatically return a structured `422` response that ide
 .\\venv\\Scripts\\python.exe crm_backend\\manage.py makemigrations --check --dry-run
 ```
 
-See [PROJECT_STATUS_AND_PRODUCTION_GAPS.md](PROJECT_STATUS_AND_PRODUCTION_GAPS.md) for the current implementation assessment and production-readiness work.
+See [PHASE.md](../PHASE.md) and [IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) for the phased scope and current implementation status, and [DEPLOYMENT.md](DEPLOYMENT.md) for running this in Docker and deploying it.
 
 ## Async database notes
 
