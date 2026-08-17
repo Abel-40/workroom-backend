@@ -377,6 +377,81 @@ class AIGenerationSecurityTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 403)
 
 
+class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
+    @patch('ai_agent.assistant_services.process_assistant_query.delay')
+    def test_request_assistant_query_creates_pending_query(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        response = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 202)
+        query = response.json()['data']['assistant_query']
+        self.assertEqual(query['status'], 'pending')
+        mock_delay.assert_called_once_with(query['id'])
+
+    @patch('ai_agent.assistant_services.process_assistant_query.delay')
+    def test_assistant_query_hidden_from_other_company(self, mock_delay):
+        project = self.create_project(owner=self.owner_a, visibility='private')
+        created = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        query_id = created.json()['data']['assistant_query']['id']
+        response = self.client.get(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 403)
+
+    def test_question_over_max_length_is_rejected(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'x' * 2001}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_request_assistant_query_requires_authentication(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 401)
+
+
+class AIHealthSummarySecurityTests(TwoCompanyTestCase):
+    @patch('ai_agent.health_services.process_health_summary.delay')
+    def test_request_health_summary_creates_pending_summary(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        response = self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 202)
+        summary = response.json()['data']['health_summary']
+        self.assertEqual(summary['status'], 'pending')
+        mock_delay.assert_called_once_with(summary['id'])
+
+    @patch('ai_agent.health_services.process_health_summary.delay')
+    def test_health_summary_hidden_from_other_company(self, mock_delay):
+        project = self.create_project(owner=self.owner_a, visibility='private')
+        created = self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
+        summary_id = created.json()['data']['health_summary']['id']
+        response = self.client.get(f'/api/ai/health-summaries/{summary_id}/', **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 403)
+
+    @patch('ai_agent.health_services.process_health_summary.delay')
+    def test_rate_limit_boundary(self, mock_delay):
+        """RATE_LIMIT_ENABLED is off globally (conftest.py) so the suite
+        doesn't depend on a real Redis -- re-enabled locally for this one
+        test, which does need a real Redis reachable at CELERY_BROKER_URL."""
+        with self.settings(RATE_LIMIT_ENABLED=True):
+            project = self.create_project(owner=self.owner_a)
+            for _ in range(6):
+                self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
+            response = self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
+            self.assertEqual(response.status_code, 429)
+
+
 class NotificationTests(TwoCompanyTestCase):
     """Phase 9: notification isolation and the events that create one."""
 

@@ -239,6 +239,8 @@ CELERY_TASK_EAGER_PROPAGATES = True
 CELERY_TASK_DEFAULT_QUEUE = 'simple'
 CELERY_TASK_ROUTES = {
     'ai_agent.tasks.process_ai_generation': {'queue': 'heavy'},
+    'ai_agent.tasks_assistant.process_assistant_query': {'queue': 'heavy'},
+    'ai_agent.tasks_health.process_health_summary': {'queue': 'heavy'},
 }
 CELERY_BEAT_SCHEDULE = {
     'retry-pending-invite-emails': {

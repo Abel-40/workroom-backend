@@ -9,7 +9,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from ninja import Schema
-from pydantic import Field
+from pydantic import Field, HttpUrl
 
 
 class ApiResponse(Schema):
@@ -65,3 +65,13 @@ class AcceptInviteIn(Schema):
 
 class CheckoutIn(Schema):
     plan_id: UUID
+
+
+class AIAssistantIn(Schema):
+    """``reference_url`` uses HttpUrl, which restricts to http/https schemes
+    by construction -- scheme allowlisting for the assistant's URL-fetch
+    capability is free at this layer (see utils/safe_fetch.py for the rest
+    of the SSRF protections)."""
+
+    question: str = Field(min_length=1, max_length=2000)
+    reference_url: HttpUrl | None = None

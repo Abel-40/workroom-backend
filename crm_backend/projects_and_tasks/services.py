@@ -405,6 +405,38 @@ def persist_ai_generated_tasks(generation, plan_data: dict) -> int:
 
     with transaction.atomic():
         Task.objects.bulk_create(to_create)
+    return len(to_create)
+
+
+def get_text_document_excerpts(project, *, max_documents=3, max_chars_per_document=3000) -> list[str]:
+    """Read the project's own plain-text attachments for the AI assistant's
+    document-context capability. Deliberately narrow: no text-extraction
+    pipeline exists for any attachment type today (Attachment.file is an
+    opaque blob, content_type is metadata only), so this is limited to
+    attachments whose content_type is already text/* -- reading those back
+    as UTF-8 needs no new dependency. PDF/DOCX extraction is explicitly
+    deferred; it would need a new library (e.g. pypdf) for a narrow path.
+
+    Sync, not async: called from the sync Celery worker
+    (ai_agent/tasks_assistant.py), same reasoning as persist_ai_generated_tasks.
+    """
+    attachments = Attachment.objects.filter(
+        project=project, is_deleted=False, content_type__startswith='text/',
+    ).order_by('-created_at')[:max_documents]
+
+    excerpts = []
+    for attachment in attachments:
+        if not attachment.file:
+            continue
+        try:
+            with attachment.file.open('rb') as fh:
+                raw = fh.read(max_chars_per_document * 4)  # bound the read itself, not just the decode
+        except (OSError, ValueError):
+            continue
+        text = raw.decode('utf-8', errors='replace')[:max_chars_per_document]
+        if text.strip():
+            excerpts.append(text)
+    return excerpts
 
     return len(to_create)
 

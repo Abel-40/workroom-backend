@@ -20,6 +20,7 @@ async def get_project_stats(project: Project) -> dict:
     todo = await tasks.filter(status=Task.STATUS.TODO).acount()
     in_review = await tasks.filter(status=Task.STATUS.IN_REVIEW).acount()
     overdue = await tasks.exclude(status=Task.STATUS.DONE).filter(deadline__lt=timezone.now()).acount()
+    unassigned = await tasks.filter(assigned_to__isnull=True).acount()
     return {
         'total_tasks': total,
         'completed_tasks': completed,
@@ -27,6 +28,7 @@ async def get_project_stats(project: Project) -> dict:
         'todo_tasks': todo,
         'in_review_tasks': in_review,
         'overdue_tasks': overdue,
+        'unassigned_tasks': unassigned,
         'completion_percent': round((completed / total) * 100, 2) if total else 0,
     }
 

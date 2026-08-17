@@ -6,6 +6,7 @@ a general-purpose throttling framework, just a guard on signup/signin/invite
 endpoints against brute-force and spam.
 """
 
+import asyncio
 import functools
 import logging
 
@@ -16,12 +17,21 @@ from ninja.errors import HttpError
 logger = logging.getLogger(__name__)
 
 _redis_client: aioredis.Redis | None = None
+_redis_client_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _client() -> aioredis.Redis:
-    global _redis_client
-    if _redis_client is None:
+    """A client's connections are bound to the event loop that created it.
+    Django's async test client (and asgiref generally) can run different
+    requests on different event loops, so a naively-cached module-level
+    client breaks the second time it's used under a new loop ("attached to
+    a different loop" / "Event loop is closed"). Recreate the client
+    whenever the running loop has changed."""
+    global _redis_client, _redis_client_loop
+    current_loop = asyncio.get_running_loop()
+    if _redis_client is None or _redis_client_loop is not current_loop:
         _redis_client = aioredis.from_url(settings.CELERY_BROKER_URL)
+        _redis_client_loop = current_loop
     return _redis_client
 
 
@@ -53,7 +63,10 @@ def rate_limit(name: str, limit: int, window_seconds: int, key_func=_default_key
                 except HttpError:
                     raise
                 except Exception:
-                    logger.warning('rate_limit.backend_unreachable', extra={'name': name})
+                    # 'name' is a reserved LogRecord attribute (the logger's
+                    # own name) -- passing it in `extra` raises a KeyError
+                    # from logging internals, so use a non-colliding key.
+                    logger.warning('rate_limit.backend_unreachable', extra={'limit_name': name})
                 else:
                     if current > limit:
                         raise HttpError(429, 'Too many requests. Please try again later.')
