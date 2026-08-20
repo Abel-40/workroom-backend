@@ -32,7 +32,9 @@ Status: `201`, `400`
 ### POST `/api/auth/signin/`
 Body: `{ email: string, password: string }`
 
-Response `data`: `{ user: User, is_authenticated: boolean, access: string }`
+Response `data`: `{ user: User, is_authenticated: boolean, access: string, role: "Owner" | "DL" | "DM" | null, company_id: UUID | null, company_name: string | null }`
+
+`role`/`company_id`/`company_name` are `null` for a user who hasn't joined or created a company yet. `role` is `"Owner"` for the company creator, otherwise the caller's `CompanyUserProfile.role` (`"DL"` = Department Leader, `"DM"` = Department Member).
 
 Status: `200`, `401`
 
@@ -101,10 +103,61 @@ Response `data`: `{ tasktypes: Array<{ id: UUID, name: string, sector: UUID | nu
 
 Status: `200`, `404`
 
+### GET `/api/departments/`
+Lists the caller's own company's departments (not sector defaults/templates -- the departments actually created for this company). Any company member (Owner/DL/DM).
+
+Body: none
+
+Response `data`: `{ results: Array<{ id: UUID, name: string, description: string, leader_id: UUID | null, leader_name: string | null, member_count: integer }> }`
+
+Status: `200`, `404`
+
+### POST `/api/departments/`
+Creates a department. Requires "managed company" standing: the company owner, or a department leader (same check used by `send_invite`) -- a department member is rejected with `403`.
+
+Body: `{ name: string, description?: string, leader_id?: UUID | null }`
+
+`name` must be unique within the company (case-insensitive); `leader_id`, if given, must be an existing member of the company.
+
+Response `data`: `{ department: { id: UUID, name: string, description: string, leader_id: UUID | null, leader_name: string | null, member_count: 0 } }`
+
+Status: `201`, `400`, `403`
+
+### GET `/api/teams/`
+Lists the caller's own company's teams. A team is a cross-department grouping of members assembled for a specific project or initiative (unlike a Department, which is a fixed org unit). Any company member (Owner/DL/DM).
+
+Body: none
+
+Response `data`: `{ results: Array<{ id: UUID, name: string, description: string, leader_id: UUID | null, leader_name: string | null, member_ids: UUID[] }> }`
+
+Status: `200`, `404`
+
+### POST `/api/teams/`
+Creates a team. Requires the same "managed company" standing as creating a department.
+
+Body: `{ name: string, description?: string, leader_id?: UUID | null, member_ids?: UUID[] }`
+
+`name` must be unique within the company; `leader_id` and every id in `member_ids`, if given, must be an existing member of the company (an unknown or cross-company id is rejected with `400`).
+
+Response `data`: `{ team: { id: UUID, name: string, description: string, leader_id: UUID | null, leader_name: string | null, member_ids: UUID[] } }`
+
+Status: `201`, `400`, `403`
+
+### GET `/api/task-types/`
+Lists the caller's own company's task types (not sector defaults/templates). Any company member (Owner/DL/DM).
+
+Body: none
+
+Response `data`: `{ results: Array<{ id: UUID, name: string, description: string }> }`
+
+Status: `200`, `404`
+
 ## Projects
 
 ### POST `/api/projects/`
-Body: `{ title: string, description?: string, department_id?: UUID | null, team_id?: UUID | null, visibility?: "public" | "company" | "department" | "private", priority?: "low" | "medium" | "high", start_date?: datetime | null, deadline?: datetime | null }`
+Body: `{ title: string, description?: string, department_id?: UUID | null, team_id?: UUID | null, visibility?: "public" | "company" | "department" | "private", priority?: "low" | "medium" | "high", start_date?: datetime | null, deadline?: datetime | null, collaborator_ids?: UUID[] }`
+
+`collaborator_ids` must be company members (owner or any `CompanyUserProfile`); an unknown or cross-company id is rejected with `400`.
 
 Response `data`: `{ project: Project }`
 
@@ -125,7 +178,7 @@ Response `data`: `{ project: Project }`
 Status: `200`, `403`, `404`
 
 ### PATCH `/api/projects/{project_id}/`
-Body: any subset of `{ title: string, description: string, department_id: UUID | null, team_id: UUID | null, visibility: "public" | "company" | "department" | "private", priority: "low" | "medium" | "high", status: "Active" | "Inactive" | "Done", start_date: datetime | null, deadline: datetime | null }`
+Body: any subset of `{ title: string, description: string, department_id: UUID | null, team_id: UUID | null, visibility: "public" | "company" | "department" | "private", priority: "low" | "medium" | "high", status: "Active" | "Inactive" | "Done", start_date: datetime | null, deadline: datetime | null, collaborator_ids: UUID[] }`
 
 Response `data`: `{ project: Project }`
 
@@ -138,7 +191,38 @@ Response `data`: `{}`
 
 Status: `200`, `403`, `404`
 
-`Project`: `{ id: UUID, title: string, description: string, company_id: UUID, department_id: UUID | null, team_id: UUID | null, visibility: string, status: string, priority: string, start_date: datetime, deadline: datetime, created_by: UUID | null, created_at: datetime, updated_at: datetime, total_tasks: integer, active_tasks: integer, completion_percent: number }`
+`Project`: `{ id: UUID, title: string, description: string, company_id: UUID, department_id: UUID | null, team_id: UUID | null, visibility: string, status: string, priority: string, start_date: datetime, deadline: datetime, created_by: UUID | null, created_at: datetime, updated_at: datetime, total_tasks: integer, active_tasks: integer, completion_percent: number, collaborator_ids: UUID[], image: { kind: "upload" | "link", url: string } | null }`
+
+### Project cover image
+A project's cover image is exactly one of an uploaded file or an external link at a time -- setting one clears the other. Requires manage rights on the project (creator, company owner, or the leader of the project's own department), same as `PATCH`/`DELETE` above.
+
+#### PUT `/api/projects/{project_id}/image/`
+Sets the cover image to an external link.
+
+Body: `{ image_url: string (URL) }`
+
+Response `data`: `{ project: Project }`
+
+Status: `200`, `400`, `403`, `404`
+
+#### POST `/api/projects/{project_id}/image/`
+Uploads a cover image file. Multipart form with a single field `image`. Max 5MB; `image/png`, `image/jpeg`, `image/gif`, or `image/webp` only.
+
+Response `data`: `{ project: Project }`
+
+Status: `200`, `400`, `403`, `404`
+
+#### GET `/api/projects/{project_id}/image/`
+Streams the uploaded image file (not a raw `/media/` path -- there isn't one; see settings.py). Requires the same view permission as the project itself. `404` if the project's cover image is an external link or unset.
+
+Status: `200` (binary image response), `403`, `404`
+
+#### DELETE `/api/projects/{project_id}/image/`
+Removes the cover image (uploaded file or link, whichever is set).
+
+Response `data`: `{}`
+
+Status: `200`, `403`, `404`
 
 ## Tasks
 
@@ -341,6 +425,15 @@ Status: `200`, `403`, `404`
 Body: none
 
 Response `data`: `{ project_count: integer, active_projects: integer, completed_projects: integer, member_count: integer, task_count: integer, completed_tasks: integer }`
+
+Status: `200`, `404`
+
+### GET `/api/analytics/company/members/`
+Body: none
+
+Per-member workload snapshot: the company owner plus every `CompanyUserProfile`, each with their current active (assigned, not done, not deleted) task counts, broken down by status.
+
+Response `data`: `{ members: Array<{ id: UUID, first_name: string, last_name: string, username: string, email: string, role: "Owner" | "DL" | "DM", department: string | null, active_task_count: integer, todo_count: integer, in_progress_count: integer, in_review_count: integer }> }`
 
 Status: `200`, `404`
 
