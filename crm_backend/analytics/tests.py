@@ -6,6 +6,7 @@ so isolation is checked the same way every other endpoint's tests check it.
 from api.tests import TwoCompanyTestCase, auth_header
 from django.utils import timezone
 from projects_and_tasks.models import Project, Task
+from users.models import CompanyUserProfile, User
 
 
 class ProjectAnalyticsTests(TwoCompanyTestCase):
@@ -74,3 +75,56 @@ class CompanyAnalyticsTests(TwoCompanyTestCase):
         response = self.client.get('/api/analytics/company/', **auth_header(self.owner_b))
         data = response.json()['data']
         self.assertEqual(data['project_count'], 0)  # company B has no projects of its own
+
+
+class CompanyWorkloadTests(TwoCompanyTestCase):
+    def setUp(self):
+        super().setUp()
+        self.project = Project.objects.create(title='Website Revamp', company=self.company_a, created_by=self.owner_a)
+        Task.objects.create(project=self.project, title='Member active', status=Task.STATUS.TODO, assigned_to=self.member_a)
+        Task.objects.create(project=self.project, title='Member done', status=Task.STATUS.DONE, assigned_to=self.member_a)
+        Task.objects.create(project=self.project, title='Owner active', status=Task.STATUS.IN_PROGRESS, assigned_to=self.owner_a)
+        Task.objects.create(project=self.project, title='Unassigned', status=Task.STATUS.TODO)
+
+    def get_workload(self, user):
+        return self.client.get('/api/analytics/company/members/', **auth_header(user))
+
+    def test_workload_lists_owner_and_members_with_active_task_counts(self):
+        response = self.get_workload(self.owner_a)
+        self.assertEqual(response.status_code, 200)
+        members = {m['id']: m for m in response.json()['data']['members']}
+        self.assertEqual(len(members), 2)  # owner (no profile row) + member_a
+
+        owner_row = members[str(self.owner_a.id)]
+        self.assertEqual(owner_row['role'], 'Owner')
+        self.assertEqual(owner_row['active_task_count'], 1)
+        self.assertEqual(owner_row['in_progress_count'], 1)
+        self.assertEqual(owner_row['todo_count'], 0)
+        self.assertIsNone(owner_row['department'])
+
+        member_row = members[str(self.member_a.id)]
+        self.assertEqual(member_row['role'], 'DM')
+        self.assertEqual(member_row['active_task_count'], 1)  # the Done task doesn't count
+        self.assertEqual(member_row['todo_count'], 1)
+        self.assertEqual(member_row['in_progress_count'], 0)
+        self.assertEqual(member_row['department'], 'Engineering')
+
+    def test_workload_is_scoped_to_the_caller_own_company(self):
+        response = self.get_workload(self.owner_b)
+        members = response.json()['data']['members']
+        self.assertEqual(len(members), 1)  # company B has only its own owner, no shared members
+        self.assertEqual(members[0]['id'], str(self.owner_b.id))
+        self.assertEqual(members[0]['active_task_count'], 0)
+
+    def test_workload_requires_authentication(self):
+        response = self.client.get('/api/analytics/company/members/')
+        self.assertEqual(response.status_code, 401)
+
+    def test_workload_reports_company_manager_role(self):
+        cm = User.objects.create_user(email='cm-a@example.com', username='cm-a', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=cm, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER,
+        )
+        response = self.get_workload(self.owner_a)
+        members = {m['id']: m for m in response.json()['data']['members']}
+        self.assertEqual(members[str(cm.id)]['role'], 'CM')
