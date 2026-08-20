@@ -16,14 +16,21 @@ async def get_owned_company(user) -> Company | None:
     return await Company.objects.filter(owner=user).afirst()
 
 
+MANAGED_COMPANY_ROLES = (
+    CompanyUserProfile.Role.COMPANY_MANAGER,
+    CompanyUserProfile.Role.DEPARTMENT_LEADER,
+)
+
+
 async def get_managed_company(user) -> Company | None:
     """The company this user may manage: the company they own, or, failing
-    that, the company where they hold a department-leader profile."""
+    that, the company where they hold a Company Manager or department-leader
+    profile."""
     company = await get_owned_company(user)
     if company is not None:
         return company
     profile = await CompanyUserProfile.objects.select_related('company').filter(
-        user=user, role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        user=user, role__in=MANAGED_COMPANY_ROLES,
     ).afirst()
     return profile.company if profile else None
 
@@ -56,4 +63,34 @@ async def get_company_role(user, company: Company) -> str | None:
     if company.owner_id == user.id:
         return CompanyUserProfile.Role.Owner
     profile = await CompanyUserProfile.objects.filter(user=user, company=company).afirst()
+    return profile.role if profile else None
+
+
+# --------------------------------------------------------------------------
+# Sync mirrors
+# --------------------------------------------------------------------------
+# Django transactions are sync-only, so a multi-write flow that must be
+# atomic (see users.services.update_member_role, and api.api's existing
+# accept_invite_in_transaction) can't await these primitives mid-transaction.
+# These mirror the exact same logic with sync ORM calls, for that use only --
+# prefer the async versions above everywhere else.
+
+def get_owned_company_sync(user) -> Company | None:
+    return Company.objects.filter(owner=user).first()
+
+
+def get_managed_company_sync(user) -> Company | None:
+    company = get_owned_company_sync(user)
+    if company is not None:
+        return company
+    profile = CompanyUserProfile.objects.select_related('company').filter(
+        user=user, role__in=MANAGED_COMPANY_ROLES,
+    ).first()
+    return profile.company if profile else None
+
+
+def get_company_role_sync(user, company: Company) -> str | None:
+    if company.owner_id == user.id:
+        return CompanyUserProfile.Role.Owner
+    profile = CompanyUserProfile.objects.filter(user=user, company=company).first()
     return profile.role if profile else None

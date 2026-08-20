@@ -54,7 +54,7 @@ class InviteIn(Schema):
 
     email: str = Field(min_length=3, max_length=254)
     department: UUID | None = None
-    role: Literal['DL', 'DM'] = 'DM'
+    role: Literal['DL', 'DM', 'CM'] = 'DM'
 
 
 class AcceptInviteIn(Schema):

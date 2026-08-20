@@ -196,6 +196,66 @@ class InvitationTokenSecurityTests(TestCase):
         self.assertFalse(invite.email_sent)
 
 
+class DefaultDepartmentAndTaskTypeSelectionTests(TwoCompanyTestCase):
+    """Regression coverage for a real bug found while adding the Company
+    Manager role: these two endpoints hardcoded an owner-only check instead
+    of using company.services.get_managed_company like every other
+    "manage this company" endpoint, silently rejecting Department Leaders.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from departments_and_teams.models import DefaultDepartment
+        from projects_and_tasks.models import DefaultTaskType
+
+        self.default_department = DefaultDepartment.objects.create(name='Engineering', sector=None)
+        self.default_task_type = DefaultTaskType.objects.create(name='Bug', sector=None)
+        self.dl_a = self._make_department_leader()
+
+    def _make_department_leader(self):
+        user = User.objects.create_user(email='dl-a@example.com', username='dl-a', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=user, company=self.company_a, department=self.department_a,
+            role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        )
+        return user
+
+    def create_departments(self, user):
+        return self.client.post(
+            '/api/department/create_departments_from_defaults/',
+            json.dumps({'company_id': str(self.company_a.id), 'use_all_default_departments': True}),
+            content_type='application/json', **auth_header(user),
+        )
+
+    def create_task_types(self, user):
+        return self.client.post(
+            '/api/default_task_type/default_task_type/',
+            json.dumps({'company_id': str(self.company_a.id), 'use_all_default_task_types': True}),
+            content_type='application/json', **auth_header(user),
+        )
+
+    def test_owner_can_create_departments_from_defaults(self):
+        self.assertEqual(self.create_departments(self.owner_a).status_code, 201)
+
+    def test_department_leader_can_create_departments_from_defaults(self):
+        self.assertEqual(self.create_departments(self.dl_a).status_code, 201)
+
+    def test_department_member_cannot_create_departments_from_defaults(self):
+        self.assertEqual(self.create_departments(self.member_a).status_code, 403)
+
+    def test_other_companys_owner_cannot_create_departments_for_this_company(self):
+        self.assertEqual(self.create_departments(self.owner_b).status_code, 403)
+
+    def test_owner_can_create_task_types_from_defaults(self):
+        self.assertEqual(self.create_task_types(self.owner_a).status_code, 201)
+
+    def test_department_leader_can_create_task_types_from_defaults(self):
+        self.assertEqual(self.create_task_types(self.dl_a).status_code, 201)
+
+    def test_department_member_cannot_create_task_types_from_defaults(self):
+        self.assertEqual(self.create_task_types(self.member_a).status_code, 403)
+
+
 class SignupPasswordValidationTests(TestCase):
     def test_signup_rejects_weak_password(self):
         response = self.client.post(

@@ -46,7 +46,7 @@ services:
     # Production (the Dockerfile's own CMD, used when this image runs
     # without compose) deliberately does NOT auto-migrate -- see
     # DEPLOYMENT.md for the manual release-step rationale.
-    command: sh -c "python manage.py migrate --noinput && python manage.py collectstatic --noinput && uvicorn crm_backend.asgi:application --host 0.0.0.0 --port 8000 --reload --reload-exclude 'staticfiles/*'"
+    command: sh -c "python manage.py migrate --noinput && python manage.py seed_permissions && python manage.py collectstatic --noinput && uvicorn crm_backend.asgi:application --host 0.0.0.0 --port 8000 --reload --reload-exclude 'staticfiles/*'"
 
   celery_worker_simple:
     <<: *base

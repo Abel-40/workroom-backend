@@ -44,6 +44,7 @@ class CompanyUserProfile(UUIDModel):
     company = models.ForeignKey('company.Company', on_delete=models.CASCADE, related_name='company_user_profiles')
     class Role(models.TextChoices):
         Owner = 'Owner', 'Owner'
+        COMPANY_MANAGER = 'CM', 'Company Manager'
         DEPARTMENT_LEADER = 'DL', 'Department Leader'
         DEPARTMENT_MEMBER = 'DM', 'Department Member'
 
@@ -71,6 +72,7 @@ def default_expiration():
 class PendingInvite(UUIDModel):
     class Role(models.TextChoices):
         Owner = 'Owner', 'Owner'
+        COMPANY_MANAGER = 'CM', 'Company Manager'
         DEPARTMENT_LEADER = 'DL', 'Department Leader'
         DEPARTMENT_MEMBER = 'DM', 'Department Member'
 

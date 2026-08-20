@@ -62,6 +62,7 @@ INSTALLED_APPS = [
     # local apps
     'company',
     'users',
+    'permissions',
     'subscriptions',
     'plans',
     'departments_and_teams',

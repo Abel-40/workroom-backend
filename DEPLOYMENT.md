@@ -47,10 +47,16 @@ before rolling out new replicas:
 
 ```
 python manage.py migrate --noinput
+python manage.py seed_permissions
 python manage.py collectstatic --noinput
 ```
 
-Then deploy the new image. The docker-compose dev setup auto-runs both on
+`seed_permissions` mirrors the RBAC catalog (`permissions and roles/roles_permission.yaml`)
+into the database for auditability -- it's idempotent (safe to re-run) and
+authorization itself never depends on it having run (see `permissions/catalog.py`),
+but it should still run on every release in case the catalog changed.
+
+Then deploy the new image. The docker-compose dev setup auto-runs all three on
 every boot because it's always a single instance -- that shortcut doesn't
 apply here.
 

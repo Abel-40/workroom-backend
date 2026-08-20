@@ -6,7 +6,7 @@ from uuid import UUID
 import stripe
 from asgiref.sync import sync_to_async
 from company.models import Company, Sector
-from company.services import get_managed_company
+from company.services import get_company_role, get_managed_company, get_member_company
 from departments_and_teams.models import DefaultDepartment, Department
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
@@ -18,6 +18,7 @@ from django.http import JsonResponse
 from ninja import NinjaAPI
 from ninja.errors import HttpError
 from notifications_and_activity.services import notify_invitation_accepted
+from permissions.catalog import has_permission
 from plans.models import Plan
 from projects_and_tasks.models import DefaultTaskType, TaskType
 from rest_framework_simplejwt.exceptions import TokenError
@@ -32,10 +33,14 @@ from utils.tokens import generate_token, hash_token
 from .auth import JWTBearerAuth
 from .routers.ai import router as ai_router
 from .routers.analytics import router as analytics_router
+from .routers.departments import router as departments_router
 from .routers.documents import router as documents_router
+from .routers.members import router as members_router
 from .routers.notifications import router as notifications_router
 from .routers.projects import router as projects_router
+from .routers.task_types import router as task_types_router
 from .routers.tasks import router as tasks_router
+from .routers.teams import router as teams_router
 from .schemas import (
     AcceptInviteIn,
     ApiResponse,
@@ -65,6 +70,10 @@ api.add_router('', documents_router)
 api.add_router('', ai_router)
 api.add_router('/notifications', notifications_router)
 api.add_router('/analytics', analytics_router)
+api.add_router('/departments', departments_router)
+api.add_router('/teams', teams_router)
+api.add_router('/task-types', task_types_router)
+api.add_router('/company/members', members_router)
 
 payload = api_response
 logger = logging.getLogger(__name__)
@@ -136,10 +145,19 @@ async def signin(request, data: SignInIn):
     )
     if user is None:
         return payload('Invalid email or password.', 401, False)
+    # Role/company context: not modeled on User itself (see users/models.py
+    # CompanyUserProfile) -- the frontend needs it up front to tell an Owner
+    # from a Department Leader/Member without a separate round trip.
+    company = await get_member_company(user)
+    role = await get_company_role(user, company) if company else None
     refresh = RefreshToken.for_user(user)
     response = JsonResponse({
         'success': True, 'message': 'Login successful', 'statusCode': 200,
-        'data': {'user': user_data(user), 'is_authenticated': True, 'access': str(refresh.access_token)},
+        'data': {
+            'user': user_data(user), 'is_authenticated': True, 'access': str(refresh.access_token),
+            'role': role, 'company_id': str(company.id) if company else None,
+            'company_name': company.name if company else None,
+        },
     }, status=200)
     response.set_cookie(
         key='refresh_token', value=str(refresh), httponly=True,
@@ -191,7 +209,8 @@ async def create_departments_from_defaults(request, data: SelectionIn):
     company = await Company.objects.select_related('owner', 'sector').filter(id=data.company_id).afirst()
     if company is None:
         return payload('Company does not exist.', 404, False, errors={'company': ['Invalid company ID']})
-    if company.owner_id != request.auth.id:
+    managed_company = await get_managed_company(request.auth)
+    if managed_company is None or managed_company.id != company.id:
         return payload('You do not have permission to manage this company.', 403, False)
     defaults = DefaultDepartment.objects.filter(
         Q(sector=company.sector) | Q(sector__isnull=True)
@@ -229,7 +248,8 @@ async def create_task_types_from_defaults(request, data: SelectionIn):
     company = await Company.objects.select_related('owner', 'sector').filter(id=data.company_id).afirst()
     if company is None:
         return payload('Company does not exist.', 404, False, errors={'company': ['Invalid company ID']})
-    if company.owner_id != request.auth.id:
+    managed_company = await get_managed_company(request.auth)
+    if managed_company is None or managed_company.id != company.id:
         return payload('You do not have permission to manage this company.', 403, False)
     defaults = DefaultTaskType.objects.filter(
         Q(sector=company.sector) | Q(sector__isnull=True)
@@ -265,6 +285,10 @@ async def send_invite(request, data: InviteIn):
     company = await get_managed_company(request.auth)
     if company is None:
         return payload("You don't have permission to send invitations.", 403, False)
+    if data.role == 'CM':
+        requester_role = await get_company_role(request.auth, company)
+        if not has_permission(requester_role, 'members:invite_cm'):
+            return payload('Only the company owner can invite a Company Manager.', 403, False)
     if data.department and not await Department.objects.filter(id=data.department, company=company).aexists():
         return payload('Invalid department for this company.', 400, False)
     if await CompanyUserProfile.objects.filter(user__email__iexact=data.email, company=company).aexists():

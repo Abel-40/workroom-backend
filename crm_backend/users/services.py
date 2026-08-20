@@ -1,15 +1,19 @@
 """Invite-email retry sweep, shared by the Celery Beat periodic task
 (users/tasks.py) and the send_pending_invites management command so there is
-one implementation instead of two.
+one implementation instead of two; and CompanyUserProfile role management.
 """
 
 import logging
 
+from company.services import get_company_role_sync, get_managed_company_sync
+from departments_and_teams.models import Department, Team
 from django.conf import settings
+from django.db import transaction
+from permissions.catalog import has_permission
 from utils.Invitation_email import send_invitation_email
 from utils.tokens import generate_token, hash_token
 
-from .models import PendingInvite
+from .models import CompanyUserProfile, PendingInvite
 
 logger = logging.getLogger(__name__)
 
@@ -55,3 +59,49 @@ def retry_pending_invite_emails() -> dict:
     result = {'sent': sent, 'expired': expired, 'failed': failed}
     logger.info('invite_email.retry_sweep_completed', extra=result)
     return result
+
+
+def update_member_role(requester, target_user_id, new_role: str):
+    """Change a company member's role. Returns (profile, error) where error
+    is one of 'forbidden', 'cannot_change_self', 'invalid_target', or None.
+
+    Runs entirely synchronously and inside one transaction -- like
+    api.api.accept_invite_in_transaction, this is a multi-write flow
+    (the role change, plus clearing Department/Team leadership if someone
+    is demoted away from Department Leader) that Django can only make atomic
+    on a sync connection.
+    """
+    with transaction.atomic():
+        company = get_managed_company_sync(requester)
+        if company is None:
+            return None, 'forbidden'
+        requester_role = get_company_role_sync(requester, company)
+        if not has_permission(requester_role, 'members:manage_role'):
+            return None, 'forbidden'
+        if target_user_id == requester.id:
+            return None, 'cannot_change_self'
+        if company.owner_id == target_user_id:
+            return None, 'invalid_target'
+
+        profile = CompanyUserProfile.objects.select_related('user').filter(
+            user_id=target_user_id, company=company,
+        ).first()
+        if profile is None:
+            return None, 'invalid_target'
+
+        involves_company_manager = CompanyUserProfile.Role.COMPANY_MANAGER in (new_role, profile.role)
+        if involves_company_manager and not has_permission(requester_role, 'members:manage_cm_role'):
+            return None, 'forbidden'
+
+        if profile.role == new_role:
+            return profile, None
+
+        old_role = profile.role
+        profile.role = new_role
+        profile.save(update_fields=['role'])
+
+        if old_role == CompanyUserProfile.Role.DEPARTMENT_LEADER and new_role != CompanyUserProfile.Role.DEPARTMENT_LEADER:
+            Department.objects.filter(company=company, leader_id=target_user_id).update(leader=None)
+            Team.objects.filter(company=company, leader_id=target_user_id).update(leader=None)
+
+        return profile, None

@@ -1,0 +1,110 @@
+# Workroom RBAC catalog -- single source of truth for role -> permission.
+#
+# Loaded once at process start (permissions.apps.PermissionsConfig.ready)
+# into an in-memory {role_code: frozenset(permission_codes)} map. No
+# authorization check ever queries the database for this data (see
+# permissions/catalog.py). Role keys MUST exactly equal
+# users.models.CompanyUserProfile.Role values -- the loader asserts this at
+# startup and raises ImproperlyConfigured on any mismatch.
+#
+# permissions/management/commands/seed_permissions.py mirrors this file into
+# the Permission/RolePermission tables purely for auditability and a future
+# admin UI; that DB mirror is never read on the authorization hot path, so a
+# skipped/failed seed run degrades only introspection, never live auth.
+#
+# A department boundary (e.g. "Department Leader may manage projects only in
+# their own department") isn't expressible as a flat permission code -- that
+# scoping stays in code (projects_and_tasks/services.py), layered on top of
+# the coarse grant below. This file answers "can this role attempt the
+# action at all," not "which specific rows."
+
+roles:
+
+  Owner:
+    description: >
+      Company owner (Company.owner -- exactly one per company, not a stored
+      CompanyUserProfile row). Full control, including the three things
+      Company Manager is deliberately denied: billing, minting/revoking
+      other Company Managers, and destroying/transferring the company.
+    permissions:
+      - subscription:manage          # /subscriptions/start-checkout/, /subscriptions/my-subscription/
+      - company:delete                # reserved -- no endpoint yet
+      - company:transfer_ownership    # reserved -- no endpoint yet
+      - members:view
+      - members:invite
+      - members:invite_cm             # only Owner may offer the CM role via invite
+      - members:manage_role
+      - members:manage_cm_role        # only Owner may promote/demote a Company Manager
+      - departments:view
+      - departments:manage
+      - teams:view
+      - teams:manage
+      - task_types:view
+      - task_types:manage
+      - projects:create
+      - projects:manage_any
+      - tasks:create
+      - tasks:manage_any
+      - documents:upload
+      - documents:delete_any
+      - ai:request
+      - analytics:view
+
+  CM:
+    description: >
+      Company Manager. Day-to-day operational parity with Owner across
+      members, departments, teams, projects, tasks, and documents --
+      excluding billing/subscription control and minting or revoking other
+      Company Managers (so a Company Manager can never create a peer), and
+      excluding company deletion/ownership transfer.
+    permissions:
+      - members:view
+      - members:invite
+      - members:manage_role
+      - departments:view
+      - departments:manage
+      - teams:view
+      - teams:manage
+      - task_types:view
+      - task_types:manage
+      - projects:create
+      - projects:manage_any
+      - tasks:create
+      - tasks:manage_any
+      - documents:upload
+      - documents:delete_any
+      - ai:request
+      - analytics:view
+
+  DL:
+    description: >
+      Department Leader. Administrative reach is limited to their own
+      department -- enforced in code alongside this catalog, since a
+      department boundary isn't expressible as a flat permission code.
+    permissions:
+      - members:view
+      - members:invite
+      - departments:view
+      - departments:manage
+      - teams:view
+      - teams:manage
+      - task_types:view
+      - task_types:manage
+      - projects:create
+      - tasks:create
+      - documents:upload
+      - ai:request
+      - analytics:view
+
+  DM:
+    description: Department Member. Baseline operational access only.
+    permissions:
+      - members:view
+      - departments:view
+      - teams:view
+      - task_types:view
+      - projects:create
+      - tasks:create
+      - documents:upload
+      - ai:request
+      - analytics:view
