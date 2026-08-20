@@ -36,6 +36,10 @@ class Project(UUIDModel):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     image = models.ImageField(upload_to='project_images/', blank=True, null=True)
+    # A project's cover image is exactly one of an uploaded file (above) or an
+    # external link (below) -- see projects_and_tasks.services for the
+    # mutual-exclusion rule enforced whenever either is set.
+    image_url = models.URLField(blank=True, default='')
     priority = models.CharField(max_length=20, choices=PRIORITY.choices, default=PRIORITY.MEDIUM)
     collaborators = models.ManyToManyField(User, related_name='collaborated_projects', blank=True)
     is_deleted = models.BooleanField(default=False)

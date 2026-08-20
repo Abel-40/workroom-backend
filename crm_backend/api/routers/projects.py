@@ -1,14 +1,18 @@
 """Project CRUD API (Phase 1)."""
 
+import mimetypes
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
+from asgiref.sync import sync_to_async
+from django.http import FileResponse
 from django.utils import timezone
-from ninja import Router, Schema
+from ninja import File, Router, Schema
+from ninja.files import UploadedFile
 from projects_and_tasks import services
 from projects_and_tasks.models import Project, Task
-from pydantic import Field
+from pydantic import Field, HttpUrl
 from utils.api_response import api_response as payload
 from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
@@ -32,6 +36,7 @@ class ProjectIn(Schema):
     priority: PriorityLiteral = 'medium'
     start_date: datetime | None = None
     deadline: datetime | None = None
+    collaborator_ids: list[UUID] = Field(default_factory=list)
 
 
 class ProjectUpdateIn(Schema):
@@ -44,6 +49,19 @@ class ProjectUpdateIn(Schema):
     status: StatusLiteral | None = None
     start_date: datetime | None = None
     deadline: datetime | None = None
+    collaborator_ids: list[UUID] | None = None
+
+
+def _project_image_data(project: Project) -> dict | None:
+    """A project's cover image is served either as a direct external link, or
+    -- for an uploaded file -- through the authenticated streaming endpoint
+    below (there is no public /media/ route for user uploads; see
+    settings.py), never as a raw file path."""
+    if project.image:
+        return {'kind': 'upload', 'url': f'/projects/{project.id}/image/'}
+    if project.image_url:
+        return {'kind': 'link', 'url': project.image_url}
+    return None
 
 
 async def project_data(project: Project) -> dict:
@@ -52,6 +70,7 @@ async def project_data(project: Project) -> dict:
     query the counts directly instead."""
     total_tasks = await project.tasks.filter(is_deleted=False).acount()
     completed_tasks = await project.tasks.filter(is_deleted=False, status=Task.STATUS.DONE).acount()
+    collaborator_ids = [str(user_id) async for user_id in project.collaborators.values_list('id', flat=True)]
     return {
         'id': str(project.id),
         'title': project.title,
@@ -70,6 +89,8 @@ async def project_data(project: Project) -> dict:
         'total_tasks': total_tasks,
         'active_tasks': total_tasks - completed_tasks,
         'completion_percent': round((completed_tasks / total_tasks) * 100, 2) if total_tasks else 0,
+        'collaborator_ids': collaborator_ids,
+        'image': _project_image_data(project),
     }
 
 
@@ -81,6 +102,7 @@ async def create_project(request, data: ProjectIn):
         department_id=data.department_id, team_id=data.team_id,
         visibility=data.visibility, priority=data.priority,
         start_date=data.start_date or timezone.now(), deadline=data.deadline or timezone.now(),
+        collaborator_ids=data.collaborator_ids,
     )
     if error == 'no_company':
         return payload("You must belong to a company to create a project.", 400, False)
@@ -88,6 +110,11 @@ async def create_project(request, data: ProjectIn):
         return payload('Invalid department for this company.', 400, False, errors={'department_id': ['Invalid department']})
     if error == 'invalid_team':
         return payload('Invalid team for this company.', 400, False, errors={'team_id': ['Invalid team']})
+    if error == 'invalid_collaborator':
+        return payload(
+            'Invalid collaborator for this company.', 400, False,
+            errors={'collaborator_ids': ['One or more users are not members of this company']},
+        )
     return payload('Project created successfully.', 201, True, {'project': await project_data(project)})
 
 
@@ -122,6 +149,11 @@ async def update_project(request, project_id: UUID, data: ProjectUpdateIn):
         return payload('You do not have permission to modify this project.', 403, False)
     if error in ('invalid_department', 'invalid_team'):
         return payload('Invalid department or team for this company.', 400, False)
+    if error == 'invalid_collaborator':
+        return payload(
+            'Invalid collaborator for this company.', 400, False,
+            errors={'collaborator_ids': ['One or more users are not members of this company']},
+        )
     return payload('Project updated successfully.', 200, True, {'project': await project_data(updated)})
 
 
@@ -135,3 +167,63 @@ async def archive_project(request, project_id: UUID):
     if not await services.archive_project(request.auth, project):
         return payload('You do not have permission to archive this project.', 403, False)
     return payload('Project archived successfully.', 200, True)
+
+
+class ProjectImageLinkIn(Schema):
+    image_url: HttpUrl
+
+
+@router.put('/{project_id}/image/', auth=auth, response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+async def set_project_image_link(request, project_id: UUID, data: ProjectImageLinkIn):
+    project, error = await services.get_project_for_user(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    updated, error = await services.set_project_image_link(request.auth, project, str(data.image_url))
+    if error == 'forbidden':
+        return payload('You do not have permission to modify this project.', 403, False)
+    return payload('Project image updated successfully.', 200, True, {'project': await project_data(updated)})
+
+
+@router.post('/{project_id}/image/', auth=auth, response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+async def upload_project_image(request, project_id: UUID, image: UploadedFile = File(...)):
+    project, error = await services.get_project_for_user(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    updated, error = await services.upload_project_image(request.auth, project, image)
+    if error == 'forbidden':
+        return payload('You do not have permission to modify this project.', 403, False)
+    if error == 'too_large':
+        return payload('Image exceeds the maximum allowed size (5MB).', 400, False)
+    if error == 'invalid_content_type':
+        return payload('This image type is not allowed. Use PNG, JPEG, GIF, or WEBP.', 400, False)
+    return payload('Project image uploaded successfully.', 200, True, {'project': await project_data(updated)})
+
+
+@router.get('/{project_id}/image/', auth=auth, response={403: ApiResponse, 404: ApiResponse})
+async def download_project_image(request, project_id: UUID):
+    project, error = await services.get_project_for_user(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    if not project.image:
+        return payload('This project has no uploaded image.', 404, False)
+    content_type = mimetypes.guess_type(project.image.name)[0] or 'application/octet-stream'
+    file_handle = await sync_to_async(project.image.open, thread_sensitive=True)('rb')
+    return FileResponse(file_handle, content_type=content_type)
+
+
+@router.delete('/{project_id}/image/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+async def delete_project_image(request, project_id: UUID):
+    project, error = await services.get_project_for_user(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    if not await services.remove_project_image(request.auth, project):
+        return payload('You do not have permission to modify this project.', 403, False)
+    return payload('Project image removed successfully.', 200, True)

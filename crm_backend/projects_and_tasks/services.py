@@ -50,7 +50,7 @@ async def user_can_view_project(user, project) -> bool:
     role = await get_company_role(user, project.company)
     if role is None:
         return False
-    if role == CompanyUserProfile.Role.Owner:
+    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
         return True
     if project.visibility == Project.VISIBILITY.COMPANY:
         return True
@@ -70,7 +70,7 @@ async def user_can_manage_project(user, project) -> bool:
     if project.created_by_id == user.id:
         return True
     role = await get_company_role(user, project.company)
-    if role == CompanyUserProfile.Role.Owner:
+    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
         return True
     if role == CompanyUserProfile.Role.DEPARTMENT_LEADER and project.department_id:
         profile = await CompanyUserProfile.objects.filter(user=user, company=project.company).afirst()
@@ -103,7 +103,7 @@ async def list_projects_for_user(user):
         return Project.objects.none()
     qs = Project.objects.filter(company=company, is_deleted=False).select_related('department', 'created_by')
     role = await get_company_role(user, company)
-    if role == CompanyUserProfile.Role.Owner:
+    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
         return qs.order_by('-created_at')
 
     visible = Q(visibility=Project.VISIBILITY.PUBLIC) | Q(visibility=Project.VISIBILITY.COMPANY)
@@ -145,8 +145,23 @@ async def _resolve_team(company, team_id):
     return team, None
 
 
+async def _resolve_collaborators(company, collaborator_ids):
+    """Validates every id belongs to the company (owner or any profile role)
+    before it's trusted -- never let a client attach an arbitrary user id to
+    a project (Rule 3)."""
+    if not collaborator_ids:
+        return [], None
+    users = [user async for user in User.objects.filter(id__in=collaborator_ids)]
+    if len(users) != len(set(collaborator_ids)):
+        return None, 'invalid_collaborator'
+    for candidate in users:
+        if not await is_company_member(candidate, company):
+            return None, 'invalid_collaborator'
+    return users, None
+
+
 async def create_project(user, *, title, description, visibility, priority, start_date, deadline,
-                          department_id=None, team_id=None):
+                          department_id=None, team_id=None, collaborator_ids=None):
     company = await get_member_company(user)
     if company is None:
         return None, 'no_company'
@@ -156,10 +171,15 @@ async def create_project(user, *, title, description, visibility, priority, star
     team, error = await _resolve_team(company, team_id)
     if error:
         return None, error
+    collaborators, error = await _resolve_collaborators(company, collaborator_ids)
+    if error:
+        return None, error
     project = await Project.objects.acreate(
         title=title, description=description, company=company, department=department, team=team,
         visibility=visibility, priority=priority, start_date=start_date, deadline=deadline, created_by=user,
     )
+    if collaborators:
+        await sync_to_async(project.collaborators.set, thread_sensitive=True)(collaborators)
     return project, None
 
 
@@ -176,10 +196,17 @@ async def update_project(user, project, updates: dict):
         if error:
             return None, error
         project.team = team
+    collaborators = None
+    if 'collaborator_ids' in updates:
+        collaborators, error = await _resolve_collaborators(project.company, updates.pop('collaborator_ids'))
+        if error:
+            return None, error
     for field, value in updates.items():
         if field in PROJECT_UPDATABLE_FIELDS:
             setattr(project, field, value)
     await project.asave()
+    if collaborators is not None:
+        await sync_to_async(project.collaborators.set, thread_sensitive=True)(collaborators)
     return project, None
 
 
@@ -188,6 +215,54 @@ async def archive_project(user, project) -> bool:
         return False
     project.is_deleted = True
     await project.asave(update_fields=['is_deleted'])
+    return True
+
+
+# --------------------------------------------------------------------------
+# Project cover image -- exactly one of an uploaded file or an external link
+# is active at a time (see Project.image / Project.image_url); setting one
+# clears the other rather than leaving stale state behind.
+# --------------------------------------------------------------------------
+
+MAX_PROJECT_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+ALLOWED_PROJECT_IMAGE_CONTENT_TYPES = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
+
+
+async def set_project_image_link(user, project, image_url: str):
+    if not await user_can_manage_project(user, project):
+        return None, 'forbidden'
+    if project.image:
+        await sync_to_async(project.image.delete, thread_sensitive=True)(save=False)
+    project.image = None
+    project.image_url = image_url
+    await project.asave(update_fields=['image', 'image_url'])
+    return project, None
+
+
+async def upload_project_image(user, project, uploaded_file):
+    if not await user_can_manage_project(user, project):
+        return None, 'forbidden'
+    if uploaded_file.size > MAX_PROJECT_IMAGE_SIZE_BYTES:
+        return None, 'too_large'
+    content_type = uploaded_file.content_type or ''
+    if content_type not in ALLOWED_PROJECT_IMAGE_CONTENT_TYPES:
+        return None, 'invalid_content_type'
+    if project.image:
+        await sync_to_async(project.image.delete, thread_sensitive=True)(save=False)
+    project.image = uploaded_file
+    project.image_url = ''
+    await project.asave(update_fields=['image', 'image_url'])
+    return project, None
+
+
+async def remove_project_image(user, project) -> bool:
+    if not await user_can_manage_project(user, project):
+        return False
+    if project.image:
+        await sync_to_async(project.image.delete, thread_sensitive=True)(save=False)
+    project.image = None
+    project.image_url = ''
+    await project.asave(update_fields=['image', 'image_url'])
     return True
 
 
