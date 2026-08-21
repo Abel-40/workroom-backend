@@ -6,6 +6,8 @@ service directly -- that boundary is Phase 6/7 (ARCHITECTURE.md Section 4/7).
 import logging
 
 from asgiref.sync import sync_to_async
+from company.services import is_company_member
+from django.contrib.auth import get_user_model
 from projects_and_tasks.services import user_can_view_project
 
 from .models import AIGeneration
@@ -13,11 +15,30 @@ from .tasks import process_ai_generation
 
 logger = logging.getLogger(__name__)
 
+User = get_user_model()
 
-async def request_project_plan(user, project):
+
+async def request_project_plan(user, project, *, prompt: str, mentioned_user_ids: list | None = None):
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
-    generation = await AIGeneration.objects.acreate(project=project, requested_by=user)
+    if await AIGeneration.objects.filter(project=project, saved_at__isnull=False).aexists():
+        return None, 'plan_already_saved'
+
+    requirements = prompt
+    if mentioned_user_ids:
+        # Informational only -- names the requester referenced while
+        # describing the work, never a structured "assign to" instruction.
+        # The AI has no assignee field to write to (see ai_schemas.GeneratedTask);
+        # real assignment happens explicitly in the review step.
+        candidates = [user async for user in User.objects.filter(id__in=mentioned_user_ids)]
+        mentioned_names = [
+            (candidate.first_name or candidate.username)
+            for candidate in candidates if await is_company_member(candidate, project.company)
+        ]
+        if mentioned_names:
+            requirements += f"\n\nTeam members mentioned by the requester (for context only, do not assign tasks): {', '.join(mentioned_names)}"
+
+    generation = await AIGeneration.objects.acreate(project=project, requested_by=user, prompt=requirements)
     try:
         # thread_sensitive=True: under CELERY_TASK_ALWAYS_EAGER (tests),
         # .delay() runs the task body inline on whatever thread this runs

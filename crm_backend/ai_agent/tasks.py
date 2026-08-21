@@ -3,13 +3,17 @@
 process_ai_generation: marks PROCESSING, calls the FastAPI AI service,
 independently re-validates the structured plan against this company's real
 department/task-type records (never trust the AI service's own validation
-alone -- Rule 9), and persists it transactionally via
-projects_and_tasks.services (Phase 8). Retries transient failures; a
-permanently invalid or rejected plan fails the generation outright rather
-than retrying forever ("Do not endlessly retry invalid AI output").
+alone -- Rule 9), and stores it as draft AIGeneratedTask rows for human
+review -- it does NOT create real Task rows; that only happens once a
+reviewer explicitly saves the plan (projects_and_tasks.services.persist_ai_generated_tasks,
+called from the /ai/generations/{id}/save/ endpoint). Retries transient
+failures; a permanently invalid or rejected plan fails the generation
+outright rather than retrying forever ("Do not endlessly retry invalid AI
+output").
 """
 
 import logging
+import uuid
 
 import requests
 from celery import shared_task
@@ -18,9 +22,8 @@ from django.conf import settings
 from django.utils import timezone
 from notifications_and_activity.services import notify_ai_generation_completed, notify_ai_generation_failed
 from projects_and_tasks.models import TaskType
-from projects_and_tasks.services import persist_ai_generated_tasks
 
-from .models import AIGeneration
+from .models import AIGeneratedTask, AIGeneration
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +45,7 @@ def _build_request_payload(generation: AIGeneration) -> dict:
         'project_id': str(project.id),
         'title': project.title,
         'description': project.description,
-        'requirements': '',
+        'requirements': generation.prompt,
         'departments': [{'id': str(d['id']), 'name': d['name']} for d in departments],
         'task_types': [{'id': str(t['id']), 'name': t['name']} for t in task_types],
     }
@@ -107,7 +110,7 @@ def process_ai_generation(self, generation_id: str):
 
     plan_data = response_body.get('data') or {}
     try:
-        created_count = persist_ai_generated_tasks(generation, plan_data)
+        created_count = _store_generated_tasks_for_review(generation, plan_data)
     except ValueError as exc:
         logger.error('ai_generation.persist_failed', extra={'generation_id': str(generation.id), 'error': str(exc)})
         _mark_failed(generation, str(exc))
@@ -121,3 +124,62 @@ def process_ai_generation(self, generation_id: str):
     generation.save(update_fields=['status', 'completed_at', 'task_count', 'provider', 'model'])
     notify_ai_generation_completed(generation)
     logger.info('ai_generation.completed', extra={'generation_id': str(generation.id), 'task_count': created_count})
+
+
+def _store_generated_tasks_for_review(generation: AIGeneration, plan_data: dict) -> int:
+    """Validate the AI's plan against this company's real department/task-type
+    records and store it as draft AIGeneratedTask rows for human review --
+    deliberately does NOT create real Task rows (see module docstring).
+    Django re-validates independently of the AI service's own validation
+    (Rule 9); a department/task type/dependency reference outside what was
+    actually supplied to the AI fails the whole generation.
+    """
+    project = generation.project
+    tasks_data = plan_data.get('tasks') or []
+    if not tasks_data:
+        raise ValueError('AI service returned an empty task list.')
+
+    company_department_ids = set(Department.objects.filter(company=project.company).values_list('id', flat=True))
+    company_task_type_ids = set(TaskType.objects.filter(company=project.company).values_list('id', flat=True))
+
+    known_temp_ids = set()
+    for item in tasks_data:
+        if not item.get('temporary_id') or not item.get('title'):
+            raise ValueError('AI-generated task is missing temporary_id or title.')
+        known_temp_ids.add(item['temporary_id'])
+
+    to_create = []
+    for item in tasks_data:
+        dependency_ids = item.get('dependency_ids') or []
+        for dep in dependency_ids:
+            if dep not in known_temp_ids:
+                raise ValueError(f"Task '{item['temporary_id']}' references an unknown dependency id.")
+
+        department_id = None
+        raw_department_id = item.get('suggested_department_id')
+        if raw_department_id:
+            department_id = uuid.UUID(str(raw_department_id))
+            if department_id not in company_department_ids:
+                raise ValueError(f"Task '{item['temporary_id']}' suggested a department outside this company.")
+
+        task_type_id = None
+        raw_task_type_id = item.get('suggested_task_type_id')
+        if raw_task_type_id:
+            task_type_id = uuid.UUID(str(raw_task_type_id))
+            if task_type_id not in company_task_type_ids:
+                raise ValueError(f"Task '{item['temporary_id']}' suggested a task type outside this company.")
+
+        priority = item.get('priority') or AIGeneratedTask.PRIORITY.MEDIUM
+        if priority not in AIGeneratedTask.PRIORITY.values:
+            priority = AIGeneratedTask.PRIORITY.MEDIUM
+
+        to_create.append(AIGeneratedTask(
+            generation=generation, temporary_id=item['temporary_id'], sequence=item.get('sequence') or 0,
+            title=item['title'][:255], description=item.get('description') or '',
+            priority=priority, estimated_effort=(item.get('estimated_effort') or '')[:100],
+            dependency_temp_ids=dependency_ids,
+            suggested_department_id=department_id, suggested_task_type_id=task_type_id,
+        ))
+
+    AIGeneratedTask.objects.bulk_create(to_create)
+    return len(to_create)

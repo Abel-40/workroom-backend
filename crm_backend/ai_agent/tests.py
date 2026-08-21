@@ -8,7 +8,7 @@ from notifications_and_activity.models import Notification
 from projects_and_tasks.models import Project, Task, TaskType
 from users.models import User
 
-from ai_agent.models import AIGeneration
+from ai_agent.models import AIGeneratedTask, AIGeneration
 from ai_agent.tasks import process_ai_generation
 
 
@@ -34,7 +34,11 @@ class ProcessAIGenerationTests(TestCase):
         self.project = Project.objects.create(title='Support platform', company=self.company, created_by=self.owner)
         self.generation = AIGeneration.objects.create(project=self.project, requested_by=self.owner)
 
-    def test_successful_generation_persists_tasks_and_completes(self):
+    def test_successful_generation_stores_draft_tasks_for_review(self):
+        """Completion stores draft AIGeneratedTask rows for human review --
+        it must NOT create real backlog Task rows; that only happens once a
+        reviewer explicitly saves the plan (see projects_and_tasks.tests for
+        persist_ai_generated_tasks, the save step)."""
         plan = {'success': True, 'data': {
             'provider': 'gemini', 'model': 'gemini-2.0-flash', 'summary': 'A plan',
             'tasks': [
@@ -51,11 +55,17 @@ class ProcessAIGenerationTests(TestCase):
         self.assertEqual(self.generation.status, AIGeneration.STATUS.COMPLETED)
         self.assertEqual(self.generation.task_count, 2)
         self.assertEqual(self.generation.provider, 'gemini')
+        self.assertIsNone(self.generation.saved_at)
 
-        tasks = Task.objects.filter(project=self.project)
-        self.assertEqual(tasks.count(), 2)
-        self.assertTrue(all(t.source == Task.SOURCE.AI_GENERATED for t in tasks))
-        self.assertTrue(all(t.assigned_to_id is None for t in tasks))  # AI must never invent an assignee
+        self.assertEqual(Task.objects.filter(project=self.project).count(), 0)
+
+        drafts = AIGeneratedTask.objects.filter(generation=self.generation).order_by('sequence')
+        self.assertEqual(drafts.count(), 2)
+        self.assertEqual(drafts[0].suggested_department_id, self.department.id)
+        self.assertEqual(drafts[0].suggested_task_type_id, self.task_type.id)
+        self.assertEqual(drafts[1].dependency_temp_ids, ['t1'])
+        self.assertTrue(all(d.assigned_to_id is None for d in drafts))  # AI must never invent an assignee
+        self.assertTrue(all(d.comment_resolved for d in drafts))
         self.assertTrue(Notification.objects.filter(
             recipient=self.owner, type=Notification.Type.AI_GENERATION_COMPLETED,
         ).exists())
@@ -78,6 +88,7 @@ class ProcessAIGenerationTests(TestCase):
         self.generation.refresh_from_db()
         self.assertEqual(self.generation.status, AIGeneration.STATUS.FAILED)
         self.assertEqual(Task.objects.filter(project=self.project).count(), 0)
+        self.assertEqual(AIGeneratedTask.objects.filter(generation=self.generation).count(), 0)
 
     def test_already_completed_generation_is_not_reprocessed(self):
         self.generation.status = AIGeneration.STATUS.COMPLETED
