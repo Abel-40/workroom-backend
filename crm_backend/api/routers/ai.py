@@ -65,6 +65,7 @@ async def generation_data(generation: AIGeneration, *, include_tasks: bool = Tru
         'status': generation.status,
         'provider': generation.provider,
         'model': generation.model,
+        'prompt': generation.prompt,
         'requested_at': generation.requested_at.isoformat(),
         'started_at': generation.started_at.isoformat() if generation.started_at else None,
         'completed_at': generation.completed_at.isoformat() if generation.completed_at else None,

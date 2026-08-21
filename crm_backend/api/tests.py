@@ -634,6 +634,22 @@ class EligibleAssigneesTests(TwoCompanyTestCase):
         response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
+    def test_results_include_role_and_department_for_the_mention_and_assignee_picker(self):
+        project = self.create_project(owner=self.owner_a, department_id=str(self.department_a.id))
+        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        rows = {row['id']: row for row in response.json()['data']['results']}
+        member_row = rows[str(self.member_a.id)]
+        self.assertEqual(member_row['role'], CompanyUserProfile.Role.DEPARTMENT_MEMBER)
+        self.assertEqual(member_row['department'], self.department_a.name)
+
+        # The owner has no CompanyUserProfile row -- only reachable via the
+        # unscoped company-roster fallback (no department/team on the project).
+        unscoped_project = self.create_project(owner=self.owner_a)
+        response = self.client.get(f"/api/projects/{unscoped_project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        owner_row = {row['id']: row for row in response.json()['data']['results']}[str(self.owner_a.id)]
+        self.assertEqual(owner_row['role'], CompanyUserProfile.Role.Owner)
+        self.assertIsNone(owner_row['department'])
+
 
 class AIPlanReviewSecurityTests(TwoCompanyTestCase):
     def _make_generation_with_draft(self, project_id, owner, **overrides):

@@ -13,6 +13,7 @@ from ninja.files import UploadedFile
 from projects_and_tasks import services
 from projects_and_tasks.models import Project, Task
 from pydantic import Field, HttpUrl
+from users.models import CompanyUserProfile
 from utils.api_response import api_response as payload
 from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
@@ -243,12 +244,31 @@ async def list_eligible_assignees(request, project_id: UUID):
     candidates, error = await services.list_eligible_assignees(request.auth, project)
     if error == 'forbidden':
         return payload('You do not have permission to view this project.', 403, False)
-    return payload('Eligible assignees retrieved successfully.', 200, True, {
-        'results': [
-            {
-                'id': str(user.id), 'first_name': user.first_name, 'last_name': user.last_name,
-                'username': user.username, 'email': user.email,
-            }
-            for user in candidates
-        ],
-    })
+
+    # Role/department enrichment mirrors analytics/services.py::get_company_workload's
+    # shape (employeeStore's established Employee contract) -- a presentation-layer
+    # concern only, so services.list_eligible_assignees itself keeps returning plain
+    # User objects unchanged for is_eligible_assignee's sake.
+    profiles = {
+        profile.user_id: profile
+        async for profile in CompanyUserProfile.objects.filter(
+            company=project.company, user_id__in=[c.id for c in candidates],
+        ).select_related('department')
+    }
+
+    def member_data(user):
+        if user.id == project.company.owner_id:
+            return CompanyUserProfile.Role.Owner, None
+        profile = profiles.get(user.id)
+        if not profile:
+            return None, None
+        return profile.role, (profile.department.name if profile.department_id else None)
+
+    results = []
+    for user in candidates:
+        role, department = member_data(user)
+        results.append({
+            'id': str(user.id), 'first_name': user.first_name, 'last_name': user.last_name,
+            'username': user.username, 'email': user.email, 'role': role, 'department': department,
+        })
+    return payload('Eligible assignees retrieved successfully.', 200, True, {'results': results})
