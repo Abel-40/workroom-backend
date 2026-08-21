@@ -6,7 +6,6 @@ any client-supplied company/project/department id at face value.
 """
 
 import re
-import uuid
 from datetime import timedelta
 
 from asgiref.sync import sync_to_async
@@ -15,6 +14,7 @@ from departments_and_teams.models import Department, Team
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Q
+from django.utils import timezone
 from notifications_and_activity.services import notify_task_assigned, notify_task_completed
 from users.models import CompanyUserProfile
 
@@ -353,6 +353,64 @@ async def update_task(user, task, updates: dict):
     return task, None
 
 
+async def list_eligible_assignees(user, project):
+    """Users eligible to be assigned a task on this project, scoped by the
+    PROJECT's own team/department (not the requester's) -- team takes
+    precedence when the project has one; department otherwise; falls back to
+    the full company roster when the project has neither, so the feature
+    stays usable for unscoped projects rather than returning nothing.
+    Department/team `leader` isn't given special treatment here: nothing in
+    the existing permission system gates task assignment by leadership."""
+    if not await user_can_view_project(user, project):
+        return None, 'forbidden'
+    if project.team_id:
+        candidates = [u async for u in User.objects.filter(team_memberships__id=project.team_id).distinct()]
+    elif project.department_id:
+        candidates = [
+            profile.user async for profile in
+            CompanyUserProfile.objects.filter(
+                company=project.company, department_id=project.department_id,
+            ).select_related('user')
+        ]
+    else:
+        candidates = [
+            profile.user async for profile in
+            CompanyUserProfile.objects.filter(company=project.company).select_related('user')
+        ]
+        owner_id = project.company.owner_id
+        if owner_id and not any(u.id == owner_id for u in candidates):
+            owner = await User.objects.filter(id=owner_id).afirst()
+            if owner:
+                candidates.append(owner)
+    return candidates, None
+
+
+def _eligible_assignee_ids_sync(project) -> set:
+    """Sync mirror of list_eligible_assignees' scoping rule (minus the
+    view-permission gate, already satisfied by the caller), for use inside
+    persist_ai_generated_tasks -- a sync, transactional function (Django
+    transactions are sync-only, see company/services.py)."""
+    if project.team_id:
+        return set(User.objects.filter(team_memberships__id=project.team_id).values_list('id', flat=True))
+    if project.department_id:
+        return set(
+            CompanyUserProfile.objects.filter(
+                company=project.company, department_id=project.department_id,
+            ).values_list('user_id', flat=True)
+        )
+    ids = set(CompanyUserProfile.objects.filter(company=project.company).values_list('user_id', flat=True))
+    if project.company.owner_id:
+        ids.add(project.company.owner_id)
+    return ids
+
+
+async def is_eligible_assignee(user, project, candidate) -> bool:
+    eligible, error = await list_eligible_assignees(user, project)
+    if error:
+        return False
+    return any(u.id == candidate.id for u in eligible)
+
+
 async def assign_task(user, task, assignee_id):
     if not await user_can_manage_task(user, task):
         return None, 'forbidden'
@@ -418,69 +476,66 @@ def _parse_estimated_effort(text: str):
     return timedelta(**{unit: amount})
 
 
-def persist_ai_generated_tasks(generation, plan_data: dict) -> int:
-    """Validate an AI-generated plan against this company's real
-    department/task-type records and persist it as real Tasks
-    (source=AI_GENERATED). Runs in one transaction: either the whole plan
-    lands or none of it does. Raises ValueError on any structural problem --
-    Django re-validates independently of the AI service's own validation
-    (Rule 9), and the AI is never allowed to invent a department, task type,
-    or assignee that wasn't explicitly supplied to it.
+def persist_ai_generated_tasks(generation):
+    """Persist a reviewed generation's draft AIGeneratedTask rows as real
+    backlog Tasks (source=AI_GENERATED). Runs in one transaction: either the
+    whole plan lands or none of it does. A row whose reviewer-assigned user
+    turned out ineligible (e.g. the project's department/team changed after
+    the row was assigned) is created WITHOUT an assignee rather than failing
+    the whole save; its temporary_id is reported back so the caller can
+    surface which one needs re-assignment.
 
-    Sync, not async: called from the sync Celery worker (ai_agent/tasks.py).
+    Sync, not async: Django transactions are sync-only (see
+    company/services.py), and this is a multi-write flow (Task rows,
+    AIGeneratedTask.created_task bookkeeping, AIGeneration.saved_at) that
+    must be atomic together.
+
+    Returns (created_tasks, invalid_assignee_temp_ids). Raises ValueError if
+    there's nothing to save or the plan was already saved (idempotency: a
+    repeated call must not create a second batch of tasks).
     """
+    from ai_agent.models import AIGeneratedTask  # local import: projects_and_tasks stays the core app, ai_agent depends on it, not vice versa
+
+    if generation.saved_at is not None:
+        raise ValueError('This plan has already been saved.')
+
     project = generation.project
-    tasks_data = plan_data.get('tasks') or []
-    if not tasks_data:
-        raise ValueError('AI service returned an empty task list.')
+    draft_rows = list(
+        generation.generated_tasks.select_related('suggested_department', 'suggested_task_type', 'assigned_to').order_by('sequence'),
+    )
+    if not draft_rows:
+        raise ValueError('This generation has no draft tasks to save.')
 
-    company_department_ids = set(Department.objects.filter(company=project.company).values_list('id', flat=True))
-    company_task_type_ids = set(TaskType.objects.filter(company=project.company).values_list('id', flat=True))
-
-    known_temp_ids = set()
-    for item in tasks_data:
-        if not item.get('temporary_id') or not item.get('title'):
-            raise ValueError('AI-generated task is missing temporary_id or title.')
-        known_temp_ids.add(item['temporary_id'])
+    eligible_ids = _eligible_assignee_ids_sync(project)
 
     to_create = []
-    for item in tasks_data:
-        for dep in item.get('dependency_ids') or []:
-            if dep not in known_temp_ids:
-                raise ValueError(f"Task '{item['temporary_id']}' references an unknown dependency id.")
-
-        department_id = None
-        raw_department_id = item.get('suggested_department_id')
-        if raw_department_id:
-            department_id = uuid.UUID(str(raw_department_id))
-            if department_id not in company_department_ids:
-                raise ValueError(f"Task '{item['temporary_id']}' suggested a department outside this company.")
-
-        task_type_id = None
-        raw_task_type_id = item.get('suggested_task_type_id')
-        if raw_task_type_id:
-            task_type_id = uuid.UUID(str(raw_task_type_id))
-            if task_type_id not in company_task_type_ids:
-                raise ValueError(f"Task '{item['temporary_id']}' suggested a task type outside this company.")
-
-        priority = item.get('priority') or Task.PRIORITY.MEDIUM
-        if priority not in Task.PRIORITY.values:
-            priority = Task.PRIORITY.MEDIUM
-
-        # assigned_to is intentionally never set here: the AI must not
-        # invent an assignee (CLAUDE.md AI Rules / Phase 8 rules).
+    invalid_assignee_temp_ids = []
+    for row in draft_rows:
+        assignee = row.assigned_to
+        if assignee is not None and assignee.id not in eligible_ids:
+            invalid_assignee_temp_ids.append(row.temporary_id)
+            assignee = None
         to_create.append(Task(
-            project=project, department_id=department_id, task_type_id=task_type_id,
-            title=item['title'][:255], description=item.get('description') or '',
-            priority=priority, sequence=item.get('sequence') or 0,
-            estimated_time=_parse_estimated_effort(item.get('estimated_effort') or ''),
+            project=project, department_id=row.suggested_department_id, task_type_id=row.suggested_task_type_id,
+            title=row.title, description=row.description, priority=row.priority, sequence=row.sequence,
+            estimated_time=_parse_estimated_effort(row.estimated_effort), assigned_to=assignee,
             created_by=generation.requested_by, source=Task.SOURCE.AI_GENERATED,
             deadline=project.deadline,
         ))
 
     with transaction.atomic():
-        Task.objects.bulk_create(to_create)
-    return len(to_create)
+        created = Task.objects.bulk_create(to_create)
+        for row, task in zip(draft_rows, created):
+            row.created_task = task
+        AIGeneratedTask.objects.bulk_update(draft_rows, ['created_task'])
+        generation.saved_at = timezone.now()
+        generation.save(update_fields=['saved_at'])
+
+    for task in created:
+        if task.assigned_to_id:
+            notify_task_assigned(task)
+
+    return created, invalid_assignee_temp_ids
 
 
 def get_text_document_excerpts(project, *, max_documents=3, max_chars_per_document=3000) -> list[str]:
@@ -512,8 +567,6 @@ def get_text_document_excerpts(project, *, max_documents=3, max_chars_per_docume
         if text.strip():
             excerpts.append(text)
     return excerpts
-
-    return len(to_create)
 
 
 # --------------------------------------------------------------------------
