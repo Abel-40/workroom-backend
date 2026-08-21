@@ -75,3 +75,25 @@ class AIAssistantIn(Schema):
 
     question: str = Field(min_length=1, max_length=2000)
     reference_url: HttpUrl | None = None
+
+
+class AIPlanRequestIn(Schema):
+    """``mentioned_user_ids`` are @@-mentioned company members the requester
+    referenced while describing the work -- passed to the AI as informational
+    context only, never a structured assignment instruction (see
+    ai_agent/services.py::request_project_plan)."""
+
+    prompt: str = Field(min_length=1, max_length=4000)
+    mentioned_user_ids: list[UUID] = Field(default_factory=list)
+
+
+class AIGeneratedTaskCommentIn(Schema):
+    comment: str = Field(min_length=1, max_length=2000)
+
+
+class AIGeneratedTaskAssignIn(Schema):
+    assigned_to_id: UUID | None = None
+
+
+class AITaskRegenerateIn(Schema):
+    instructions: str = Field(default='', max_length=2000)

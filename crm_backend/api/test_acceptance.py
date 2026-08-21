@@ -100,13 +100,17 @@ class V1AcceptanceJourneyTests(TestCase):
         self.assertEqual(done.status_code, 200)
 
         # 8. AI plan (Celery runs eagerly -- see conftest.py -- and the
-        # FastAPI HTTP call is mocked, matching ai_agent/tests.py).
+        # FastAPI HTTP call is mocked, matching ai_agent/tests.py). Completion
+        # only stores a draft plan for review -- nothing lands in the backlog
+        # until it's explicitly saved (step 9).
         with patch('ai_agent.tasks.requests.post', return_value=_mock_ai_response()):
-            ai_plan = self._post(f'/api/projects/{project_id}/ai-plan/', {}, owner)
+            ai_plan = self._post(f'/api/projects/{project_id}/ai-plan/', {'prompt': f'Build a simple {tag} feature'}, owner)
         self.assertEqual(ai_plan.status_code, 202)
         generation_id = ai_plan.json()['data']['generation']['id']
 
-        # 9. Validated tasks actually persisted
+        # 9. Reviewer saves the plan -- only now do real backlog Tasks exist.
+        save_resp = self._post(f'/api/ai/generations/{generation_id}/save/', {}, owner)
+        self.assertEqual(save_resp.status_code, 200)
         ai_tasks = Task.objects.filter(project_id=project_id, source=Task.SOURCE.AI_GENERATED)
         self.assertEqual(ai_tasks.count(), 2)
         self.assertTrue(all(t.assigned_to_id is None for t in ai_tasks))

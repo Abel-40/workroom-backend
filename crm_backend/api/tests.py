@@ -10,11 +10,14 @@ import hashlib
 import json
 from unittest.mock import patch
 
+from ai_agent.models import AIGeneratedTask, AIGeneration
 from company.models import Company, Sector
-from departments_and_teams.models import Department
+from departments_and_teams.models import Department, Team
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
+from django.utils import timezone
 from notifications_and_activity.models import Notification
+from projects_and_tasks.models import Task
 from rest_framework_simplejwt.tokens import RefreshToken
 from users.models import CompanyUserProfile, PendingInvite, User
 
@@ -419,22 +422,49 @@ class DocumentSecurityTests(TwoCompanyTestCase):
 
 
 class AIGenerationSecurityTests(TwoCompanyTestCase):
+    def _request_plan(self, project, owner, prompt='Build a login flow', mentioned_user_ids=None):
+        body = {'prompt': prompt}
+        if mentioned_user_ids is not None:
+            body['mentioned_user_ids'] = mentioned_user_ids
+        return self.client.post(
+            f"/api/projects/{project['id']}/ai-plan/", json.dumps(body), content_type='application/json',
+            **auth_header(owner),
+        )
+
     @patch('ai_agent.services.process_ai_generation.delay')
     def test_request_ai_plan_creates_pending_generation(self, mock_delay):
         project = self.create_project(owner=self.owner_a)
-        response = self.client.post(f"/api/projects/{project['id']}/ai-plan/", **auth_header(self.owner_a))
+        response = self._request_plan(project, self.owner_a)
         self.assertEqual(response.status_code, 202)
         generation = response.json()['data']['generation']
         self.assertEqual(generation['status'], 'pending')
+        self.assertIsNone(generation['saved_at'])
+        self.assertEqual(generation['generated_tasks'], [])
         mock_delay.assert_called_once_with(generation['id'])
+
+    def test_request_ai_plan_requires_a_prompt(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self._request_plan(project, self.owner_a, prompt='')
+        self.assertEqual(response.status_code, 422)
 
     @patch('ai_agent.services.process_ai_generation.delay')
     def test_generation_hidden_from_other_company(self, mock_delay):
         project = self.create_project(owner=self.owner_a, visibility='private')
-        created = self.client.post(f"/api/projects/{project['id']}/ai-plan/", **auth_header(self.owner_a))
+        created = self._request_plan(project, self.owner_a)
         generation_id = created.json()['data']['generation']['id']
         response = self.client.get(f'/api/ai/generations/{generation_id}/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
+
+    @patch('ai_agent.services.process_ai_generation.delay')
+    def test_second_plan_request_is_rejected_once_a_plan_is_saved(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        AIGeneration.objects.create(
+            project_id=project['id'], requested_by=self.owner_a, status=AIGeneration.STATUS.COMPLETED,
+            saved_at=timezone.now(),
+        )
+        response = self._request_plan(project, self.owner_a)
+        self.assertEqual(response.status_code, 409)
+        mock_delay.assert_not_called()
 
 
 class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
@@ -564,3 +594,221 @@ class NotificationTests(TwoCompanyTestCase):
         self.assertFalse(Notification.objects.filter(
             recipient=self.member_a, type=Notification.Type.TASK_COMPLETED,
         ).exists())
+
+
+class EligibleAssigneesTests(TwoCompanyTestCase):
+    def test_falls_back_to_full_company_roster_when_project_has_no_department_or_team(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        ids = {row['id'] for row in response.json()['data']['results']}
+        self.assertIn(str(self.member_a.id), ids)
+        self.assertIn(str(self.owner_a.id), ids)
+        self.assertNotIn(str(self.owner_b.id), ids)
+
+    def test_scoped_to_the_projects_own_department_when_one_is_set(self):
+        other_department = Department.objects.create(name='Sales', company=self.company_a)
+        other_member = User.objects.create_user(email='sales@example.com', username='sales', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=other_member, company=self.company_a, department=other_department,
+            role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+        project = self.create_project(owner=self.owner_a, department_id=str(self.department_a.id))
+        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        ids = {row['id'] for row in response.json()['data']['results']}
+        self.assertIn(str(self.member_a.id), ids)  # member_a is in department_a
+        self.assertNotIn(str(other_member.id), ids)  # in Sales, not this project's department
+
+    def test_scoped_to_the_projects_team_when_one_is_set_even_if_department_is_also_set(self):
+        team = Team.objects.create(name='Launch Squad', company=self.company_a)
+        team.members.set([self.member_a])
+        project = self.create_project(
+            owner=self.owner_a, department_id=str(self.department_a.id), team_id=str(team.id),
+        )
+        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        ids = {row['id'] for row in response.json()['data']['results']}
+        self.assertEqual(ids, {str(self.member_a.id)})  # team takes precedence over department
+
+    def test_outsider_cannot_view_eligible_assignees_for_a_private_project(self):
+        project = self.create_project(owner=self.owner_a, visibility='private')
+        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 403)
+
+
+class AIPlanReviewSecurityTests(TwoCompanyTestCase):
+    def _make_generation_with_draft(self, project_id, owner, **overrides):
+        generation = AIGeneration.objects.create(
+            project_id=project_id, requested_by=owner, status=AIGeneration.STATUS.COMPLETED,
+        )
+        draft = AIGeneratedTask.objects.create(
+            generation=generation, temporary_id='t1', sequence=1, title='Define requirements', **overrides,
+        )
+        return generation, draft
+
+    def test_comment_marks_the_task_unresolved(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
+        response = self.client.patch(
+            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/comment/",
+            json.dumps({'comment': 'Add more technical detail.'}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.reviewer_comment, 'Add more technical detail.')
+        self.assertFalse(draft.comment_resolved)
+
+    def test_comment_hidden_from_other_company(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
+        response = self.client.patch(
+            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/comment/",
+            json.dumps({'comment': 'x'}), content_type='application/json',
+            **auth_header(self.owner_b),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_assign_rejects_a_user_outside_the_company(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
+        response = self.client.patch(
+            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
+            json.dumps({'assigned_to_id': str(self.owner_b.id)}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_assign_accepts_an_eligible_member_and_clearing_it_again(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
+        set_response = self.client.patch(
+            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
+            json.dumps({'assigned_to_id': str(self.member_a.id)}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        self.assertEqual(set_response.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.assigned_to_id, self.member_a.id)
+
+        clear_response = self.client.patch(
+            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
+            json.dumps({'assigned_to_id': None}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        self.assertEqual(clear_response.status_code, 200)
+        draft.refresh_from_db()
+        self.assertIsNone(draft.assigned_to_id)
+
+    def test_regenerate_requires_at_least_one_unresolved_comment(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
+        response = self.client.post(
+            f"/api/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    @patch('api.routers.ai.process_ai_plan_regeneration.delay')
+    def test_regenerate_enqueues_when_a_comment_is_pending(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, reviewer_comment='Needs detail.', comment_resolved=False,
+        )
+        response = self.client.post(
+            f"/api/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()['data']['generation']['status'], 'processing')
+        mock_delay.assert_called_once_with(str(generation.id))
+
+    def test_regenerate_rejected_once_the_plan_is_saved(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, reviewer_comment='x', comment_resolved=False,
+        )
+        generation.saved_at = timezone.now()
+        generation.save(update_fields=['saved_at'])
+        response = self.client.post(
+            f"/api/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_save_persists_tasks_and_is_idempotent(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
+        first = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(len(first.json()['data']['tasks']), 1)
+        self.assertEqual(first.json()['data']['tasks'][0]['source'], 'ai_generated')
+
+        generation.refresh_from_db()
+        self.assertIsNotNone(generation.saved_at)
+
+        second = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        self.assertEqual(second.status_code, 409)
+
+    def test_save_drops_an_assignee_that_became_ineligible_and_reports_it(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
+        # Assign to a member of company_a directly at the model layer, then
+        # scope the project to a *different* department after the fact so
+        # the assignment is no longer eligible by the time save runs.
+        draft.assigned_to = self.member_a
+        draft.save(update_fields=['assigned_to'])
+        other_department = Department.objects.create(name='Sales', company=self.company_a)
+        self.client.patch(
+            f"/api/projects/{project['id']}/", json.dumps({'department_id': str(other_department.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        body = response.json()['data']
+        self.assertEqual(body['invalid_assignee_temp_ids'], ['t1'])
+        self.assertIsNone(body['tasks'][0]['assigned_to'])
+
+    def test_save_hidden_from_other_company(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
+        response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 403)
+
+
+class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
+    def _create_ai_generated_task(self, project_id, owner):
+        task = self.client.post(
+            f'/api/projects/{project_id}/tasks/', json.dumps({'title': 'Define requirements'}),
+            content_type='application/json', **auth_header(owner),
+        ).json()['data']['task']
+        Task.objects.filter(id=task['id']).update(source=Task.SOURCE.AI_GENERATED)
+        return task
+
+    @patch('api.routers.ai.process_task_content_regeneration.delay')
+    def test_regenerate_ai_content_enqueues_for_the_creator(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        task = self._create_ai_generated_task(project['id'], self.owner_a)
+        response = self.client.post(
+            f"/api/tasks/{task['id']}/regenerate-ai-content/", json.dumps({'instructions': 'More detail.'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 202)
+        mock_delay.assert_called_once()
+
+    def test_regenerate_ai_content_rejects_a_manual_task(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/projects/{project['id']}/tasks/", json.dumps({'title': 'Manual task'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        response = self.client.post(
+            f"/api/tasks/{task['id']}/regenerate-ai-content/", json.dumps({}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_regenerate_ai_content_hidden_from_other_company(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self._create_ai_generated_task(project['id'], self.owner_a)
+        response = self.client.post(
+            f"/api/tasks/{task['id']}/regenerate-ai-content/", json.dumps({}),
+            content_type='application/json', **auth_header(self.owner_b),
+        )
+        self.assertEqual(response.status_code, 403)

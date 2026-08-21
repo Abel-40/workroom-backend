@@ -227,3 +227,28 @@ async def delete_project_image(request, project_id: UUID):
     if not await services.remove_project_image(request.auth, project):
         return payload('You do not have permission to modify this project.', 403, False)
     return payload('Project image removed successfully.', 200, True)
+
+
+@router.get('/{project_id}/eligible-assignees/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+async def list_eligible_assignees(request, project_id: UUID):
+    """Company members eligible to be assigned a task on this project,
+    scoped by the project's own team/department -- used by the @@ mention
+    picker and the AI-plan review assignee picker (see projects_and_tasks
+    .services.list_eligible_assignees for the scoping rule)."""
+    project, error = await services.get_project_for_user(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    candidates, error = await services.list_eligible_assignees(request.auth, project)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    return payload('Eligible assignees retrieved successfully.', 200, True, {
+        'results': [
+            {
+                'id': str(user.id), 'first_name': user.first_name, 'last_name': user.last_name,
+                'username': user.username, 'email': user.email,
+            }
+            for user in candidates
+        ],
+    })
