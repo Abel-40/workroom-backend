@@ -19,6 +19,7 @@ import requests
 from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
+from pages.services import blocks_to_text
 from projects_and_tasks.models import Task
 from projects_and_tasks.services import get_text_document_excerpts
 from utils import safe_fetch
@@ -47,6 +48,7 @@ def _build_request_payload(query: AIAssistantQuery, reference_url_content: str) 
         .order_by('-created_at').values_list('title', flat=True)[:MAX_TASK_TITLES],
     )
     document_excerpts = get_text_document_excerpts(project)
+    page_excerpts = [blocks_to_text(page.blocks) for page in query.pages.all()]
     return {
         'query_id': str(query.id),
         'project_id': str(project.id),
@@ -57,6 +59,7 @@ def _build_request_payload(query: AIAssistantQuery, reference_url_content: str) 
         'reference_url': query.reference_url or None,
         'reference_url_content': reference_url_content,
         'document_excerpts': document_excerpts,
+        'page_excerpts': [text for text in page_excerpts if text],
     }
 
 

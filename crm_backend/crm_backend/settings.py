@@ -73,6 +73,7 @@ INSTALLED_APPS = [
     'messaging',
     'ai_agent',
     'connected_apps',
+    'pages',
 ]
 
 MIDDLEWARE = [

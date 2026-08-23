@@ -10,13 +10,14 @@ import hashlib
 import json
 from unittest.mock import patch
 
-from ai_agent.models import AIGeneratedTask, AIGeneration
+from ai_agent.models import AIGeneratedTask, AIGeneration, AIProjectHealthSummary
 from company.models import Company, Sector
 from departments_and_teams.models import Department, Team
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.utils import timezone
 from notifications_and_activity.models import Notification
+from pages.models import Page, PageFolder
 from projects_and_tasks.models import Task
 from rest_framework_simplejwt.tokens import RefreshToken
 from users.models import CompanyUserProfile, PendingInvite, User
@@ -466,6 +467,42 @@ class AIGenerationSecurityTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 409)
         mock_delay.assert_not_called()
 
+    @patch('ai_agent.services.process_ai_generation.delay')
+    def test_plan_request_accepts_an_eligible_assignee_pool_and_stores_it(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        response = self.client.post(
+            f"/api/projects/{project['id']}/ai-plan/",
+            json.dumps({'prompt': 'Build a login flow', 'assignee_ids': [str(self.member_a.id)], 'max_tasks': 5}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 202)
+        generation = AIGeneration.objects.get(id=response.json()['data']['generation']['id'])
+        self.assertEqual(generation.requested_assignee_ids, [str(self.member_a.id)])
+        self.assertEqual(generation.max_tasks, 5)
+
+    @patch('ai_agent.services.process_ai_generation.delay')
+    def test_plan_request_rejects_an_assignee_outside_the_company(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        response = self.client.post(
+            f"/api/projects/{project['id']}/ai-plan/",
+            json.dumps({'prompt': 'Build a login flow', 'assignee_ids': [str(self.owner_b.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+        mock_delay.assert_not_called()
+
+    @patch('ai_agent.services.process_ai_generation.delay')
+    def test_plan_request_rejects_max_tasks_out_of_bounds(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        response = self._request_plan(project, self.owner_a)
+        self.assertEqual(response.status_code, 202)  # default max_tasks applies
+        over_limit = self.client.post(
+            f"/api/projects/{project['id']}/ai-plan/",
+            json.dumps({'prompt': 'Build a login flow', 'max_tasks': 999}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(over_limit.status_code, 422)
+
 
 class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
     @patch('ai_agent.assistant_services.process_assistant_query.delay')
@@ -510,6 +547,33 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
         )
         self.assertEqual(response.status_code, 401)
 
+    @patch('ai_agent.assistant_services.process_assistant_query.delay')
+    def test_assistant_query_attaches_selected_pages_from_own_company(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        folder = PageFolder.objects.create(name='Docs', company=self.company_a, created_by=self.owner_a)
+        page = Page.objects.create(folder=folder, title='Spec', created_by=self.owner_a)
+        response = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'Summarize the spec.', 'page_ids': [str(page.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 202)
+        pages = response.json()['data']['assistant_query']['pages']
+        self.assertEqual([p['id'] for p in pages], [str(page.id)])
+
+    @patch('ai_agent.assistant_services.process_assistant_query.delay')
+    def test_assistant_query_rejects_a_page_from_another_company(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        other_folder = PageFolder.objects.create(name='B Docs', company=self.company_b, created_by=self.owner_b)
+        other_page = Page.objects.create(folder=other_folder, title='Not yours', created_by=self.owner_b)
+        response = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'Summarize this.', 'page_ids': [str(other_page.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+        mock_delay.assert_not_called()
+
 
 class AIHealthSummarySecurityTests(TwoCompanyTestCase):
     @patch('ai_agent.health_services.process_health_summary.delay')
@@ -540,6 +604,39 @@ class AIHealthSummarySecurityTests(TwoCompanyTestCase):
                 self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
             response = self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
             self.assertEqual(response.status_code, 429)
+
+    def test_export_returns_an_xlsx_workbook_for_a_completed_summary(self):
+        project = self.create_project(owner=self.owner_a)
+        summary = AIProjectHealthSummary.objects.create(
+            project_id=project['id'], requested_by=self.owner_a, status=AIProjectHealthSummary.STATUS.COMPLETED,
+            summary='On track.', risk_level=AIProjectHealthSummary.RISK_LEVEL.LOW,
+        )
+        response = self.client.get(
+            f"/api/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response['Content-Type'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        self.assertIn('attachment', response['Content-Disposition'])
+
+    def test_export_rejected_for_a_summary_that_isnt_completed(self):
+        project = self.create_project(owner=self.owner_a)
+        summary = AIProjectHealthSummary.objects.create(project_id=project['id'], requested_by=self.owner_a)
+        response = self.client.get(
+            f"/api/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_export_hidden_from_other_company(self):
+        project = self.create_project(owner=self.owner_a)
+        summary = AIProjectHealthSummary.objects.create(
+            project_id=project['id'], requested_by=self.owner_a, status=AIProjectHealthSummary.STATUS.COMPLETED,
+        )
+        response = self.client.get(
+            f"/api/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_b),
+        )
+        self.assertEqual(response.status_code, 403)
 
 
 class NotificationTests(TwoCompanyTestCase):
@@ -786,6 +883,28 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
         response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
+
+    def test_save_applies_the_ai_suggested_assignee_when_no_human_override_exists(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, suggested_assignee=self.member_a,
+        )
+        response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['tasks'][0]['assigned_to'], str(self.member_a.id))
+
+    def test_save_prefers_the_human_override_over_the_ai_suggestion(self):
+        project = self.create_project(owner=self.owner_a)
+        other_member = User.objects.create_user(email='other-a@example.com', username='other-a', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=other_member, company=self.company_a, role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, suggested_assignee=self.member_a, assigned_to=other_member,
+        )
+        response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['tasks'][0]['assigned_to'], str(other_member.id))
 
 
 class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):

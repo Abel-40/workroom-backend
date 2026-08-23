@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
+from ai_agent.models import AIGeneration
 from asgiref.sync import sync_to_async
 from django.http import FileResponse
 from django.utils import timezone
@@ -72,6 +73,7 @@ async def project_data(project: Project) -> dict:
     total_tasks = await project.tasks.filter(is_deleted=False).acount()
     completed_tasks = await project.tasks.filter(is_deleted=False, status=Task.STATUS.DONE).acount()
     collaborator_ids = [str(user_id) async for user_id in project.collaborators.values_list('id', flat=True)]
+    has_saved_plan = await AIGeneration.objects.filter(project=project, saved_at__isnull=False).aexists()
     return {
         'id': str(project.id),
         'title': project.title,
@@ -94,6 +96,7 @@ async def project_data(project: Project) -> dict:
         'completion_percent': round((completed_tasks / total_tasks) * 100, 2) if total_tasks else 0,
         'collaborator_ids': collaborator_ids,
         'image': _project_image_data(project),
+        'has_saved_plan': has_saved_plan,
     }
 
 

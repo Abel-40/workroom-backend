@@ -4,12 +4,16 @@ only; no LLM call happens here, see ai_agent/services.py)."""
 from uuid import UUID
 
 from ai_agent import assistant_services, health_services, services
+from ai_agent.exports import build_health_report_workbook, safe_filename
 from ai_agent.models import AIAssistantQuery, AIGeneratedTask, AIGeneration, AIProjectHealthSummary, AITaskContentRegeneration
 from ai_agent.tasks_regenerate import process_ai_plan_regeneration, process_task_content_regeneration
+from analytics.services import get_project_stats
 from asgiref.sync import sync_to_async
 from django.contrib.auth import get_user_model
+from django.http import HttpResponse
 from django.utils import timezone
 from ninja import Router
+from pages import services as pages_services
 from projects_and_tasks.services import (
     get_task_for_user,
     get_viewable_project,
@@ -29,6 +33,7 @@ from ..schemas import (
     AIGeneratedTaskAssignIn,
     AIGeneratedTaskCommentIn,
     AIPlanRequestIn,
+    AssistantSaveAsPageIn,
     AITaskRegenerateIn,
     ApiResponse,
 )
@@ -50,6 +55,7 @@ def generated_task_data(item: AIGeneratedTask) -> dict:
         'dependency_temp_ids': item.dependency_temp_ids,
         'suggested_department_id': str(item.suggested_department_id) if item.suggested_department_id else None,
         'suggested_task_type_id': str(item.suggested_task_type_id) if item.suggested_task_type_id else None,
+        'suggested_assignee_id': str(item.suggested_assignee_id) if item.suggested_assignee_id else None,
         'assigned_to_id': str(item.assigned_to_id) if item.assigned_to_id else None,
         'reviewer_comment': item.reviewer_comment,
         'comment_resolved': item.comment_resolved,
@@ -71,6 +77,8 @@ async def generation_data(generation: AIGeneration, *, include_tasks: bool = Tru
         'completed_at': generation.completed_at.isoformat() if generation.completed_at else None,
         'saved_at': generation.saved_at.isoformat() if generation.saved_at else None,
         'task_count': generation.task_count,
+        'max_tasks': generation.max_tasks,
+        'requested_assignee_ids': generation.requested_assignee_ids,
         'error_message': generation.error_message,
     }
     if include_tasks:
@@ -78,7 +86,10 @@ async def generation_data(generation: AIGeneration, *, include_tasks: bool = Tru
     return data
 
 
-@router.post('/projects/{project_id}/ai-plan/', auth=auth, response={202: ApiResponse, 403: ApiResponse, 404: ApiResponse, 409: ApiResponse, 500: ApiResponse})
+@router.post(
+    '/projects/{project_id}/ai-plan/', auth=auth,
+    response={202: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse, 409: ApiResponse, 500: ApiResponse},
+)
 async def request_ai_plan(request, project_id: UUID, data: AIPlanRequestIn):
     project, error = await get_viewable_project(request.auth, project_id)
     if error == 'not_found':
@@ -87,11 +98,17 @@ async def request_ai_plan(request, project_id: UUID, data: AIPlanRequestIn):
         return payload('You do not have permission to request an AI plan for this project.', 403, False)
     generation, error = await services.request_project_plan(
         request.auth, project, prompt=data.prompt, mentioned_user_ids=data.mentioned_user_ids,
+        assignee_ids=data.assignee_ids, max_tasks=data.max_tasks,
     )
     if error == 'forbidden':
         return payload('You do not have permission to request an AI plan for this project.', 403, False)
     if error == 'plan_already_saved':
         return payload('This project already has a saved AI-generated plan.', 409, False)
+    if error == 'invalid_assignee':
+        return payload(
+            'One or more selected assignees are not eligible for this project.', 400, False,
+            errors={'assignee_ids': ['Not eligible']},
+        )
     if error == 'queue_failed':
         return payload(
             'The AI generation job could not be queued.', 500, False, data={'generation': await generation_data(generation)},
@@ -116,7 +133,7 @@ async def list_generations(request, project_id: UUID, page: int = 1, page_size: 
         return payload('Project not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this project.', 403, False)
-    queryset = AIGeneration.objects.filter(project=project).order_by('-requested_at')
+    queryset = AIGeneration.objects.filter(project=project, discarded_at__isnull=True).order_by('-requested_at')
     items, meta = await paginate(queryset, page, page_size)
     return payload('Generation history retrieved successfully.', 200, True, {
         'results': [await generation_data(generation, include_tasks=False) for generation in items], 'meta': meta,
@@ -207,6 +224,24 @@ async def regenerate_generated_plan(request, generation_id: UUID):
 
 
 @router.post(
+    '/ai/generations/{generation_id}/discard/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse, 409: ApiResponse},
+)
+async def discard_generation(request, generation_id: UUID):
+    generation, error = await services.get_generation_for_user(request.auth, generation_id)
+    if error == 'not_found':
+        return payload('Generation not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to discard this plan.', 403, False)
+    error = await services.discard_generation(request.auth, generation)
+    if error == 'forbidden':
+        return payload('You do not have permission to discard this plan.', 403, False)
+    if error == 'already_saved':
+        return payload('A saved plan cannot be discarded.', 409, False)
+    return payload('Draft plan discarded.', 200, True)
+
+
+@router.post(
     '/ai/generations/{generation_id}/save/', auth=auth,
     response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse, 409: ApiResponse},
 )
@@ -292,7 +327,7 @@ async def get_task_regeneration(request, regeneration_id: UUID):
     return payload('Task regeneration retrieved successfully.', 200, True, {'task_regeneration': task_regeneration_data(regeneration)})
 
 
-def assistant_query_data(query: AIAssistantQuery) -> dict:
+async def assistant_query_data(query: AIAssistantQuery) -> dict:
     return {
         'id': str(query.id),
         'project_id': str(query.project_id),
@@ -308,12 +343,16 @@ def assistant_query_data(query: AIAssistantQuery) -> dict:
         'started_at': query.started_at.isoformat() if query.started_at else None,
         'completed_at': query.completed_at.isoformat() if query.completed_at else None,
         'error_message': query.error_message,
+        'pages': [
+            {'id': str(page.id), 'title': page.title, 'folder_name': page.folder.name}
+            async for page in query.pages.select_related('folder').all()
+        ],
     }
 
 
 @router.post(
     '/projects/{project_id}/ai-assistant/', auth=auth,
-    response={202: ApiResponse, 403: ApiResponse, 404: ApiResponse, 500: ApiResponse},
+    response={202: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse, 500: ApiResponse},
 )
 @rate_limit('ai_assistant_query', limit=20, window_seconds=3600, key_func=lambda r: str(r.auth.id))
 async def request_ai_assistant(request, project_id: UUID, data: AIAssistantIn):
@@ -323,14 +362,21 @@ async def request_ai_assistant(request, project_id: UUID, data: AIAssistantIn):
     if error == 'forbidden':
         return payload('You do not have permission to ask the assistant about this project.', 403, False)
     reference_url = str(data.reference_url) if data.reference_url else None
-    query, error = await assistant_services.request_assistant_query(request.auth, project, data.question, reference_url)
+    query, error = await assistant_services.request_assistant_query(
+        request.auth, project, data.question, reference_url, data.page_ids,
+    )
     if error == 'forbidden':
         return payload('You do not have permission to ask the assistant about this project.', 403, False)
+    if error == 'invalid_page':
+        return payload(
+            'One or more selected pages are not accessible.', 400, False, errors={'page_ids': ['Invalid page']},
+        )
     if error == 'queue_failed':
         return payload(
-            'The assistant query job could not be queued.', 500, False, data={'assistant_query': assistant_query_data(query)},
+            'The assistant query job could not be queued.', 500, False,
+            data={'assistant_query': await assistant_query_data(query)},
         )
-    return payload('Assistant query requested.', 202, True, {'assistant_query': assistant_query_data(query)})
+    return payload('Assistant query requested.', 202, True, {'assistant_query': await assistant_query_data(query)})
 
 
 @router.get('/ai/assistant-queries/{query_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -340,7 +386,7 @@ async def get_assistant_query(request, query_id: UUID):
         return payload('Assistant query not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this assistant query.', 403, False)
-    return payload('Assistant query retrieved successfully.', 200, True, {'assistant_query': assistant_query_data(query)})
+    return payload('Assistant query retrieved successfully.', 200, True, {'assistant_query': await assistant_query_data(query)})
 
 
 @router.get(
@@ -356,7 +402,43 @@ async def list_assistant_queries(request, project_id: UUID, page: int = 1, page_
     queryset = AIAssistantQuery.objects.filter(project=project).order_by('-requested_at')
     items, meta = await paginate(queryset, page, page_size)
     return payload('Assistant query history retrieved successfully.', 200, True, {
-        'results': [assistant_query_data(query) for query in items], 'meta': meta,
+        'results': [await assistant_query_data(query) for query in items], 'meta': meta,
+    })
+
+
+@router.post(
+    '/ai/assistant-queries/{query_id}/save-as-page/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def save_assistant_query_as_page(request, query_id: UUID, data: AssistantSaveAsPageIn):
+    query, error = await assistant_services.get_assistant_query_for_user(request.auth, query_id)
+    if error == 'not_found':
+        return payload('Assistant query not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to save this assistant query.', 403, False)
+    if query.status != AIAssistantQuery.STATUS.COMPLETED or not query.answer:
+        return payload('This assistant query has no answer to save yet.', 400, False)
+
+    company = query.project.company
+    if data.folder_id:
+        folder, error = await pages_services.get_folder_for_user(request.auth, data.folder_id)
+        if error or folder.company_id != company.id:
+            return payload('Invalid folder.', 400, False, errors={'folder_id': ['Invalid folder']})
+    elif data.new_folder_name:
+        folder, error = await pages_services.get_or_create_folder_by_name(request.auth, company, data.new_folder_name)
+        if error:
+            return payload('You do not have permission to create folders.', 403, False)
+    else:
+        return payload('A folder or new folder name is required.', 400, False, errors={'folder_id': ['Required']})
+
+    page, error = await pages_services.create_page(
+        request.auth, folder, title=data.title,
+        blocks=[{'type': 'paragraph', 'text': query.answer}], project=query.project,
+    )
+    if error:
+        return payload('You do not have permission to save this response as a page.', 403, False)
+    return payload('Saved as a page.', 201, True, {
+        'page': {'id': str(page.id), 'folder_id': str(page.folder_id), 'title': page.title},
     })
 
 
@@ -406,6 +488,31 @@ async def get_health_summary(request, summary_id: UUID):
     if error == 'forbidden':
         return payload('You do not have permission to view this health summary.', 403, False)
     return payload('Health summary retrieved successfully.', 200, True, {'health_summary': health_summary_data(summary)})
+
+
+@router.get(
+    '/projects/{project_id}/ai-health-summary/{summary_id}/export/', auth=auth,
+    response={400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def export_health_report(request, project_id: UUID, summary_id: UUID):
+    project, error = await get_viewable_project(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    summary, error = await health_services.get_health_summary_for_user(request.auth, summary_id)
+    if error or summary.project_id != project.id:
+        return payload('Health summary not found.', 404, False)
+    if summary.status != AIProjectHealthSummary.STATUS.COMPLETED:
+        return payload('This health summary is not ready to export yet.', 400, False)
+
+    stats = await get_project_stats(project)
+    buffer = await sync_to_async(build_health_report_workbook, thread_sensitive=True)(project, summary, stats)
+    response = HttpResponse(
+        buffer.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    response['Content-Disposition'] = f'attachment; filename="{safe_filename(project.title)}"'
+    return response
 
 
 @router.get(

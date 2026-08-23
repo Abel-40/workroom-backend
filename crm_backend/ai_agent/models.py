@@ -36,12 +36,27 @@ class AIGeneration(UUIDModel):
     task_count = models.PositiveIntegerField(default=0)
     error_message = models.TextField(blank=True, default='')
 
+    # Human-approved pool of eligible assignees the tasks may be
+    # suggested-assigned to (validated via is_eligible_assignee before this
+    # row was even created), and the hard cap on how many tasks the plan may
+    # contain. Stored here (not just passed as Celery args) so the worker,
+    # which only receives a generation id, can re-read both -- see
+    # ai_agent/tasks.py::_build_request_payload/_store_generated_tasks_for_review.
+    requested_assignee_ids = models.JSONField(default=list, blank=True)
+    max_tasks = models.PositiveIntegerField(null=True, blank=True)
+
     # Set only once the generated plan has actually been persisted as real
     # backlog tasks (see projects_and_tasks.services.persist_ai_generated_tasks).
     # This, not `status`, is the authoritative "does this project already
     # have a saved AI plan" flag: a COMPLETED generation may still be an
     # unsaved draft awaiting review.
     saved_at = models.DateTimeField(null=True, blank=True)
+
+    # Set when the requester abandons an unsaved draft (the "New plan" /
+    # "discard" flow) so it stops being returned as this project's latest
+    # generation -- without this, refreshing the page would resurrect a
+    # draft the user explicitly discarded. Never set on a saved plan.
+    discarded_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.project_id} - {self.status}"
@@ -76,6 +91,14 @@ class AIGeneratedTask(UUIDModel):
     # Set by a human reviewer only (see projects_and_tasks.services -- the AI
     # is never allowed to set this itself; GeneratedTask has no such field).
     assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    # The AI's suggestion only, from generation.requested_assignee_ids --
+    # never trusted directly (Rule 10: never let the AI choose a user).
+    # persist_ai_generated_tasks applies this to the real Task's assignee
+    # only where a human hasn't already set `assigned_to` above and the
+    # person is still eligible at save time.
+    suggested_assignee = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
     )
     reviewer_comment = models.TextField(blank=True, default='')
@@ -156,6 +179,10 @@ class AIAssistantQuery(UUIDModel):
     )
     question = models.TextField()
     reference_url = models.URLField(blank=True, default='')
+    # Workroom pages the requester explicitly selected as context -- distinct
+    # from the project's text-attachment excerpts (get_text_document_excerpts),
+    # which are always included regardless of selection.
+    pages = models.ManyToManyField('pages.Page', blank=True, related_name='ai_assistant_queries')
     provider = models.CharField(max_length=50, blank=True, default='')
     model = models.CharField(max_length=100, blank=True, default='')
     status = models.CharField(max_length=20, choices=STATUS.choices, default=STATUS.PENDING)

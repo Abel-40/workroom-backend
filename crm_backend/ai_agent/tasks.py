@@ -19,11 +19,14 @@ import requests
 from celery import shared_task
 from departments_and_teams.models import Department
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.utils import timezone
 from notifications_and_activity.services import notify_ai_generation_completed, notify_ai_generation_failed
 from projects_and_tasks.models import TaskType
 
 from .models import AIGeneratedTask, AIGeneration
+
+User = get_user_model()
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +39,15 @@ class PermanentAIGenerationError(Exception):
     """The AI service rejected the request or returned invalid output."""
 
 
+def _label(user) -> str:
+    return user.first_name or user.username
+
+
 def _build_request_payload(generation: AIGeneration) -> dict:
     project = generation.project
     departments = Department.objects.filter(company=project.company).values('id', 'name')
     task_types = TaskType.objects.filter(company=project.company).values('id', 'name')
+    assignees = User.objects.filter(id__in=generation.requested_assignee_ids)
     return {
         'generation_id': str(generation.id),
         'project_id': str(project.id),
@@ -48,6 +56,8 @@ def _build_request_payload(generation: AIGeneration) -> dict:
         'requirements': generation.prompt,
         'departments': [{'id': str(d['id']), 'name': d['name']} for d in departments],
         'task_types': [{'id': str(t['id']), 'name': t['name']} for t in task_types],
+        'assignees': [{'id': str(u.id), 'name': _label(u)} for u in assignees],
+        'max_tasks': generation.max_tasks,
     }
 
 
@@ -139,8 +149,16 @@ def _store_generated_tasks_for_review(generation: AIGeneration, plan_data: dict)
     if not tasks_data:
         raise ValueError('AI service returned an empty task list.')
 
+    # Never trust the AI service to have honored max_tasks on its own
+    # (Rule 10) -- truncate here regardless of what it returned.
+    if generation.max_tasks:
+        tasks_data = tasks_data[:generation.max_tasks]
+
     company_department_ids = set(Department.objects.filter(company=project.company).values_list('id', flat=True))
     company_task_type_ids = set(TaskType.objects.filter(company=project.company).values_list('id', flat=True))
+    # The AI may only suggest an assignee from the pool the human explicitly
+    # approved for this generation -- not just any company member.
+    requested_assignee_ids = {uuid.UUID(str(uid)) for uid in generation.requested_assignee_ids}
 
     known_temp_ids = set()
     for item in tasks_data:
@@ -169,6 +187,21 @@ def _store_generated_tasks_for_review(generation: AIGeneration, plan_data: dict)
             if task_type_id not in company_task_type_ids:
                 raise ValueError(f"Task '{item['temporary_id']}' suggested a task type outside this company.")
 
+        # Auxiliary, not structural (like estimated_effort below): a bad
+        # assignee guess is dropped rather than failing the whole plan --
+        # the human still reviews/confirms every assignment either way.
+        assignee_id = None
+        raw_assignee_id = item.get('suggested_assignee_id')
+        if raw_assignee_id:
+            candidate_id = uuid.UUID(str(raw_assignee_id))
+            if candidate_id in requested_assignee_ids:
+                assignee_id = candidate_id
+            else:
+                logger.warning(
+                    'ai_generation.suggested_assignee_outside_pool',
+                    extra={'generation_id': str(generation.id), 'temporary_id': item['temporary_id']},
+                )
+
         priority = item.get('priority') or AIGeneratedTask.PRIORITY.MEDIUM
         if priority not in AIGeneratedTask.PRIORITY.values:
             priority = AIGeneratedTask.PRIORITY.MEDIUM
@@ -177,6 +210,7 @@ def _store_generated_tasks_for_review(generation: AIGeneration, plan_data: dict)
             generation=generation, temporary_id=item['temporary_id'], sequence=item.get('sequence') or 0,
             title=item['title'][:255], description=item.get('description') or '',
             priority=priority, estimated_effort=(item.get('estimated_effort') or '')[:100],
+            suggested_assignee_id=assignee_id,
             dependency_temp_ids=dependency_ids,
             suggested_department_id=department_id, suggested_task_type_id=task_type_id,
         ))

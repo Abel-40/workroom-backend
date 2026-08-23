@@ -41,6 +41,7 @@ from .routers.departments import router as departments_router
 from .routers.documents import router as documents_router
 from .routers.members import router as members_router
 from .routers.notifications import router as notifications_router
+from .routers.pages import router as pages_router
 from .routers.projects import router as projects_router
 from .routers.task_types import router as task_types_router
 from .routers.tasks import router as tasks_router
@@ -72,6 +73,7 @@ api.add_router('/projects', projects_router)
 api.add_router('', tasks_router)
 api.add_router('', documents_router)
 api.add_router('', ai_router)
+api.add_router('', pages_router)
 api.add_router('/notifications', notifications_router)
 api.add_router('/analytics', analytics_router)
 api.add_router('/departments', departments_router)

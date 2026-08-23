@@ -71,20 +71,29 @@ class AIAssistantIn(Schema):
     """``reference_url`` uses HttpUrl, which restricts to http/https schemes
     by construction -- scheme allowlisting for the assistant's URL-fetch
     capability is free at this layer (see utils/safe_fetch.py for the rest
-    of the SSRF protections)."""
+    of the SSRF protections). ``page_ids`` are Workroom pages (pages app) the
+    requester explicitly selected as context."""
 
     question: str = Field(min_length=1, max_length=2000)
     reference_url: HttpUrl | None = None
+    page_ids: list[UUID] = Field(default_factory=list)
 
 
 class AIPlanRequestIn(Schema):
     """``mentioned_user_ids`` are @@-mentioned company members the requester
     referenced while describing the work -- passed to the AI as informational
     context only, never a structured assignment instruction (see
-    ai_agent/services.py::request_project_plan)."""
+    ai_agent/services.py::request_project_plan). ``assignee_ids`` is a
+    different thing entirely: the human-approved pool of people the plan's
+    tasks may be suggested-assigned to (validated eligible before the
+    generation is even created). ``max_tasks`` hard-caps how many tasks the
+    plan may contain; the AI is never trusted to have honored it on its own
+    (see ai_agent/tasks.py::_store_generated_tasks_for_review)."""
 
     prompt: str = Field(min_length=1, max_length=4000)
     mentioned_user_ids: list[UUID] = Field(default_factory=list)
+    assignee_ids: list[UUID] = Field(default_factory=list)
+    max_tasks: int = Field(default=10, ge=1, le=50)
 
 
 class AIGeneratedTaskCommentIn(Schema):
@@ -97,3 +106,32 @@ class AIGeneratedTaskAssignIn(Schema):
 
 class AITaskRegenerateIn(Schema):
     instructions: str = Field(default='', max_length=2000)
+
+
+class PageFolderCreateIn(Schema):
+    name: str = Field(min_length=1, max_length=255)
+    color: str = Field(default='amber')
+
+
+class PageBlockIn(Schema):
+    type: Literal['heading', 'paragraph', 'list', 'attachment']
+    text: str | None = None
+    items: list[str] | None = None
+    file_name: str | None = None
+
+
+class PageCreateIn(Schema):
+    title: str = Field(min_length=1, max_length=255)
+    blocks: list[PageBlockIn] = Field(default_factory=list)
+    project_id: UUID | None = None
+
+
+class PageUpdateIn(Schema):
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    blocks: list[PageBlockIn] | None = None
+
+
+class AssistantSaveAsPageIn(Schema):
+    title: str = Field(min_length=1, max_length=255)
+    folder_id: UUID | None = None
+    new_folder_name: str | None = Field(default=None, max_length=255)
