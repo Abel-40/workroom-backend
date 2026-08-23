@@ -7,6 +7,7 @@ import stripe
 from asgiref.sync import sync_to_async
 from company.models import Company, Sector
 from company.services import get_company_role, get_managed_company, get_member_company
+from departments_and_teams import services as departments_and_teams_services
 from departments_and_teams.models import DefaultDepartment, Department
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
@@ -17,10 +18,11 @@ from django.db.models import Q
 from django.http import JsonResponse
 from ninja import NinjaAPI
 from ninja.errors import HttpError
-from notifications_and_activity.services import notify_invitation_accepted
+from notifications_and_activity.services import log_member_invited, log_member_joined, notify_invitation_accepted
 from permissions.catalog import has_permission
 from plans.models import Plan
-from projects_and_tasks.models import DefaultTaskType, TaskType
+from projects_and_tasks import services as projects_and_tasks_services
+from projects_and_tasks.models import DefaultTaskType
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from subscriptions.models import Subscription
@@ -31,7 +33,9 @@ from utils.rate_limit import rate_limit
 from utils.tokens import generate_token, hash_token
 
 from .auth import JWTBearerAuth
+from .routers.activity import router as activity_router
 from .routers.ai import router as ai_router
+from .routers.company_config import router as company_config_router
 from .routers.analytics import router as analytics_router
 from .routers.departments import router as departments_router
 from .routers.documents import router as documents_router
@@ -74,6 +78,8 @@ api.add_router('/departments', departments_router)
 api.add_router('/teams', teams_router)
 api.add_router('/task-types', task_types_router)
 api.add_router('/company/members', members_router)
+api.add_router('/activity', activity_router)
+api.add_router('/company/default-config', company_config_router)
 
 payload = api_response
 logger = logging.getLogger(__name__)
@@ -117,6 +123,7 @@ def accept_invite_in_transaction(token: str, password: str, username: str):
         company = invite.company
         invite.delete()
         notify_invitation_accepted(user, company)
+        log_member_joined(user, company)
         return user, None
 
 
@@ -212,16 +219,9 @@ async def create_departments_from_defaults(request, data: SelectionIn):
     managed_company = await get_managed_company(request.auth)
     if managed_company is None or managed_company.id != company.id:
         return payload('You do not have permission to manage this company.', 403, False)
-    defaults = DefaultDepartment.objects.filter(
-        Q(sector=company.sector) | Q(sector__isnull=True)
-    ) if data.use_all_default_departments else DefaultDepartment.objects.filter(id__in=data.selected_types)
-    existing_names = {name async for name in Department.objects.filter(company=company).values_list('name', flat=True)}
-    to_create = [
-        Department(name=item.name, description=item.description, company=company)
-        async for item in defaults if item.name not in existing_names
-    ]
-    if to_create:
-        await Department.objects.abulk_create(to_create)
+    to_create = await departments_and_teams_services.apply_default_departments(
+        company, use_all=data.use_all_default_departments, selected_ids=data.selected_types,
+    )
     return payload('Departments created successfully.', 201, True, {
         'company_id': company.id, 'created_departments': [{'name': item.name} for item in to_create],
         'total_departments_created': len(to_create),
@@ -251,16 +251,9 @@ async def create_task_types_from_defaults(request, data: SelectionIn):
     managed_company = await get_managed_company(request.auth)
     if managed_company is None or managed_company.id != company.id:
         return payload('You do not have permission to manage this company.', 403, False)
-    defaults = DefaultTaskType.objects.filter(
-        Q(sector=company.sector) | Q(sector__isnull=True)
-    ) if data.use_all_default_task_types else DefaultTaskType.objects.filter(id__in=data.selected_types)
-    existing_names = {name async for name in TaskType.objects.filter(company=company).values_list('name', flat=True)}
-    to_create = [
-        TaskType(name=item.name, description=item.description, company=company)
-        async for item in defaults if item.name not in existing_names
-    ]
-    if to_create:
-        await TaskType.objects.abulk_create(to_create)
+    to_create = await projects_and_tasks_services.apply_default_task_types(
+        company, use_all=data.use_all_default_task_types, selected_ids=data.selected_types,
+    )
     return payload('Task types assigned successfully.', 201, True, {
         'company_id': company.id, 'created_task_types': [{'name': item.name} for item in to_create],
         'total_task_types_created': len(to_create),
@@ -315,6 +308,7 @@ async def send_invite(request, data: InviteIn):
     await sync_to_async(send_invite_email_task.delay, thread_sensitive=True)(
         str(invite.id), raw_token, request.auth.get_username(),
     )
+    await sync_to_async(log_member_invited, thread_sensitive=True)(company, request.auth, invite.email)
     await invite.arefresh_from_db(fields=['email_sent'])
     message = (
         'Invitation sent successfully' if invite.email_sent

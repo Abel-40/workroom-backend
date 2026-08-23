@@ -35,6 +35,7 @@ roles:
       - members:invite_cm             # only Owner may offer the CM role via invite
       - members:manage_role
       - members:manage_cm_role        # only Owner may promote/demote a Company Manager
+      - members:remove                # only Owner/CM may remove a member from the company
       - departments:view
       - departments:manage
       - teams:view
@@ -61,6 +62,7 @@ roles:
       - members:view
       - members:invite
       - members:manage_role
+      - members:remove
       - departments:view
       - departments:manage
       - teams:view

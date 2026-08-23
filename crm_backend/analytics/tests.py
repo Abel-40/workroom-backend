@@ -4,6 +4,7 @@ so isolation is checked the same way every other endpoint's tests check it.
 """
 
 from api.tests import TwoCompanyTestCase, auth_header
+from departments_and_teams.models import Department
 from django.utils import timezone
 from projects_and_tasks.models import Project, Task
 from users.models import CompanyUserProfile, User
@@ -128,3 +129,52 @@ class CompanyWorkloadTests(TwoCompanyTestCase):
         response = self.get_workload(self.owner_a)
         members = {m['id']: m for m in response.json()['data']['members']}
         self.assertEqual(members[str(cm.id)]['role'], 'CM')
+
+
+class DepartmentAnalyticsTests(TwoCompanyTestCase):
+    def setUp(self):
+        super().setUp()
+        # department_a ('Engineering') already exists with member_a in it
+        # (see TwoCompanyTestCase.setUp).
+        self.project = Project.objects.create(
+            title='Backend Revamp', company=self.company_a, created_by=self.owner_a, department=self.department_a,
+        )
+        Task.objects.create(project=self.project, title='T1', status=Task.STATUS.DONE, department=self.department_a)
+        Task.objects.create(project=self.project, title='T2', status=Task.STATUS.TODO, department=self.department_a)
+        # A task whose own department differs from its project's department
+        # -- must be counted under its own department, not the project's.
+        self.sales_department = Department.objects.create(name='Sales', company=self.company_a)
+        Task.objects.create(project=self.project, title='T3', status=Task.STATUS.TODO, department=self.sales_department)
+
+    def get_department_stats(self, user):
+        return self.client.get('/api/analytics/company/departments/', **auth_header(user))
+
+    def test_department_stats_bucket_by_the_tasks_own_department(self):
+        response = self.get_department_stats(self.owner_a)
+        self.assertEqual(response.status_code, 200)
+        by_name = {d['name']: d for d in response.json()['data']['departments']}
+
+        engineering = by_name['Engineering']
+        self.assertEqual(engineering['project_count'], 1)
+        self.assertEqual(engineering['task_count'], 2)
+        self.assertEqual(engineering['completed_task_count'], 1)
+        self.assertEqual(engineering['member_count'], 1)  # member_a
+
+        sales = by_name['Sales']
+        self.assertEqual(sales['project_count'], 0)
+        self.assertEqual(sales['task_count'], 1)
+        self.assertEqual(sales['member_count'], 0)
+
+    def test_a_company_with_no_departments_returns_an_empty_list(self):
+        response = self.get_department_stats(self.owner_b)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['departments'], [])
+
+    def test_department_stats_are_scoped_to_the_callers_own_company(self):
+        response = self.get_department_stats(self.owner_b)
+        names = {d['name'] for d in response.json()['data']['departments']}
+        self.assertNotIn('Engineering', names)
+
+    def test_requires_authentication(self):
+        response = self.client.get('/api/analytics/company/departments/')
+        self.assertEqual(response.status_code, 401)

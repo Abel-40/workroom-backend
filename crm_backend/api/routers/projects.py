@@ -85,6 +85,8 @@ async def project_data(project: Project) -> dict:
         'start_date': project.start_date.isoformat(),
         'deadline': project.deadline.isoformat(),
         'created_by': str(project.created_by_id) if project.created_by_id else None,
+        'current_owner_id': str(project.current_owner_id) if project.current_owner_id else None,
+        'current_owner_name': project.current_owner.username if project.current_owner_id else None,
         'created_at': project.created_at.isoformat(),
         'updated_at': project.updated_at.isoformat(),
         'total_tasks': total_tasks,
@@ -156,6 +158,28 @@ async def update_project(request, project_id: UUID, data: ProjectUpdateIn):
             errors={'collaborator_ids': ['One or more users are not members of this company']},
         )
     return payload('Project updated successfully.', 200, True, {'project': await project_data(updated)})
+
+
+class ProjectOwnerIn(Schema):
+    new_owner_id: UUID
+
+
+@router.patch('/{project_id}/owner/', auth=auth, response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+async def transfer_project_owner(request, project_id: UUID, data: ProjectOwnerIn):
+    project, error = await services.get_project_for_user(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    updated, error = await services.transfer_project_ownership(request.auth, project, data.new_owner_id)
+    if error == 'forbidden':
+        return payload('You do not have permission to transfer this project.', 403, False)
+    if error == 'invalid_owner':
+        return payload(
+            'Invalid owner for this company.', 400, False,
+            errors={'new_owner_id': ['Must be a member of this project\'s company']},
+        )
+    return payload('Project ownership transferred successfully.', 200, True, {'project': await project_data(updated)})
 
 
 @router.delete('/{project_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})

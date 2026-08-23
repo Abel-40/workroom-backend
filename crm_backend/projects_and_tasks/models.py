@@ -32,7 +32,14 @@ class Project(UUIDModel):
     status = models.CharField(max_length=20, choices=STATUS.choices, default=STATUS.ACTIVE)
     department = models.ForeignKey('departments_and_teams.Department', on_delete=models.CASCADE, related_name='projects', null=True)
     team = models.ForeignKey('departments_and_teams.Team',on_delete=models.CASCADE,related_name='project_team',null=True)
-    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='assigned_projects', null=True)
+    # Immutable historical creator -- never reassigned, even after ownership
+    # transfer or the creator leaving the company (SET_NULL, not CASCADE, so
+    # this record survives a User row being removed).
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='assigned_projects', null=True)
+    # The current responsible owner -- defaults to created_by at creation, but
+    # is reassignable (see services.transfer_project_ownership) independently
+    # of the immutable created_by above.
+    current_owner = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='owned_projects', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     image = models.ImageField(upload_to='project_images/', blank=True, null=True)
@@ -89,6 +96,13 @@ class TaskType(UUIDModel):
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True)
     company = models.ForeignKey('company.Company', on_delete=models.CASCADE, related_name='task_types')
+    # Traceability back to the DefaultTaskType template this was created
+    # from, if any -- see Department.default_department for the same
+    # pattern/rationale. Null for manually-created task types and for any
+    # row created before this field existed (no retroactive backfill).
+    default_task_type = models.ForeignKey(
+        'DefaultTaskType', on_delete=models.SET_NULL, null=True, blank=True, related_name='company_task_types',
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
 

@@ -1,3 +1,255 @@
-from django.test import TestCase
+"""Company activity feed: which events get logged (a curated set, not every
+field edit), tenant isolation, and the limit bound. Reuses TwoCompanyTestCase
+(api/tests.py) for cross-tenant coverage the same way every other endpoint's
+tests do.
+"""
 
-# Create your tests here.
+import json
+from unittest.mock import patch
+
+from api.tests import TwoCompanyTestCase, auth_header
+from users.models import CompanyUserProfile
+
+from notifications_and_activity.models import CompanyActivity, Notification
+from notifications_and_activity.tasks import send_notification_email_task
+
+
+class CompanyActivityTests(TwoCompanyTestCase):
+    def list_activity(self, user, limit=None):
+        url = '/api/activity/'
+        if limit is not None:
+            url += f'?limit={limit}'
+        return self.client.get(url, **auth_header(user))
+
+    def test_creating_a_project_logs_an_activity_entry(self):
+        self.create_project(owner=self.owner_a)
+        self.assertTrue(CompanyActivity.objects.filter(
+            company=self.company_a, type=CompanyActivity.ActivityType.PROJECT_CREATED,
+        ).exists())
+
+    def test_completing_a_project_logs_an_activity_entry_exactly_once(self):
+        project = self.create_project(owner=self.owner_a)
+        patch_body = json.dumps({'status': 'Done'})
+        self.client.patch(
+            f"/api/projects/{project['id']}/", patch_body, content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        # Saving the same Done status again must not log a second completion.
+        self.client.patch(
+            f"/api/projects/{project['id']}/", json.dumps({'description': 'still done'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(
+            CompanyActivity.objects.filter(
+                company=self.company_a, type=CompanyActivity.ActivityType.PROJECT_COMPLETED,
+            ).count(),
+            1,
+        )
+
+    def test_activity_list_requires_authentication(self):
+        response = self.client.get('/api/activity/')
+        self.assertEqual(response.status_code, 401)
+
+    def test_activity_is_scoped_to_the_callers_own_company(self):
+        self.create_project(owner=self.owner_a)
+        response = self.list_activity(self.owner_b)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['results'], [])
+
+    def test_member_can_view_company_activity(self):
+        self.create_project(owner=self.owner_a)
+        response = self.list_activity(self.member_a)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(len(response.json()['data']['results']) >= 1)
+
+    def test_limit_is_bounded(self):
+        for i in range(5):
+            self.create_project(owner=self.owner_a, title=f'Project {i}')
+        response = self.list_activity(self.owner_a, limit=1000)
+        self.assertEqual(response.status_code, 200)
+        self.assertLessEqual(len(response.json()['data']['results']), 50)
+
+    def test_creating_a_department_logs_an_activity_entry(self):
+        self.client.post(
+            '/api/departments/', json.dumps({'name': 'Marketing'}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        self.assertTrue(CompanyActivity.objects.filter(
+            company=self.company_a, type=CompanyActivity.ActivityType.DEPARTMENT_CREATED,
+        ).exists())
+
+    def test_creating_a_team_logs_an_activity_entry(self):
+        self.client.post(
+            '/api/teams/', json.dumps({'name': 'Launch Squad'}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        self.assertTrue(CompanyActivity.objects.filter(
+            company=self.company_a, type=CompanyActivity.ActivityType.TEAM_CREATED,
+        ).exists())
+
+    def test_sending_an_invite_logs_an_activity_entry(self):
+        with patch('users.tasks.send_invitation_email'):
+            self.client.post(
+                '/api/auth/send_invite/', json.dumps({'email': 'new@example.com'}),
+                content_type='application/json', **auth_header(self.owner_a),
+            )
+        self.assertTrue(CompanyActivity.objects.filter(
+            company=self.company_a, type=CompanyActivity.ActivityType.MEMBER_INVITED,
+        ).exists())
+
+    def test_removing_a_member_logs_an_activity_entry(self):
+        self.client.post(
+            f'/api/company/members/{self.member_a.id}/remove/', json.dumps({}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertTrue(CompanyActivity.objects.filter(
+            company=self.company_a, type=CompanyActivity.ActivityType.MEMBER_REMOVED,
+        ).exists())
+
+    def test_transferring_ownership_logs_an_activity_entry(self):
+        project = self.create_project(owner=self.owner_a)
+        self.client.patch(
+            f"/api/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertTrue(CompanyActivity.objects.filter(
+            company=self.company_a, type=CompanyActivity.ActivityType.PROJECT_OWNERSHIP_TRANSFERRED,
+        ).exists())
+
+
+class NotificationEmailCategoryTests(TwoCompanyTestCase):
+    """A critical notification always emails; an optional one respects the
+    recipient's CompanyUserProfile.email_notifications_enabled preference."""
+
+    def create_task(self, project_id, owner=None, **overrides):
+        body = {'title': 'Build login page'}
+        body.update(overrides)
+        return self.client.post(
+            f'/api/projects/{project_id}/tasks/', json.dumps(body), content_type='application/json',
+            **auth_header(owner or self.owner_a),
+        ).json()['data']['task']
+
+    @patch('notifications_and_activity.tasks.send_notification_email_task.delay')
+    def test_task_assigned_is_critical_and_always_enqueues_email(self, mock_delay):
+        profile = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
+        profile.email_notifications_enabled = False
+        profile.save(update_fields=['email_notifications_enabled'])
+
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.client.post(
+            f"/api/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        notification = Notification.objects.get(recipient=self.member_a, type=Notification.Type.TASK_ASSIGNED)
+        self.assertEqual(notification.category, Notification.Category.CRITICAL)
+        mock_delay.assert_called_once_with(str(notification.id))
+
+    @patch('notifications_and_activity.tasks.send_notification_email_task.delay')
+    def test_optional_notification_skips_email_when_preference_disabled(self, mock_delay):
+        # member_a creates the task; owner_a is assigned and completes it, so
+        # the (optional) TASK_COMPLETED notification goes to member_a, whose
+        # preference is disabled below.
+        profile = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
+        profile.email_notifications_enabled = False
+        profile.save(update_fields=['email_notifications_enabled'])
+
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'], owner=self.member_a)
+        self.client.post(
+            f"/api/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.owner_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        mock_delay.reset_mock()
+        self.client.patch(
+            f"/api/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        notification = Notification.objects.get(recipient=self.member_a, type=Notification.Type.TASK_COMPLETED)
+        self.assertEqual(notification.category, Notification.Category.OPTIONAL)
+        mock_delay.assert_not_called()
+
+    @patch('notifications_and_activity.tasks.send_notification_email_task.delay')
+    def test_optional_notification_enqueues_email_when_preference_enabled(self, mock_delay):
+        # member_a's preference defaults to enabled (True).
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'], owner=self.member_a)
+        self.client.post(
+            f"/api/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.owner_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        mock_delay.reset_mock()
+        self.client.patch(
+            f"/api/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        notification = Notification.objects.get(recipient=self.member_a, type=Notification.Type.TASK_COMPLETED)
+        mock_delay.assert_called_once_with(str(notification.id))
+
+
+class NotificationEmailTaskTests(TwoCompanyTestCase):
+    @patch('notifications_and_activity.tasks.send_notification_email')
+    def test_sends_and_marks_email_sent(self, mock_send):
+        notification = Notification.objects.create(
+            recipient=self.owner_a, type=Notification.Type.TASK_ASSIGNED,
+            category=Notification.Category.CRITICAL, title='Test', message='Body',
+        )
+        send_notification_email_task(str(notification.id))
+        mock_send.assert_called_once_with(self.owner_a.email, 'Test', 'Body')
+        notification.refresh_from_db()
+        self.assertTrue(notification.email_sent)
+
+    @patch('notifications_and_activity.tasks.send_notification_email')
+    def test_rerunning_on_an_already_sent_notification_is_a_noop(self, mock_send):
+        notification = Notification.objects.create(
+            recipient=self.owner_a, type=Notification.Type.TASK_ASSIGNED,
+            category=Notification.Category.CRITICAL, title='Test', message='Body', email_sent=True,
+        )
+        send_notification_email_task(str(notification.id))
+        mock_send.assert_not_called()
+
+
+class NotificationPreferenceTests(TwoCompanyTestCase):
+    def set_preference(self, enabled, user=None):
+        return self.client.patch(
+            '/api/company/members/me/notification-preference/',
+            json.dumps({'email_notifications_enabled': enabled}),
+            content_type='application/json', **auth_header(user or self.member_a),
+        )
+
+    def test_member_can_disable_their_own_email_notifications(self):
+        response = self.set_preference(False)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['data']['email_notifications_enabled'])
+        self.assertFalse(
+            CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a).email_notifications_enabled,
+        )
+
+    def test_owner_has_no_profile_to_update(self):
+        response = self.set_preference(False, user=self.owner_a)
+        self.assertEqual(response.status_code, 400)
+
+    def test_requires_authentication(self):
+        response = self.client.patch(
+            '/api/company/members/me/notification-preference/',
+            json.dumps({'email_notifications_enabled': False}), content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 401)
+
+
+class NotificationFilterTests(TwoCompanyTestCase):
+    def test_filters_by_type_and_related_object(self):
+        Notification.objects.create(
+            recipient=self.owner_a, type=Notification.Type.TASK_ASSIGNED, title='A',
+            related_object_type='project', related_object_id=self.owner_a.id,
+        )
+        Notification.objects.create(recipient=self.owner_a, type=Notification.Type.TASK_COMPLETED, title='B')
+        response = self.client.get(
+            f'/api/notifications/?type=task_assigned&related_object_type=project'
+            f'&related_object_id={self.owner_a.id}',
+            **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        results = response.json()['data']['results']
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['title'], 'A')

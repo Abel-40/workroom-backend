@@ -50,6 +50,15 @@ class CompanyUserProfile(UUIDModel):
 
     role = models.CharField(max_length=200, choices=Role.choices, default=Role.Owner)
     department = models.ForeignKey('departments_and_teams.Department', on_delete=models.SET_NULL, null=True, blank=True)
+    # Company-scoped lockout, distinct from the global auth User.is_active --
+    # see users.services.set_member_active_status and company.services (the
+    # tenant-resolution helpers filter on this) for why: deactivating access
+    # to one company must never affect Django auth or any other company the
+    # same person might belong to.
+    is_active = models.BooleanField(default=True)
+    # Optional notifications respect this; critical ones always email
+    # regardless -- see notifications_and_activity.services.TYPE_CATEGORY.
+    email_notifications_enabled = models.BooleanField(default=True)
 
     # Profile details
     profile_picture = models.ImageField(upload_to='profile_pictures/', null=True, blank=True)

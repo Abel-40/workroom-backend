@@ -15,10 +15,16 @@ from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from notifications_and_activity.services import notify_task_assigned, notify_task_completed
+from notifications_and_activity.services import (
+    log_ownership_transferred,
+    log_project_completed,
+    log_project_created,
+    notify_task_assigned,
+    notify_task_completed,
+)
 from users.models import CompanyUserProfile
 
-from .models import Attachment, Project, Task, TaskType
+from .models import Attachment, DefaultTaskType, Project, Task, TaskType
 
 User = get_user_model()
 
@@ -65,9 +71,9 @@ async def user_can_view_project(user, project) -> bool:
 
 
 async def user_can_manage_project(user, project) -> bool:
-    """Edit/archive rights: creator, company owner, or the leader of the
-    project's own department."""
-    if project.created_by_id == user.id:
+    """Edit/archive rights: creator, current owner, company owner, or the
+    leader of the project's own department."""
+    if project.created_by_id == user.id or project.current_owner_id == user.id:
         return True
     role = await get_company_role(user, project.company)
     if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
@@ -101,7 +107,7 @@ async def list_projects_for_user(user):
     company = await get_member_company(user)
     if company is None:
         return Project.objects.none()
-    qs = Project.objects.filter(company=company, is_deleted=False).select_related('department', 'created_by')
+    qs = Project.objects.filter(company=company, is_deleted=False).select_related('department', 'created_by', 'current_owner')
     role = await get_company_role(user, company)
     if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
         return qs.order_by('-created_at')
@@ -117,7 +123,7 @@ async def list_projects_for_user(user):
 
 async def get_project_for_user(user, project_id):
     """Returns (project, error) where error is 'not_found', 'forbidden', or None."""
-    project = await Project.objects.select_related('company', 'department', 'created_by').filter(
+    project = await Project.objects.select_related('company', 'department', 'created_by', 'current_owner').filter(
         id=project_id, is_deleted=False,
     ).afirst()
     if project is None:
@@ -176,16 +182,19 @@ async def create_project(user, *, title, description, visibility, priority, star
         return None, error
     project = await Project.objects.acreate(
         title=title, description=description, company=company, department=department, team=team,
-        visibility=visibility, priority=priority, start_date=start_date, deadline=deadline, created_by=user,
+        visibility=visibility, priority=priority, start_date=start_date, deadline=deadline,
+        created_by=user, current_owner=user,
     )
     if collaborators:
         await sync_to_async(project.collaborators.set, thread_sensitive=True)(collaborators)
+    await sync_to_async(log_project_created, thread_sensitive=True)(project)
     return project, None
 
 
 async def update_project(user, project, updates: dict):
     if not await user_can_manage_project(user, project):
         return None, 'forbidden'
+    was_done = project.status == Project.STATUS.DONE
     if 'department_id' in updates:
         department, error = await _resolve_department(project.company, updates.pop('department_id'))
         if error:
@@ -207,6 +216,8 @@ async def update_project(user, project, updates: dict):
     await project.asave()
     if collaborators is not None:
         await sync_to_async(project.collaborators.set, thread_sensitive=True)(collaborators)
+    if project.status == Project.STATUS.DONE and not was_done:
+        await sync_to_async(log_project_completed, thread_sensitive=True)(project)
     return project, None
 
 
@@ -216,6 +227,25 @@ async def archive_project(user, project) -> bool:
     project.is_deleted = True
     await project.asave(update_fields=['is_deleted'])
     return True
+
+
+async def transfer_project_ownership(user, project, new_owner_id):
+    """Reassign the project's current owner. Never touches the immutable
+    created_by (see Project.created_by) -- history is preserved by design.
+    Returns (project, error) where error is 'forbidden', 'invalid_owner', or
+    None."""
+    if not await user_can_manage_project(user, project):
+        return None, 'forbidden'
+    if new_owner_id == project.current_owner_id:
+        return project, None
+    new_owner = await User.objects.filter(id=new_owner_id).afirst()
+    if new_owner is None or not await is_company_member(new_owner, project.company):
+        return None, 'invalid_owner'
+    previous_owner = project.current_owner
+    project.current_owner = new_owner
+    await project.asave(update_fields=['current_owner'])
+    await sync_to_async(log_ownership_transferred, thread_sensitive=True)(project, previous_owner, new_owner)
+    return project, None
 
 
 # --------------------------------------------------------------------------
@@ -611,3 +641,46 @@ async def delete_document(user, document) -> bool:
     document.is_deleted = True
     await document.asave(update_fields=['is_deleted'])
     return True
+
+
+# --------------------------------------------------------------------------
+# Default-task-type configuration -- mirrors departments_and_teams.services'
+# apply_default_departments/get_default_departments_with_status, shared by
+# the onboarding wizard (api.api.create_task_types_from_defaults) and the
+# post-registration company-config management endpoints.
+# --------------------------------------------------------------------------
+
+async def apply_default_task_types(company, *, use_all=False, selected_ids=None):
+    """Creates company TaskType rows from DefaultTaskType templates for
+    ``company``'s sector (or explicit ``selected_ids``), skipping any whose
+    name already exists in this company. Returns the list of newly created
+    TaskType instances (empty if everything was already present)."""
+    defaults = DefaultTaskType.objects.filter(
+        Q(sector_id=company.sector_id) | Q(sector__isnull=True),
+    ) if use_all else DefaultTaskType.objects.filter(id__in=selected_ids or [])
+    existing_names = {
+        name async for name in TaskType.objects.filter(company=company).values_list('name', flat=True)
+    }
+    to_create = [
+        TaskType(name=item.name, description=item.description, company=company, default_task_type=item)
+        async for item in defaults if item.name not in existing_names
+    ]
+    if to_create:
+        await TaskType.objects.abulk_create(to_create)
+    return to_create
+
+
+async def get_default_task_types_with_status(company) -> list[dict]:
+    """Every DefaultTaskType available to ``company``'s sector, annotated
+    with whether it's already enabled -- see
+    departments_and_teams.services.get_default_departments_with_status for
+    the same pattern."""
+    enabled_ids = {
+        default_id async for default_id in TaskType.objects.filter(
+            company=company, default_task_type__isnull=False,
+        ).values_list('default_task_type_id', flat=True)
+    }
+    return [
+        {'id': str(item.id), 'name': item.name, 'description': item.description, 'enabled': item.id in enabled_ids}
+        async for item in DefaultTaskType.objects.filter(Q(sector_id=company.sector_id) | Q(sector__isnull=True))
+    ]

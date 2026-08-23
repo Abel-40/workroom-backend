@@ -13,6 +13,19 @@ class Department(UUIDModel):
         blank=True,
         related_name='leading_departments'
     )
+    # Traceability back to the DefaultDepartment template this was created
+    # from, if any -- null for manually-created departments, and for any
+    # department created before this field existed (no retroactive
+    # backfill is attempted; see the migration). Lets the company
+    # default-config page show which of a company's departments are
+    # "enabled defaults" vs custom, without duplicating template data.
+    default_department = models.ForeignKey(
+        'DefaultDepartment',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='company_departments',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

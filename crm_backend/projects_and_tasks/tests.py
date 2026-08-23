@@ -9,7 +9,7 @@ import json
 from api.tests import TwoCompanyTestCase, auth_header
 from django.core.files.uploadedfile import SimpleUploadedFile
 
-from projects_and_tasks.models import Project, TaskType
+from projects_and_tasks.models import DefaultTaskType, Project, TaskType
 
 
 class TaskTypeListTests(TwoCompanyTestCase):
@@ -83,6 +83,99 @@ class ProjectCollaboratorTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 400)
         stored = Project.objects.get(id=project['id'])
         self.assertEqual(list(stored.collaborators.all()), [])
+
+
+class DefaultTaskTypeConfigTests(TwoCompanyTestCase):
+    """Post-registration default-task-type management -- mirrors
+    departments_and_teams.tests.DefaultConfigTests."""
+
+    def setUp(self):
+        super().setUp()
+        self.default = DefaultTaskType.objects.create(name='Bug', sector=None)
+
+    def list_config(self, user=None):
+        return self.client.get('/api/company/default-config/', **auth_header(user or self.owner_a))
+
+    def enable(self, selected_ids=None, use_all=False, user=None):
+        body = {'use_all': use_all}
+        if selected_ids is not None:
+            body['selected_ids'] = [str(i) for i in selected_ids]
+        return self.client.post(
+            '/api/company/default-config/task-types/', json.dumps(body),
+            content_type='application/json', **auth_header(user or self.owner_a),
+        )
+
+    def test_enabling_a_default_task_type_creates_a_traceable_row(self):
+        response = self.enable(selected_ids=[self.default.id])
+        self.assertEqual(response.status_code, 201)
+        task_type = TaskType.objects.get(company=self.company_a, name='Bug')
+        self.assertEqual(task_type.default_task_type_id, self.default.id)
+
+        status_response = self.list_config()
+        by_name = {t['name']: t for t in status_response.json()['data']['task_types']}
+        self.assertTrue(by_name['Bug']['enabled'])
+
+    def test_reenabling_is_a_noop(self):
+        self.enable(selected_ids=[self.default.id])
+        response = self.enable(selected_ids=[self.default.id])
+        self.assertEqual(response.json()['data']['total_created'], 0)
+        self.assertEqual(TaskType.objects.filter(company=self.company_a, name='Bug').count(), 1)
+
+    def test_department_member_cannot_manage_default_task_types(self):
+        response = self.enable(selected_ids=[self.default.id], user=self.member_a)
+        self.assertEqual(response.status_code, 403)
+
+
+class ProjectOwnershipTransferTests(TwoCompanyTestCase):
+    """current_owner is reassignable; created_by (the historical creator)
+    never changes -- see projects_and_tasks.services.transfer_project_ownership."""
+
+    def transfer(self, project_id, new_owner_id, user=None):
+        return self.client.patch(
+            f'/api/projects/{project_id}/owner/',
+            json.dumps({'new_owner_id': str(new_owner_id)}),
+            content_type='application/json', **auth_header(user or self.owner_a),
+        )
+
+    def test_new_project_defaults_current_owner_to_its_creator(self):
+        project = self.create_project(owner=self.owner_a)
+        self.assertEqual(project['current_owner_id'], str(self.owner_a.id))
+        self.assertEqual(project['created_by'], str(self.owner_a.id))
+
+    def test_creator_can_transfer_ownership_to_a_company_member(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.transfer(project['id'], self.member_a.id)
+        self.assertEqual(response.status_code, 200)
+        updated = response.json()['data']['project']
+        self.assertEqual(updated['current_owner_id'], str(self.member_a.id))
+        # The historical creator is never overwritten by a transfer.
+        self.assertEqual(updated['created_by'], str(self.owner_a.id))
+
+    def test_transferring_to_the_current_owner_is_a_noop(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.transfer(project['id'], self.owner_a.id)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['project']['current_owner_id'], str(self.owner_a.id))
+
+    def test_non_manager_cannot_transfer_ownership(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.transfer(project['id'], self.member_a.id, user=self.member_a)
+        self.assertEqual(response.status_code, 403)
+        stored = Project.objects.get(id=project['id'])
+        self.assertEqual(stored.current_owner_id, self.owner_a.id)
+
+    def test_cannot_transfer_to_a_user_outside_the_company(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.transfer(project['id'], self.owner_b.id)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('new_owner_id', response.json()['errors'])
+        stored = Project.objects.get(id=project['id'])
+        self.assertEqual(stored.current_owner_id, self.owner_a.id)
+
+    def test_transfer_is_scoped_to_the_callers_own_company(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.transfer(project['id'], self.owner_b.id, user=self.owner_b)
+        self.assertEqual(response.status_code, 403)
 
 
 class ProjectImageTests(TwoCompanyTestCase):

@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from analytics.services import get_company_stats, get_company_workload, get_project_stats
+from analytics.services import get_company_stats, get_company_workload, get_department_stats, get_project_stats
 from company.services import get_member_company
 from ninja import Router
 from projects_and_tasks import services
@@ -40,3 +40,12 @@ async def company_workload(request):
         return payload('You do not belong to a company.', 404, False)
     members = await get_company_workload(company)
     return payload('Company workload retrieved successfully.', 200, True, {'members': members})
+
+
+@router.get('/company/departments/', auth=auth, response={200: ApiResponse, 404: ApiResponse})
+async def department_stats(request):
+    company = await get_member_company(request.auth)
+    if company is None:
+        return payload('You do not belong to a company.', 404, False)
+    departments = await get_department_stats(company)
+    return payload('Department analytics retrieved successfully.', 200, True, {'departments': departments})

@@ -1,5 +1,6 @@
 """In-app notification list/read API (Phase 9)."""
 
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -19,6 +20,7 @@ def notification_data(notification: Notification) -> dict:
     return {
         'id': str(notification.id),
         'type': notification.type,
+        'category': notification.category,
         'title': notification.title,
         'message': notification.message,
         'related_object_type': notification.related_object_type,
@@ -29,12 +31,27 @@ def notification_data(notification: Notification) -> dict:
 
 
 @router.get('/', auth=auth, response={200: ApiResponse})
-async def list_notifications(request, is_read: Optional[bool] = None, page: int = 1, page_size: int = DEFAULT_PAGE_SIZE):
+async def list_notifications(
+    request, is_read: Optional[bool] = None, type: Optional[str] = None,
+    date_from: Optional[datetime] = None, date_to: Optional[datetime] = None,
+    related_object_type: Optional[str] = None, related_object_id: Optional[UUID] = None,
+    page: int = 1, page_size: int = DEFAULT_PAGE_SIZE,
+):
     # recipient=request.auth is the tenant boundary here: a user can only
     # ever see their own notifications, never another user's.
     queryset = Notification.objects.filter(recipient=request.auth)
     if is_read is not None:
         queryset = queryset.filter(is_read=is_read)
+    if type is not None:
+        queryset = queryset.filter(type=type)
+    if date_from is not None:
+        queryset = queryset.filter(created_at__gte=date_from)
+    if date_to is not None:
+        queryset = queryset.filter(created_at__lte=date_to)
+    if related_object_type is not None:
+        queryset = queryset.filter(related_object_type=related_object_type)
+    if related_object_id is not None:
+        queryset = queryset.filter(related_object_id=related_object_id)
     items, meta = await paginate(queryset, page, page_size)
     unread_count = await Notification.objects.filter(recipient=request.auth, is_read=False).acount()
     return payload('Notifications retrieved successfully.', 200, True, {

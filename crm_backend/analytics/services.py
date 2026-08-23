@@ -7,6 +7,7 @@ nothing to keep in sync. Callers are responsible for the auth/tenant check
 company-scoped endpoint uses) before calling these.
 """
 
+from departments_and_teams.models import Department
 from django.contrib.auth import get_user_model
 from django.db.models import Count
 from django.utils import timezone
@@ -113,6 +114,7 @@ async def get_company_workload(company) -> list[dict]:
         'email': owner.email,
         'role': CompanyUserProfile.Role.Owner,
         'department': None,
+        'is_active': True,
         **workload_fields(str(owner.id)),
     }]
 
@@ -126,6 +128,62 @@ async def get_company_workload(company) -> list[dict]:
             'email': profile.user.email,
             'role': profile.role,
             'department': profile.department.name if profile.department_id else None,
+            'is_active': profile.is_active,
             **workload_fields(str(profile.user_id)),
         })
     return members
+
+
+async def get_department_stats(company) -> list[dict]:
+    """Per-department project/task counts and member count -- a bounded,
+    point-in-time breakdown for the company insights page. No trend/velocity
+    data; that's explicitly out of V1 scope.
+
+    Task.department is the task's own field, distinct from
+    Task.project.department -- a task can be assigned to a different
+    department than its parent project, so counting by the task's own field
+    is deliberate here, not an oversight.
+    """
+    results = []
+    departments = Department.objects.filter(company=company).order_by('name')
+    async for department in departments:
+        project_count = await Project.objects.filter(department=department, is_deleted=False).acount()
+        tasks = Task.objects.filter(department=department, is_deleted=False)
+        task_count = await tasks.acount()
+        completed_task_count = await tasks.filter(status=Task.STATUS.DONE).acount()
+        member_count = await CompanyUserProfile.objects.filter(department=department).acount()
+        results.append({
+            'id': str(department.id),
+            'name': department.name,
+            'project_count': project_count,
+            'task_count': task_count,
+            'completed_task_count': completed_task_count,
+            'member_count': member_count,
+        })
+    return results
+
+
+async def get_member_workload(company, user) -> dict:
+    """Single-user variant of get_company_workload's active-task breakdown --
+    for the employee detail page, which doesn't need the whole company's
+    counts recomputed just to show one person's."""
+    counts_by_status: dict[str, int] = {}
+    counts_qs = (
+        Task.objects.filter(project__company=company, is_deleted=False, assigned_to=user)
+        .exclude(status=Task.STATUS.DONE)
+        .values('status')
+        .annotate(count=Count('id'))
+    )
+    async for row in counts_qs:
+        field = _ACTIVE_STATUS_FIELD.get(row['status'])
+        if field is not None:
+            counts_by_status[field] = row['count']
+    todo = counts_by_status.get('todo_count', 0)
+    in_progress = counts_by_status.get('in_progress_count', 0)
+    in_review = counts_by_status.get('in_review_count', 0)
+    return {
+        'active_task_count': todo + in_progress + in_review,
+        'todo_count': todo,
+        'in_progress_count': in_progress,
+        'in_review_count': in_review,
+    }
