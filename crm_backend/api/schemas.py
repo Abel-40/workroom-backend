@@ -57,12 +57,6 @@ class InviteIn(Schema):
     role: Literal['DL', 'DM', 'CM'] = 'DM'
 
 
-class AcceptInviteIn(Schema):
-    token: str = Field(min_length=1, max_length=64)
-    password: str = Field(min_length=8, max_length=128)
-    username: str = Field(min_length=1, max_length=100)
-
-
 class CheckoutIn(Schema):
     plan_id: UUID
 

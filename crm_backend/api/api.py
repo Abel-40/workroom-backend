@@ -16,8 +16,9 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connection, transaction
 from django.db.models import Q
 from django.http import JsonResponse
-from ninja import NinjaAPI
+from ninja import File, Form, NinjaAPI
 from ninja.errors import HttpError
+from ninja.files import UploadedFile
 from notifications_and_activity.services import log_member_invited, log_member_joined, notify_invitation_accepted
 from permissions.catalog import has_permission
 from plans.models import Plan
@@ -47,7 +48,6 @@ from .routers.task_types import router as task_types_router
 from .routers.tasks import router as tasks_router
 from .routers.teams import router as teams_router
 from .schemas import (
-    AcceptInviteIn,
     ApiResponse,
     CheckoutIn,
     CompanyRegistrationIn,
@@ -104,7 +104,15 @@ def user_data(user):
     }
 
 
-def accept_invite_in_transaction(token: str, password: str, username: str):
+def accept_invite_in_transaction(
+    token: str,
+    password: str,
+    full_name: str,
+    profession: str,
+    phone_number: str,
+    address: str,
+    profile_picture: UploadedFile,
+):
     """Transactions are sync-only in Django, so keep this multi-write flow atomic."""
     with transaction.atomic():
         invite = PendingInvite.objects.select_for_update().filter(
@@ -118,9 +126,21 @@ def accept_invite_in_transaction(token: str, password: str, username: str):
             return None, 'expired'
         if User.objects.filter(email__iexact=invite.email).exists():
             return None, 'existing_user'
-        user = User.objects.create_user(email=invite.email, password=password, username=username)
+        first_name, _, last_name = full_name.strip().partition(' ')
+        user = User.objects.create_user(
+            email=invite.email,
+            password=password,
+            username=full_name.strip(),
+        )
+        user.first_name = first_name
+        user.last_name = last_name
+        user.save(update_fields=['first_name', 'last_name'])
         CompanyUserProfile.objects.create(
             user=user, company=invite.company, department=invite.department, role=invite.role,
+            profession=profession.strip() or 'Not provided',
+            phone_number=phone_number.strip() or 'Not provided',
+            address=address.strip() or 'Not provided',
+            profile_picture=profile_picture,
         )
         company = invite.company
         invite.delete()
@@ -166,6 +186,7 @@ async def signin(request, data: SignInIn):
             'user': user_data(user), 'is_authenticated': True, 'access': str(refresh.access_token),
             'role': role, 'company_id': str(company.id) if company else None,
             'company_name': company.name if company else None,
+            'company_created_at': company.created_at.isoformat() if company else None,
         },
     }, status=200)
     response.set_cookie(
@@ -319,11 +340,36 @@ async def send_invite(request, data: InviteIn):
     return payload(message, 200, True, {'email': invite.email, 'email_sent': invite.email_sent})
 
 
-@api.post('/emp/accept_invite/', response={201: ApiResponse, 400: ApiResponse})
+@api.post('/emp/accept_invite/', response={201: ApiResponse, 400: ApiResponse, 422: ApiResponse})
 @rate_limit('accept_invite', limit=10, window_seconds=600)
-async def accept_invite(request, data: AcceptInviteIn):
+async def accept_invite(
+    request,
+    token: str = Form(...),
+    password: str = Form(...),
+    full_name: str = Form(...),
+    profession: str = Form(''),
+    phone_number: str = Form(''),
+    address: str = Form(''),
+    profile_picture: UploadedFile = File(...),
+):
+    if not 1 <= len(token) <= 64:
+        return payload('Invalid or expired invitation token.', 400, False)
+    if not 2 <= len(full_name.strip()) <= 301:
+        return payload('Enter your full name.', 400, False)
+    if len(profession) > 100 or len(phone_number) > 20 or len(address) > 200:
+        return payload('One or more profile fields are too long.', 400, False)
+    if len(password) > 128:
+        return payload('Validation error', 400, False, errors={'password': ['Password must be at most 128 characters.']})
+    try:
+        await sync_to_async(validate_password, thread_sensitive=True)(password)
+    except DjangoValidationError as exc:
+        return payload('Validation error', 400, False, errors={'password': exc.messages})
+    if profile_picture.size > 5 * 1024 * 1024:
+        return payload('Profile picture exceeds the maximum allowed size (5MB).', 400, False)
+    if (profile_picture.content_type or '') not in {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}:
+        return payload('Profile picture must be a PNG, JPEG, GIF, or WEBP image.', 400, False)
     user, error = await sync_to_async(accept_invite_in_transaction, thread_sensitive=True)(
-        data.token, data.password, data.username,
+        token, password, full_name, profession, phone_number, address, profile_picture,
     )
     if error:
         message = (

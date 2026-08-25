@@ -11,6 +11,7 @@ import json
 from unittest.mock import Mock, patch
 
 from company.models import Sector
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from notifications_and_activity.models import Notification
 from projects_and_tasks.models import Task
@@ -65,8 +66,13 @@ class V1AcceptanceJourneyTests(TestCase):
         self.assertEqual(invite.status_code, 200)
         self.assertTrue(invite.json()['data']['email_sent'])
         raw_token = mock_send.call_args.args[-1].split('token=')[-1]
-        accept = self._post('/api/emp/accept_invite/', {
-            'token': raw_token, 'password': 'Kx9#mQ2vLp8Z', 'username': f'member-{tag}',
+        accept = self.client.post('/api/emp/accept_invite/', {
+            'token': raw_token,
+            'password': 'Kx9#mQ2vLp8Z',
+            'full_name': f'Member {tag}',
+            'profile_picture': SimpleUploadedFile(
+                'avatar.png', b'\x89PNG\r\n\x1a\n', content_type='image/png',
+            ),
         })
         self.assertEqual(accept.status_code, 201)
         member_id = accept.json()['data']['user']['id']
