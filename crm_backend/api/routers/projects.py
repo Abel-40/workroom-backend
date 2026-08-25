@@ -7,6 +7,7 @@ from uuid import UUID
 
 from ai_agent.models import AIGeneration
 from asgiref.sync import sync_to_async
+from django.db.models import Count
 from django.http import FileResponse
 from django.utils import timezone
 from ninja import File, Router, Schema
@@ -291,11 +292,28 @@ async def list_eligible_assignees(request, project_id: UUID):
             return None, None
         return profile.role, (profile.department.name if profile.department_id else None)
 
+    # Open (not-Done, not-deleted) task count on THIS project only, so the
+    # assignee picker reflects workload on the project being planned rather
+    # than a company-wide figure -- one aggregate query, not one per
+    # candidate. Presentation-layer only, same as role/department above.
+    open_counts: dict[str, int] = {}
+    candidate_ids = [c.id for c in candidates]
+    if candidate_ids:
+        counts_qs = (
+            Task.objects.filter(project=project, assigned_to_id__in=candidate_ids, is_deleted=False)
+            .exclude(status=Task.STATUS.DONE)
+            .values('assigned_to')
+            .annotate(count=Count('id'))
+        )
+        async for row in counts_qs:
+            open_counts[str(row['assigned_to'])] = row['count']
+
     results = []
     for user in candidates:
         role, department = member_data(user)
         results.append({
             'id': str(user.id), 'first_name': user.first_name, 'last_name': user.last_name,
             'username': user.username, 'email': user.email, 'role': role, 'department': department,
+            'open_task_count': open_counts.get(str(user.id), 0),
         })
     return payload('Eligible assignees retrieved successfully.', 200, True, {'results': results})
