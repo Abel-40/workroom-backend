@@ -4,6 +4,7 @@ one implementation instead of two; and CompanyUserProfile role management.
 """
 
 import logging
+from zoneinfo import available_timezones
 
 from analytics.services import get_member_workload
 from company.services import get_company_role_sync, get_managed_company_sync, get_member_company, is_company_member_sync
@@ -422,3 +423,18 @@ async def update_notification_preference(user, email_notifications_enabled: bool
         profile.email_notifications_enabled = email_notifications_enabled
         await profile.asave(update_fields=['email_notifications_enabled'])
     return profile, None
+
+
+async def update_user_timezone(user, tz_name: str):
+    """Self-service: a user updates their own display timezone. Unlike
+    update_notification_preference above, this never depends on company
+    membership -- timezone lives on User (see users.models.User.timezone),
+    not CompanyUserProfile, specifically so it works for every authenticated
+    user including a company Owner. Returns (user, error) where error is
+    'invalid_timezone' or None."""
+    if tz_name not in available_timezones():
+        return None, 'invalid_timezone'
+    if user.timezone != tz_name:
+        user.timezone = tz_name
+        await user.asave(update_fields=['timezone'])
+    return user, None

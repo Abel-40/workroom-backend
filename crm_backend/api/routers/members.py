@@ -47,6 +47,10 @@ class NotificationPreferenceIn(Schema):
     email_notifications_enabled: bool
 
 
+class TimezonePreferenceIn(Schema):
+    timezone: str
+
+
 def _member_data(profile) -> dict:
     return {
         'user_id': profile.user_id,
@@ -182,3 +186,17 @@ async def update_notification_preference(request, data: NotificationPreferenceIn
         'Notification preference updated successfully.', 200, True,
         {'email_notifications_enabled': profile.email_notifications_enabled},
     )
+
+
+@router.patch(
+    '/me/timezone/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse},
+)
+async def update_timezone(request, data: TimezonePreferenceIn):
+    user, error = await services.update_user_timezone(request.auth, data.timezone)
+    if error == 'invalid_timezone':
+        return payload(
+            'Unrecognized timezone.', 400, False,
+            errors={'timezone': ['Must be a valid IANA timezone name']},
+        )
+    return payload('Timezone updated successfully.', 200, True, {'timezone': user.timezone})

@@ -31,6 +31,17 @@ class User(AbstractUser):
   id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
   email = models.EmailField(unique=True,max_length=200)
   username = models.CharField(max_length=100,unique=False)
+  # IANA timezone name (e.g. "America/New_York"), validated against
+  # zoneinfo.available_timezones() in users.services.update_user_timezone --
+  # never validated against a DB-driven choices list, since Python's stdlib
+  # tzdata is already the authoritative source. Lives on User (not
+  # CompanyUserProfile, unlike phone_number/address/etc.) because it's a
+  # personal preference, not a company-membership one -- and unlike
+  # CompanyUserProfile, every authenticated user unconditionally has a User
+  # row, including a company Owner (see users.services
+  # .update_notification_preference's 'no_profile' case for the gap this
+  # avoids).
+  timezone = models.CharField(max_length=64, default='UTC')
   USERNAME_FIELD = "email"
   REQUIRED_FIELDS = ['username']
   objects= UserManger()
