@@ -7,6 +7,7 @@ import json
 
 from api.tests import TwoCompanyTestCase, auth_header
 
+from pages.markdown import markdown_to_blocks
 from pages.models import Page, PageFolder
 from pages.services import blocks_to_text
 
@@ -24,6 +25,40 @@ class BlocksToTextTests(TwoCompanyTestCase):
     def test_caps_length(self):
         text = blocks_to_text([{'type': 'paragraph', 'text': 'x' * 5000}], max_chars=10)
         self.assertEqual(len(text), 10)
+
+
+class MarkdownToBlocksTests(TwoCompanyTestCase):
+    def test_atx_heading_becomes_a_heading_block(self):
+        blocks = markdown_to_blocks('## Project Overview\nSome body text.')
+        self.assertEqual(blocks[0], {'type': 'heading', 'text': 'Project Overview'})
+        self.assertEqual(blocks[1], {'type': 'paragraph', 'text': 'Some body text.'})
+
+    def test_bold_only_line_becomes_a_heading_block(self):
+        blocks = markdown_to_blocks('**Project Overview**\n\nBody paragraph.')
+        self.assertEqual(blocks[0], {'type': 'heading', 'text': 'Project Overview'})
+        self.assertEqual(blocks[1], {'type': 'paragraph', 'text': 'Body paragraph.'})
+
+    def test_bold_lead_in_list_item_stays_a_list_item_not_a_heading(self):
+        blocks = markdown_to_blocks('- **Title:** Research the best stack\n- **Goal:** Ship it')
+        self.assertEqual(blocks, [{
+            'type': 'list',
+            'items': ['**Title:** Research the best stack', '**Goal:** Ship it'],
+        }])
+
+    def test_numbered_list_items_are_collected_into_one_list_block(self):
+        blocks = markdown_to_blocks('1. First\n2. Second\n3. Third')
+        self.assertEqual(blocks, [{'type': 'list', 'items': ['First', 'Second', 'Third']}])
+
+    def test_consecutive_paragraph_lines_join_into_one_block(self):
+        blocks = markdown_to_blocks('Line one.\nLine two.\n\nA new paragraph.')
+        self.assertEqual(blocks, [
+            {'type': 'paragraph', 'text': 'Line one.\nLine two.'},
+            {'type': 'paragraph', 'text': 'A new paragraph.'},
+        ])
+
+    def test_blank_or_plain_text_falls_back_to_a_single_paragraph(self):
+        self.assertEqual(markdown_to_blocks('Just one line.'), [{'type': 'paragraph', 'text': 'Just one line.'}])
+        self.assertEqual(markdown_to_blocks(''), [{'type': 'paragraph', 'text': ''}])
 
 
 class PageFolderSecurityTests(TwoCompanyTestCase):
@@ -47,6 +82,32 @@ class PageFolderSecurityTests(TwoCompanyTestCase):
             content_type='application/json', **auth_header(self.member_a),
         )
         self.assertEqual(response.status_code, 201)
+
+    def test_delete_folder_removes_it_from_listing(self):
+        folder = PageFolder.objects.create(name='Old Notes', company=self.company_a, created_by=self.owner_a)
+        response = self.client.delete(f'/api/page-folders/{folder.id}/', **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        listing = self.client.get('/api/page-folders/', **auth_header(self.owner_a))
+        self.assertNotIn(str(folder.id), [f['id'] for f in listing.json()['data']['results']])
+
+    def test_other_company_cannot_delete_this_folder(self):
+        folder = PageFolder.objects.create(name='Docs', company=self.company_a, created_by=self.owner_a)
+        response = self.client.delete(f'/api/page-folders/{folder.id}/', **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 403)
+        folder.refresh_from_db()
+        self.assertFalse(folder.is_deleted)
+
+    def test_deleting_a_folder_cascades_to_its_pages(self):
+        folder = PageFolder.objects.create(name='Docs', company=self.company_a, created_by=self.owner_a)
+        page = Page.objects.create(folder=folder, title='Spec', created_by=self.owner_a)
+        response = self.client.delete(f'/api/page-folders/{folder.id}/', **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        page.refresh_from_db()
+        self.assertTrue(page.is_deleted)
+        # Cascaded pages must also drop out of the cross-folder picker used
+        # by the AI Assistant's page-context feature.
+        picker = self.client.get('/api/pages/', **auth_header(self.owner_a))
+        self.assertNotIn(str(page.id), [p['id'] for p in picker.json()['data']['results']])
 
 
 class PageSecurityTests(TwoCompanyTestCase):

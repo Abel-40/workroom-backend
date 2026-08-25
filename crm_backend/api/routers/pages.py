@@ -60,6 +60,18 @@ async def create_folder(request, data: PageFolderCreateIn):
     return payload('Folder created successfully.', 201, True, {'folder': folder_data(folder)})
 
 
+@router.delete('/page-folders/{folder_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+async def delete_folder(request, folder_id: UUID):
+    folder, error = await services.get_folder_for_user(request.auth, folder_id)
+    if error == 'not_found':
+        return payload('Folder not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to delete this folder.', 403, False)
+    if not await services.delete_folder(request.auth, folder):
+        return payload('You do not have permission to delete this folder.', 403, False)
+    return payload('Folder deleted successfully.', 200, True)
+
+
 @router.get('/page-folders/{folder_id}/pages/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
 async def list_pages_in_folder(request, folder_id: UUID, page: int = 1, page_size: int = DEFAULT_PAGE_SIZE):
     folder, error = await services.get_folder_for_user(request.auth, folder_id)

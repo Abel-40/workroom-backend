@@ -98,6 +98,21 @@ async def delete_page(user, page) -> bool:
     return True
 
 
+async def delete_folder(user, folder) -> bool:
+    """Soft-deletes the folder AND cascades to its pages. Cascading (rather
+    than leaving pages with is_deleted=False under a deleted folder) is what
+    keeps every existing Page query correct without also having to filter on
+    folder__is_deleted everywhere -- e.g. list_pages_for_company and
+    get_pages_by_ids_for_company (the cross-folder picker / AI Assistant
+    page-context lookup) only ever check the page's own is_deleted."""
+    if not await is_company_member(user, folder.company):
+        return False
+    folder.is_deleted = True
+    await folder.asave(update_fields=['is_deleted'])
+    await folder.pages.filter(is_deleted=False).aupdate(is_deleted=True)
+    return True
+
+
 async def list_pages_for_company(user, company, *, search: str = ''):
     """Flat, cross-folder page listing for the picker modal -- includes each
     page's folder via select_related so the picker can show/group by folder
