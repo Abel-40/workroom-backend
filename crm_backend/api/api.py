@@ -40,6 +40,8 @@ from .routers.company_config import router as company_config_router
 from .routers.analytics import router as analytics_router
 from .routers.departments import router as departments_router
 from .routers.documents import router as documents_router
+from .routers.event_types import router as event_types_router
+from .routers.events import router as events_router
 from .routers.members import router as members_router
 from .routers.notifications import router as notifications_router
 from .routers.pages import router as pages_router
@@ -79,6 +81,8 @@ api.add_router('/analytics', analytics_router)
 api.add_router('/departments', departments_router)
 api.add_router('/teams', teams_router)
 api.add_router('/task-types', task_types_router)
+api.add_router('/events', events_router)
+api.add_router('/event-types', event_types_router)
 api.add_router('/company/members', members_router)
 api.add_router('/activity', activity_router)
 api.add_router('/company/default-config', company_config_router)

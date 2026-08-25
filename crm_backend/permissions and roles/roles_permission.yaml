@@ -42,10 +42,15 @@ roles:
       - teams:manage
       - task_types:view
       - task_types:manage
+      - event_types:view
+      - event_types:manage
       - projects:create
       - projects:manage_any
       - tasks:create
       - tasks:manage_any
+      - events:view
+      - events:create
+      - events:manage_any
       - documents:upload
       - documents:delete_any
       - ai:request
@@ -69,10 +74,15 @@ roles:
       - teams:manage
       - task_types:view
       - task_types:manage
+      - event_types:view
+      - event_types:manage
       - projects:create
       - projects:manage_any
       - tasks:create
       - tasks:manage_any
+      - events:view
+      - events:create
+      - events:manage_any
       - documents:upload
       - documents:delete_any
       - ai:request
@@ -92,8 +102,12 @@ roles:
       - teams:manage
       - task_types:view
       - task_types:manage
+      - event_types:view
+      - event_types:manage
       - projects:create
       - tasks:create
+      - events:view
+      - events:create
       - documents:upload
       - ai:request
       - analytics:view
@@ -105,8 +119,11 @@ roles:
       - departments:view
       - teams:view
       - task_types:view
+      - event_types:view
       - projects:create
       - tasks:create
+      - events:view
+      - events:create
       - documents:upload
       - ai:request
       - analytics:view

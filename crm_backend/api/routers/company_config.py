@@ -15,6 +15,7 @@ from uuid import UUID
 
 from company.services import get_managed_company
 from departments_and_teams.services import apply_default_departments, get_default_departments_with_status
+from event_management.services import apply_default_event_types, get_default_event_types_with_status
 from ninja import Router, Schema
 from projects_and_tasks.services import apply_default_task_types, get_default_task_types_with_status
 from pydantic import Field
@@ -40,6 +41,7 @@ async def list_default_config(request):
     return payload('Default configuration retrieved successfully.', 200, True, {
         'departments': await get_default_departments_with_status(company),
         'task_types': await get_default_task_types_with_status(company),
+        'event_types': await get_default_event_types_with_status(company),
     })
 
 
@@ -63,5 +65,17 @@ async def enable_default_task_types(request, data: DefaultSelectionIn):
     created = await apply_default_task_types(company, use_all=data.use_all, selected_ids=data.selected_ids)
     return payload('Task types enabled successfully.', 201, True, {
         'created_task_types': [{'name': item.name} for item in created],
+        'total_created': len(created),
+    })
+
+
+@router.post('/event-types/', auth=auth, response={201: ApiResponse, 403: ApiResponse})
+async def enable_default_event_types(request, data: DefaultSelectionIn):
+    company = await get_managed_company(request.auth)
+    if company is None:
+        return payload("You don't have permission to manage this company's configuration.", 403, False)
+    created = await apply_default_event_types(company, use_all=data.use_all, selected_ids=data.selected_ids)
+    return payload('Event types enabled successfully.', 201, True, {
+        'created_event_types': [{'name': item.name} for item in created],
         'total_created': len(created),
     })
