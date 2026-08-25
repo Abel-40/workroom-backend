@@ -10,7 +10,7 @@ import hashlib
 import json
 from unittest.mock import patch
 
-from ai_agent.models import AIGeneratedTask, AIGeneration, AIProjectHealthSummary
+from ai_agent.models import AIAssistantQuery, AIGeneratedTask, AIGeneration, AIProjectHealthSummary
 from company.models import Company, Sector
 from departments_and_teams.models import Department, Team
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -95,6 +95,22 @@ class CompanyRegistrationSecurityTests(TestCase):
         self.assertEqual(response.status_code, 400)
 
 
+class SignInCompanyContextTests(TestCase):
+    def test_signin_includes_the_company_creation_date_for_date_boundaries(self):
+        sector = Sector.objects.create(name='Software')
+        user = User.objects.create_user(email='owner@example.com', username='owner', password='Kx9#mQ2vLp8Z')
+        company = Company.objects.create(name='Acme', owner=user, sector=sector)
+
+        response = self.client.post(
+            '/api/auth/signin/', json.dumps({'email': user.email, 'password': 'Kx9#mQ2vLp8Z'}),
+            content_type='application/json', secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['company_id'], str(company.id))
+        self.assertEqual(response.json()['data']['company_created_at'], company.created_at.isoformat())
+
+
 class SectorSharingTests(TestCase):
     """Regression test for the Company.sector OneToOneField -> ForeignKey fix."""
 
@@ -157,6 +173,16 @@ class InvitationTokenSecurityTests(TestCase):
         raw_token = mock_send.call_args.args[-1].split('token=')[-1]
         return raw_token
 
+    def accept_payload(self, token):
+        return {
+            'token': token,
+            'password': 'Kx9#mQ2vLp8Z',
+            'full_name': 'Invitee Example',
+            'profile_picture': SimpleUploadedFile(
+                'avatar.png', b'\x89PNG\r\n\x1a\n', content_type='image/png',
+            ),
+        }
+
     def test_raw_token_is_never_stored_in_the_database(self):
         raw_token = self.send_invite_and_get_raw_token()
         invite = PendingInvite.objects.get(email='invitee@example.com')
@@ -167,8 +193,7 @@ class InvitationTokenSecurityTests(TestCase):
         self.send_invite_and_get_raw_token()
         response = self.client.post(
             '/api/emp/accept_invite/',
-            {'token': 'not-the-real-token', 'password': 'Kx9#mQ2vLp8Z', 'username': 'invitee'},
-            content_type='application/json',
+            self.accept_payload('not-the-real-token'),
         )
         self.assertEqual(response.status_code, 400)
 
@@ -177,8 +202,7 @@ class InvitationTokenSecurityTests(TestCase):
         self.assertEqual(PendingInvite.objects.filter(email='invitee@example.com').count(), 1)
         response = self.client.post(
             '/api/emp/accept_invite/',
-            {'token': raw_token, 'password': 'Kx9#mQ2vLp8Z', 'username': 'invitee'},
-            content_type='application/json',
+            self.accept_payload(raw_token),
         )
         self.assertEqual(response.status_code, 201)
         self.assertEqual(PendingInvite.objects.filter(email='invitee@example.com').count(), 0)
@@ -574,6 +598,67 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 400)
         mock_delay.assert_not_called()
 
+    @patch('ai_agent.assistant_services.process_assistant_query.delay')
+    def test_delete_assistant_query_removes_it(self, mock_delay):
+        project = self.create_project(owner=self.owner_a)
+        created = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        query_id = created.json()['data']['assistant_query']['id']
+        response = self.client.delete(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.client.get(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.owner_a)).status_code, 404,
+        )
+
+    @patch('ai_agent.assistant_services.process_assistant_query.delay')
+    def test_delete_assistant_query_hidden_from_other_company(self, mock_delay):
+        project = self.create_project(owner=self.owner_a, visibility='private')
+        created = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        query_id = created.json()['data']['assistant_query']['id']
+        response = self.client.delete(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 403)
+
+    @patch('ai_agent.assistant_services.process_assistant_query.delay')
+    def test_delete_assistant_query_forbidden_for_non_requester_member(self, mock_delay):
+        project = self.create_project(owner=self.owner_a, visibility='company')
+        created = self.client.post(
+            f"/api/projects/{project['id']}/ai-assistant/",
+            json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        query_id = created.json()['data']['assistant_query']['id']
+        # member_a can view the query (company-visible project) but didn't
+        # ask it and has no manage rights on the project -- must not delete it.
+        response = self.client.delete(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.member_a))
+        self.assertEqual(response.status_code, 403)
+
+    def test_save_as_page_splits_the_answer_into_structured_blocks(self):
+        project = self.create_project(owner=self.owner_a)
+        query = AIAssistantQuery.objects.create(
+            project_id=project['id'], requested_by=self.owner_a, question='What is the plan?',
+            status=AIAssistantQuery.STATUS.COMPLETED,
+            answer='**Overview**\n\nSome context.\n\n- First point\n- Second point',
+        )
+        response = self.client.post(
+            f'/api/ai/assistant-queries/{query.id}/save-as-page/',
+            json.dumps({'title': 'Saved answer', 'new_folder_name': 'AI Answers'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 201)
+        page = Page.objects.get(id=response.json()['data']['page']['id'])
+        self.assertEqual(page.blocks, [
+            {'type': 'heading', 'text': 'Overview'},
+            {'type': 'paragraph', 'text': 'Some context.'},
+            {'type': 'list', 'items': ['First point', 'Second point']},
+        ])
+
 
 class AIHealthSummarySecurityTests(TwoCompanyTestCase):
     @patch('ai_agent.health_services.process_health_summary.delay')
@@ -746,6 +831,20 @@ class EligibleAssigneesTests(TwoCompanyTestCase):
         owner_row = {row['id']: row for row in response.json()['data']['results']}[str(self.owner_a.id)]
         self.assertEqual(owner_row['role'], CompanyUserProfile.Role.Owner)
         self.assertIsNone(owner_row['department'])
+
+    def test_open_task_count_is_scoped_to_this_project_and_excludes_done(self):
+        project = self.create_project(owner=self.owner_a)
+        other_project = self.create_project(owner=self.owner_a)
+        Task.objects.create(project_id=project['id'], assigned_to=self.member_a, status=Task.STATUS.TODO)
+        Task.objects.create(project_id=project['id'], assigned_to=self.member_a, status=Task.STATUS.IN_PROGRESS)
+        Task.objects.create(project_id=project['id'], assigned_to=self.member_a, status=Task.STATUS.DONE)
+        Task.objects.create(project_id=project['id'], assigned_to=self.member_a, status=Task.STATUS.TODO, is_deleted=True)
+        # Open work on a DIFFERENT project must not leak into this count.
+        Task.objects.create(project_id=other_project['id'], assigned_to=self.member_a, status=Task.STATUS.TODO)
+
+        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        member_row = {row['id']: row for row in response.json()['data']['results']}[str(self.member_a.id)]
+        self.assertEqual(member_row['open_task_count'], 2)
 
 
 class AIPlanReviewSecurityTests(TwoCompanyTestCase):
