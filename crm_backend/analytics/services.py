@@ -114,12 +114,16 @@ async def get_company_workload(company) -> list[dict]:
         'email': owner.email,
         'role': CompanyUserProfile.Role.Owner,
         'department': None,
+        'profile_picture_url': None,
         'is_active': True,
         **workload_fields(str(owner.id)),
     }]
 
     profiles = CompanyUserProfile.objects.filter(company=company).select_related('user', 'department')
     async for profile in profiles:
+        profile_picture_url = (
+            f'/company/members/{profile.user_id}/profile-image/' if profile.profile_picture else None
+        )
         members.append({
             'id': str(profile.user_id),
             'first_name': profile.user.first_name,
@@ -128,6 +132,10 @@ async def get_company_workload(company) -> list[dict]:
             'email': profile.user.email,
             'role': profile.role,
             'department': profile.department.name if profile.department_id else None,
+            # Profile uploads are private. The frontend resolves this
+            # authenticated endpoint to a short-lived object URL rather than
+            # exposing a public media path.
+            'profile_picture_url': profile_picture_url,
             'is_active': profile.is_active,
             **workload_fields(str(profile.user_id)),
         })

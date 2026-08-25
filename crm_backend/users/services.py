@@ -11,6 +11,7 @@ from company.services import get_company_role_sync, get_managed_company_sync, ge
 from departments_and_teams.models import Department, Team
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 from notifications_and_activity.services import log_member_removed
 from permissions.catalog import has_permission
 from projects_and_tasks.models import Project, Task
@@ -22,6 +23,18 @@ from .models import CompanyUserProfile, PendingInvite, User
 logger = logging.getLogger(__name__)
 
 
+def purge_expired_invites() -> int:
+    """Permanently remove expired invitation records.
+
+    An expired link cannot be accepted or resent: deleting its row means the
+    inviter can create a clean new invitation for the same email immediately.
+    This is called by the periodic email sweep and again by the send/accept
+    paths so correctness does not depend on Celery timing.
+    """
+    deleted, _ = PendingInvite.objects.filter(expires_at__lte=timezone.now()).delete()
+    return deleted
+
+
 def retry_pending_invite_emails() -> dict:
     """Retry invitation emails for invites where email_sent is still False.
 
@@ -31,18 +44,13 @@ def retry_pending_invite_emails() -> dict:
     have partially leaked (e.g. into mail server logs) from the failed try.
     """
     frontend_url = getattr(settings, 'FRONTEND_URL', 'http://your-frontend.com').rstrip('/')
+    expired = purge_expired_invites()
     invites = PendingInvite.objects.filter(
         status=PendingInvite.Status.Pending, email_sent=False,
     ).select_related('company')
 
-    sent = expired = failed = 0
+    sent = failed = 0
     for invite in invites:
-        if invite.is_expired():
-            invite.status = PendingInvite.Status.Expired
-            invite.save(update_fields=['status'])
-            expired += 1
-            continue
-
         raw_token = generate_token()
         invite.token_hash = hash_token(raw_token)
         try:
@@ -63,6 +71,23 @@ def retry_pending_invite_emails() -> dict:
     result = {'sent': sent, 'expired': expired, 'failed': failed}
     logger.info('invite_email.retry_sweep_completed', extra=result)
     return result
+
+
+async def get_member_profile_picture(requester, target_user_id):
+    """Return a member profile only when both users belong to the same company.
+
+    ImageField paths are deliberately never made public; the API router streams
+    the file after this membership check.
+    """
+    company = await get_member_company(requester)
+    if company is None:
+        return None, 'forbidden'
+    profile = await CompanyUserProfile.objects.filter(
+        user_id=target_user_id, company=company,
+    ).afirst()
+    if profile is None or not profile.profile_picture:
+        return None, 'not_found'
+    return profile, None
 
 
 def update_member_role(requester, target_user_id, new_role: str):
@@ -309,6 +334,7 @@ async def get_member_detail(requester, target_user_id):
         return {
             'user': target, 'role': CompanyUserProfile.Role.Owner,
             'department_name': None, 'is_active': True,
+            'profile_picture_url': None,
             # The owner has no profile row to store a preference on -- always
             # gets critical-only-style behavior, see _should_email's fallback.
             'email_notifications_enabled': True, 'workload': workload,
@@ -320,10 +346,14 @@ async def get_member_detail(requester, target_user_id):
     if profile is None:
         return None, 'not_found'
     workload = await get_member_workload(company, profile.user)
+    profile_picture_url = (
+        f'/company/members/{profile.user_id}/profile-image/' if profile.profile_picture else None
+    )
     return {
         'user': profile.user, 'role': profile.role,
         'email_notifications_enabled': profile.email_notifications_enabled,
         'department_name': profile.department.name if profile.department_id else None,
+        'profile_picture_url': profile_picture_url,
         'is_active': profile.is_active, 'workload': workload,
     }, None
 

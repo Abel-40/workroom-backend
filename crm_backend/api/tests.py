@@ -8,6 +8,7 @@ focused on cross-tenant rejection over raw endpoint coverage.
 
 import hashlib
 import json
+from datetime import timedelta
 from unittest.mock import patch
 
 from ai_agent.models import AIAssistantQuery, AIGeneratedTask, AIGeneration, AIProjectHealthSummary
@@ -163,6 +164,13 @@ class InvitationRoleTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
+    def test_department_leader_invite_requires_a_department(self):
+        response = self.client.post(
+            '/api/auth/send_invite/', {'email': 'leader@example.com', 'role': 'DL'},
+            content_type='application/json', **auth_header(self.owner),
+        )
+        self.assertEqual(response.status_code, 400)
+
     def test_user_without_company_cannot_send_invite(self):
         response = self.client.post(
             '/api/auth/send_invite/', {'email': 'new@example.com'},
@@ -180,10 +188,11 @@ class InvitationTokenSecurityTests(TestCase):
         self.owner = User.objects.create_user(email='owner@example.com', username='owner', password='Kx9#mQ2vLp8Z')
         self.company = Company.objects.create(name='Acme', owner=self.owner, sector=sector)
 
-    def send_invite_and_get_raw_token(self, email='invitee@example.com'):
+    def send_invite_and_get_raw_token(self, email='invitee@example.com', **invite_fields):
+        payload = {'email': email, **invite_fields}
         with patch('users.tasks.send_invitation_email') as mock_send:
             self.client.post(
-                '/api/auth/send_invite/', {'email': email},
+                '/api/auth/send_invite/', payload,
                 content_type='application/json', **auth_header(self.owner),
             )
         raw_token = mock_send.call_args.args[-1].split('token=')[-1]
@@ -238,6 +247,58 @@ class InvitationTokenSecurityTests(TestCase):
         self.assertFalse(response.json()['data']['email_sent'])
         invite = PendingInvite.objects.get(email='invitee@example.com')
         self.assertFalse(invite.email_sent)
+
+    def test_invite_applies_selected_department_and_role_after_registration(self):
+        department = Department.objects.create(name='Design', company=self.company)
+        raw_token = self.send_invite_and_get_raw_token(
+            email='leader@example.com', department=str(department.id), role='DL',
+        )
+        invite = PendingInvite.objects.get(email='leader@example.com')
+        self.assertEqual(invite.department_id, department.id)
+        self.assertEqual(invite.role, CompanyUserProfile.Role.DEPARTMENT_LEADER)
+
+        response = self.client.post('/api/emp/accept_invite/', self.accept_payload(raw_token))
+        self.assertEqual(response.status_code, 201)
+        profile = CompanyUserProfile.objects.get(user__email='leader@example.com', company=self.company)
+        self.assertEqual(profile.department_id, department.id)
+        self.assertEqual(profile.role, CompanyUserProfile.Role.DEPARTMENT_LEADER)
+
+    def test_expired_invite_is_deleted_before_a_new_invite_is_issued(self):
+        self.send_invite_and_get_raw_token()
+        expired = PendingInvite.objects.get(email='invitee@example.com')
+        expired.expires_at = timezone.now() - timedelta(seconds=1)
+        expired.save(update_fields=['expires_at'])
+
+        replacement_token = self.send_invite_and_get_raw_token()
+        replacement = PendingInvite.objects.get(email='invitee@example.com')
+        self.assertNotEqual(replacement.id, expired.id)
+        self.assertEqual(replacement.token_hash, hashlib.sha256(replacement_token.encode()).hexdigest())
+        self.assertEqual(PendingInvite.objects.filter(email='invitee@example.com').count(), 1)
+
+    def test_accepting_an_expired_invite_deletes_the_stale_record(self):
+        raw_token = self.send_invite_and_get_raw_token()
+        invite = PendingInvite.objects.get(email='invitee@example.com')
+        invite.expires_at = timezone.now() - timedelta(seconds=1)
+        invite.save(update_fields=['expires_at'])
+
+        response = self.client.post('/api/emp/accept_invite/', self.accept_payload(raw_token))
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(PendingInvite.objects.filter(id=invite.id).exists())
+
+    def test_workload_exposes_and_streams_a_registered_members_profile_picture(self):
+        raw_token = self.send_invite_and_get_raw_token()
+        accepted = self.client.post('/api/emp/accept_invite/', self.accept_payload(raw_token))
+        self.assertEqual(accepted.status_code, 201)
+        user_id = accepted.json()['data']['user']['id']
+
+        workload = self.client.get('/api/analytics/company/members/', **auth_header(self.owner))
+        self.assertEqual(workload.status_code, 200)
+        member = next(row for row in workload.json()['data']['members'] if row['id'] == user_id)
+        self.assertEqual(member['profile_picture_url'], f'/company/members/{user_id}/profile-image/')
+
+        image = self.client.get(f"/api{member['profile_picture_url']}", **auth_header(self.owner))
+        self.assertEqual(image.status_code, 200)
+        self.assertTrue(image.streaming)
 
 
 class DefaultDepartmentAndTaskTypeSelectionTests(TwoCompanyTestCase):

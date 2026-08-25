@@ -8,10 +8,12 @@ company and role from server-side state (never a client-supplied company
 id) before touching anything, exactly like every other mutation in this API.
 """
 
+import mimetypes
 from typing import Literal
 from uuid import UUID
 
 from asgiref.sync import sync_to_async
+from django.http import FileResponse
 from ninja import Router, Schema
 from users import services
 from utils.api_response import api_response as payload
@@ -69,6 +71,7 @@ def _member_detail_data(detail: dict) -> dict:
         'last_name': detail['user'].last_name,
         'role': detail['role'],
         'department_name': detail['department_name'],
+        'profile_picture_url': detail['profile_picture_url'],
         'is_active': detail['is_active'],
         'email_notifications_enabled': detail['email_notifications_enabled'],
         'workload': detail['workload'],
@@ -103,6 +106,26 @@ async def get_member_detail(request, user_id: UUID):
     if error == 'not_found':
         return payload('Member not found.', 404, False)
     return payload('Member retrieved successfully.', 200, True, {'member': _member_detail_data(detail)})
+
+
+@router.get(
+    '/{user_id}/profile-image/', auth=auth,
+    response={403: ApiResponse, 404: ApiResponse},
+)
+async def download_member_profile_image(request, user_id: UUID):
+    """Stream an uploaded member picture after enforcing company membership.
+
+    This mirrors the protected project-image route. It gives workload cards a
+    usable image URL without publishing profile uploads through /media/.
+    """
+    profile, error = await services.get_member_profile_picture(request.auth, user_id)
+    if error == 'forbidden':
+        return payload('You do not belong to a company.', 403, False)
+    if error == 'not_found':
+        return payload('Profile image not found.', 404, False)
+    content_type = mimetypes.guess_type(profile.profile_picture.name)[0] or 'application/octet-stream'
+    file_handle = await sync_to_async(profile.profile_picture.open, thread_sensitive=True)('rb')
+    return FileResponse(file_handle, content_type=content_type)
 
 
 @router.patch(

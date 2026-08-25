@@ -16,6 +16,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connection, transaction
 from django.db.models import Q
 from django.http import JsonResponse
+from django.utils import timezone
 from ninja import File, Form, NinjaAPI
 from ninja.errors import HttpError
 from ninja.files import UploadedFile
@@ -36,8 +37,8 @@ from utils.tokens import generate_token, hash_token
 from .auth import JWTBearerAuth
 from .routers.activity import router as activity_router
 from .routers.ai import router as ai_router
-from .routers.company_config import router as company_config_router
 from .routers.analytics import router as analytics_router
+from .routers.company_config import router as company_config_router
 from .routers.departments import router as departments_router
 from .routers.documents import router as documents_router
 from .routers.event_types import router as event_types_router
@@ -141,8 +142,7 @@ def accept_invite_in_transaction(
         if invite is None:
             return None, 'invalid'
         if invite.is_expired():
-            invite.status = PendingInvite.Status.Expired
-            invite.save(update_fields=['status'])
+            invite.delete()
             return None, 'expired'
         if User.objects.filter(email__iexact=invite.email).exists():
             return None, 'existing_user'
@@ -325,10 +325,20 @@ async def send_invite(request, data: InviteIn):
         requester_role = await get_company_role(request.auth, company)
         if not has_permission(requester_role, 'members:invite_cm'):
             return payload('Only the company owner can invite a Company Manager.', 403, False)
+    if data.role == 'DL' and not data.department:
+        return payload('A Department Leader must be assigned to a department.', 400, False)
     if data.department and not await Department.objects.filter(id=data.department, company=company).aexists():
         return payload('Invalid department for this company.', 400, False)
     if await CompanyUserProfile.objects.filter(user__email__iexact=data.email, company=company).aexists():
         return payload('The user is already registered for this company.', 400, False)
+    # A token is valid for exactly 48 hours. Remove stale records here as
+    # well as in the periodic sweep so the inviter can re-invite immediately
+    # even if no worker has run since expiry.
+    await PendingInvite.objects.filter(
+        email__iexact=data.email,
+        company=company,
+        expires_at__lte=timezone.now(),
+    ).adelete()
     existing = await PendingInvite.objects.filter(
         email__iexact=data.email, company=company, status=PendingInvite.Status.Pending,
     ).order_by('-created_at').afirst()

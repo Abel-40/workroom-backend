@@ -27,6 +27,9 @@ def send_invite_email_task(invite_id: str, raw_token: str, inviter_name: str):
     ).select_related('company').first()
     if invite is None:
         return
+    if invite.is_expired():
+        invite.delete()
+        return
     frontend_url = getattr(settings, 'FRONTEND_URL', 'http://your-frontend.com').rstrip('/')
     try:
         send_invitation_email(
