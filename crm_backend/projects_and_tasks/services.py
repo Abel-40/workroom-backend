@@ -244,7 +244,7 @@ async def transfer_project_ownership(user, project, new_owner_id):
     previous_owner = project.current_owner
     project.current_owner = new_owner
     await project.asave(update_fields=['current_owner'])
-    await sync_to_async(log_ownership_transferred, thread_sensitive=True)(project, previous_owner, new_owner)
+    await sync_to_async(log_ownership_transferred, thread_sensitive=True)(project, user, previous_owner, new_owner)
     return project, None
 
 

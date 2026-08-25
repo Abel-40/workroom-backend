@@ -140,9 +140,15 @@ def log_project_completed(project):
     )
 
 
-def log_ownership_transferred(project, previous_owner, new_owner):
+def log_ownership_transferred(project, actor, previous_owner, new_owner):
+    # actor is whoever performed the transfer (already permission-checked by
+    # transfer_project_ownership) -- distinct from new_owner, who is only the
+    # recipient and may have no manage rights at all. Recording new_owner as
+    # the actor here used to misattribute the action to them, making the
+    # activity feed look like they did something they may not even have
+    # permission to do.
     log_activity(
-        project.company, new_owner, CompanyActivity.ActivityType.PROJECT_OWNERSHIP_TRANSFERRED,
+        project.company, actor, CompanyActivity.ActivityType.PROJECT_OWNERSHIP_TRANSFERRED,
         f"Ownership of '{project.title}' moved from {_actor_name(previous_owner)} to {_actor_name(new_owner)}",
         related_object_type='project', related_object_id=project.id,
     )

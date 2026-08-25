@@ -8,7 +8,7 @@ import json
 from unittest.mock import patch
 
 from api.tests import TwoCompanyTestCase, auth_header
-from users.models import CompanyUserProfile
+from users.models import CompanyUserProfile, User
 
 from notifications_and_activity.models import CompanyActivity, Notification
 from notifications_and_activity.tasks import send_notification_email_task
@@ -112,9 +112,32 @@ class CompanyActivityTests(TwoCompanyTestCase):
             f"/api/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.member_a.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
-        self.assertTrue(CompanyActivity.objects.filter(
+        activity = CompanyActivity.objects.get(
             company=self.company_a, type=CompanyActivity.ActivityType.PROJECT_OWNERSHIP_TRANSFERRED,
-        ).exists())
+        )
+        self.assertEqual(activity.actor_id, self.owner_a.id)
+
+    def test_ownership_transfer_activity_credits_the_requester_not_the_new_owner(self):
+        """Regression test: log_ownership_transferred used to record
+        new_owner as the activity's actor, misattributing the transfer to
+        whoever merely received ownership -- who may have no manage rights
+        on the project at all. The actor must be whoever actually performed
+        the transfer (already permission-checked separately)."""
+        project = self.create_project(owner=self.owner_a)
+        manager = User.objects.create_user(email='manager-a@example.com', username='manager-a', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=manager, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER,
+        )
+        response = self.client.patch(
+            f"/api/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(manager),
+        )
+        self.assertEqual(response.status_code, 200)
+        activity = CompanyActivity.objects.get(
+            company=self.company_a, type=CompanyActivity.ActivityType.PROJECT_OWNERSHIP_TRANSFERRED,
+        )
+        self.assertEqual(activity.actor_id, manager.id)
+        self.assertNotEqual(activity.actor_id, self.member_a.id)
 
 
 class NotificationEmailCategoryTests(TwoCompanyTestCase):

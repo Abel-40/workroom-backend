@@ -8,6 +8,7 @@ import json
 
 from api.tests import TwoCompanyTestCase, auth_header
 from django.core.files.uploadedfile import SimpleUploadedFile
+from notifications_and_activity.models import CompanyActivity
 
 from projects_and_tasks.models import DefaultTaskType, Project, TaskType
 
@@ -163,6 +164,11 @@ class ProjectOwnershipTransferTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 403)
         stored = Project.objects.get(id=project['id'])
         self.assertEqual(stored.current_owner_id, self.owner_a.id)
+        # A rejected attempt must never appear in the activity feed as if it
+        # had happened.
+        self.assertFalse(CompanyActivity.objects.filter(
+            company=self.company_a, type=CompanyActivity.ActivityType.PROJECT_OWNERSHIP_TRANSFERRED,
+        ).exists())
 
     def test_cannot_transfer_to_a_user_outside_the_company(self):
         project = self.create_project(owner=self.owner_a)
