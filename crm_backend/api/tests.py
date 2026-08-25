@@ -62,6 +62,22 @@ class TwoCompanyTestCase(TestCase):
         return response.json()['data']['project']
 
 
+class UnhandledExceptionEnvelopeTests(TwoCompanyTestCase):
+    """The catch-all handler (api.api.handle_unexpected_error) must turn any
+    uncaught exception into the app's normal response envelope -- never a
+    raw traceback -- and never leak the exception message to the client."""
+
+    def test_unexpected_exception_returns_safe_envelope(self):
+        with patch('projects_and_tasks.services.list_projects_for_user', side_effect=RuntimeError('boom, contains secret db info')):
+            response = self.client.get('/api/projects/', **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 500)
+        body = response.json()
+        self.assertFalse(body['success'])
+        self.assertEqual(body['statusCode'], 500)
+        self.assertNotIn('boom', body['message'])
+        self.assertNotIn('RuntimeError', body['message'])
+
+
 class CompanyRegistrationSecurityTests(TestCase):
     def setUp(self):
         self.sector = Sector.objects.create(name='Software')

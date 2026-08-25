@@ -101,6 +101,21 @@ def handle_http_error(request, exc: HttpError):
     )
 
 
+@api.exception_handler(Exception)
+def handle_unexpected_error(request, exc: Exception):
+    """Any exception not already handled by a more specific handler above
+    (Ninja dispatches by the most specific registered class in the MRO, so
+    HttpError still goes to handle_http_error, never here). Never leaks the
+    traceback/exception message to the client (Rule 11) -- only a generic
+    message in the app's normal response envelope, with the real exception
+    logged server-side through the existing request-id-correlated logger."""
+    logger.exception('Unhandled exception on %s %s', request.method, request.path)
+    return api.create_response(
+        request, {'success': False, 'message': 'An unexpected error occurred.', 'statusCode': 500, 'data': {}},
+        status=500,
+    )
+
+
 def user_data(user):
     return {
         'id': user.id, 'email': user.email, 'username': user.username,
