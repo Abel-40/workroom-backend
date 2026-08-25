@@ -78,6 +78,13 @@ class ProcessAIGenerationTests(TestCase):
         self.assertTrue(Notification.objects.filter(
             recipient=self.owner, type=Notification.Type.AI_GENERATION_FAILED,
         ).exists())
+        notification = Notification.objects.get(
+            recipient=self.owner, type=Notification.Type.AI_GENERATION_FAILED,
+        )
+        self.assertEqual(
+            notification.message,
+            'We could not create this AI plan right now. Please try again in a few minutes.',
+        )
 
     def test_invalid_department_reference_fails_generation_without_creating_tasks(self):
         plan = {'data': {'tasks': [{

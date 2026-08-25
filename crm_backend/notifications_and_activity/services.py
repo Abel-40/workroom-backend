@@ -94,10 +94,13 @@ def notify_ai_generation_completed(generation):
 
 
 def notify_ai_generation_failed(generation):
+    # Provider responses can contain infrastructure details, JSON bodies, or
+    # exception text. Those remain in the generation record and worker logs
+    # for diagnosis, but must never be copied to a user-facing notification.
     _create(
         generation.requested_by, Notification.Type.AI_GENERATION_FAILED,
         f"AI plan failed for '{generation.project.title}'",
-        message=(generation.error_message or '')[:500],
+        message='We could not create this AI plan right now. Please try again in a few minutes.',
         related_object_type='ai_generation', related_object_id=generation.id,
     )
 

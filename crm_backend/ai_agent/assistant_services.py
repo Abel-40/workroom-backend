@@ -8,7 +8,7 @@ import logging
 
 from asgiref.sync import sync_to_async
 from pages.services import get_pages_by_ids_for_company
-from projects_and_tasks.services import user_can_view_project
+from projects_and_tasks.services import user_can_manage_project, user_can_view_project
 
 from .models import AIAssistantQuery
 from .tasks_assistant import process_assistant_query
@@ -53,3 +53,13 @@ async def get_assistant_query_for_user(user, query_id):
     if not await user_can_view_project(user, query.project):
         return None, 'forbidden'
     return query, None
+
+
+async def delete_assistant_query(user, query) -> str | None:
+    """Remove a query from the requester's own history. Restricted to the
+    requester or someone who can manage the project -- viewing is broader
+    (any project member) but deleting another member's question isn't."""
+    if not (query.requested_by_id == user.id or await user_can_manage_project(user, query.project)):
+        return 'forbidden'
+    await query.adelete()
+    return None

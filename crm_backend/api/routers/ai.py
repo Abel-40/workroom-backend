@@ -14,6 +14,7 @@ from django.http import HttpResponse
 from django.utils import timezone
 from ninja import Router
 from pages import services as pages_services
+from pages.markdown import markdown_to_blocks
 from projects_and_tasks.services import (
     get_task_for_user,
     get_viewable_project,
@@ -433,13 +434,26 @@ async def save_assistant_query_as_page(request, query_id: UUID, data: AssistantS
 
     page, error = await pages_services.create_page(
         request.auth, folder, title=data.title,
-        blocks=[{'type': 'paragraph', 'text': query.answer}], project=query.project,
+        blocks=markdown_to_blocks(query.answer), project=query.project,
     )
     if error:
         return payload('You do not have permission to save this response as a page.', 403, False)
     return payload('Saved as a page.', 201, True, {
         'page': {'id': str(page.id), 'folder_id': str(page.folder_id), 'title': page.title},
     })
+
+
+@router.delete('/ai/assistant-queries/{query_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+async def delete_assistant_query_view(request, query_id: UUID):
+    query, error = await assistant_services.get_assistant_query_for_user(request.auth, query_id)
+    if error == 'not_found':
+        return payload('Assistant query not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to delete this assistant query.', 403, False)
+    error = await assistant_services.delete_assistant_query(request.auth, query)
+    if error == 'forbidden':
+        return payload('You do not have permission to delete this assistant query.', 403, False)
+    return payload('Assistant query deleted.', 200, True)
 
 
 def health_summary_data(summary: AIProjectHealthSummary) -> dict:
