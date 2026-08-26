@@ -21,7 +21,7 @@ class TaskTypeListTests(TwoCompanyTestCase):
         TaskType.objects.create(name='Other Company Type', company=self.company_b)
 
     def list_task_types(self, user):
-        return self.client.get('/api/task-types/', **auth_header(user))
+        return self.client.get('/api/v1/task-types/', **auth_header(user))
 
     def test_owner_lists_their_company_task_types(self):
         response = self.list_task_types(self.owner_a)
@@ -40,7 +40,7 @@ class TaskTypeListTests(TwoCompanyTestCase):
         self.assertEqual(names, {'Other Company Type'})
 
     def test_requires_authentication(self):
-        response = self.client.get('/api/task-types/')
+        response = self.client.get('/api/v1/task-types/')
         self.assertEqual(response.status_code, 401)
 
 
@@ -53,7 +53,7 @@ class ProjectCollaboratorTests(TwoCompanyTestCase):
 
     def test_create_project_rejects_collaborator_from_another_company(self):
         response = self.client.post(
-            '/api/projects/',
+            '/api/v1/projects/',
             json.dumps({'title': 'Cross-tenant', 'collaborator_ids': [str(self.owner_b.id)]}),
             content_type='application/json',
             **auth_header(self.owner_a),
@@ -65,7 +65,7 @@ class ProjectCollaboratorTests(TwoCompanyTestCase):
     def test_update_project_replaces_collaborators(self):
         project = self.create_project(collaborator_ids=[str(self.member_a.id)])
         response = self.client.patch(
-            f"/api/projects/{project['id']}/",
+            f"/api/v1/projects/{project['id']}/",
             json.dumps({'collaborator_ids': []}),
             content_type='application/json',
             **auth_header(self.owner_a),
@@ -76,7 +76,7 @@ class ProjectCollaboratorTests(TwoCompanyTestCase):
     def test_update_project_rejects_collaborator_from_another_company(self):
         project = self.create_project()
         response = self.client.patch(
-            f"/api/projects/{project['id']}/",
+            f"/api/v1/projects/{project['id']}/",
             json.dumps({'collaborator_ids': [str(self.owner_b.id)]}),
             content_type='application/json',
             **auth_header(self.owner_a),
@@ -95,14 +95,14 @@ class DefaultTaskTypeConfigTests(TwoCompanyTestCase):
         self.default = DefaultTaskType.objects.create(name='Bug', sector=None)
 
     def list_config(self, user=None):
-        return self.client.get('/api/company/default-config/', **auth_header(user or self.owner_a))
+        return self.client.get('/api/v1/company/default-config/', **auth_header(user or self.owner_a))
 
     def enable(self, selected_ids=None, use_all=False, user=None):
         body = {'use_all': use_all}
         if selected_ids is not None:
             body['selected_ids'] = [str(i) for i in selected_ids]
         return self.client.post(
-            '/api/company/default-config/task-types/', json.dumps(body),
+            '/api/v1/company/default-config/task-types/', json.dumps(body),
             content_type='application/json', **auth_header(user or self.owner_a),
         )
 
@@ -133,7 +133,7 @@ class ProjectOwnershipTransferTests(TwoCompanyTestCase):
 
     def transfer(self, project_id, new_owner_id, user=None):
         return self.client.patch(
-            f'/api/projects/{project_id}/owner/',
+            f'/api/v1/projects/{project_id}/owner/',
             json.dumps({'new_owner_id': str(new_owner_id)}),
             content_type='application/json', **auth_header(user or self.owner_a),
         )
@@ -199,13 +199,13 @@ class ProjectImageTests(TwoCompanyTestCase):
 
     def set_link(self, project_id, image_url, user=None):
         return self.client.put(
-            f'/api/projects/{project_id}/image/', json.dumps({'image_url': image_url}),
+            f'/api/v1/projects/{project_id}/image/', json.dumps({'image_url': image_url}),
             content_type='application/json', **auth_header(user or self.owner_a),
         )
 
     def upload(self, project_id, upload=None, user=None):
         return self.client.post(
-            f'/api/projects/{project_id}/image/', {'image': upload or self.tiny_png()},
+            f'/api/v1/projects/{project_id}/image/', {'image': upload or self.tiny_png()},
             **auth_header(user or self.owner_a),
         )
 
@@ -230,7 +230,7 @@ class ProjectImageTests(TwoCompanyTestCase):
     def test_uploaded_image_can_be_downloaded(self):
         project = self.create_project()
         self.upload(project['id'])
-        response = self.client.get(f"/api/projects/{project['id']}/image/", **auth_header(self.owner_a))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/image/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response['Content-Type'], 'image/png')
 
@@ -238,7 +238,7 @@ class ProjectImageTests(TwoCompanyTestCase):
         project = self.create_project()
         self.upload(project['id'])
         self.set_link(project['id'], 'https://example.com/cover.png')
-        response = self.client.get(f"/api/projects/{project['id']}/image/", **auth_header(self.owner_a))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/image/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 404)
 
     def test_uploading_a_file_clears_a_previously_set_link(self):
@@ -252,9 +252,9 @@ class ProjectImageTests(TwoCompanyTestCase):
     def test_owner_can_remove_the_image(self):
         project = self.create_project()
         self.upload(project['id'])
-        response = self.client.delete(f"/api/projects/{project['id']}/image/", **auth_header(self.owner_a))
+        response = self.client.delete(f"/api/v1/projects/{project['id']}/image/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
-        detail = self.client.get(f"/api/projects/{project['id']}/", **auth_header(self.owner_a))
+        detail = self.client.get(f"/api/v1/projects/{project['id']}/", **auth_header(self.owner_a))
         self.assertIsNone(detail.json()['data']['project']['image'])
 
     def test_rejects_disallowed_content_type(self):
@@ -284,5 +284,5 @@ class ProjectImageTests(TwoCompanyTestCase):
 
     def test_requires_authentication(self):
         project = self.create_project()
-        response = self.client.get(f"/api/projects/{project['id']}/image/")
+        response = self.client.get(f"/api/v1/projects/{project['id']}/image/")
         self.assertEqual(response.status_code, 401)

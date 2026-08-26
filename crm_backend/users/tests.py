@@ -32,7 +32,7 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
 
     def change_role(self, requester, target, role):
         return self.client.patch(
-            f'/api/company/members/{target.id}/role/', json.dumps({'role': role}),
+            f'/api/v1/company/members/{target.id}/role/', json.dumps({'role': role}),
             content_type='application/json', **auth_header(requester),
         )
 
@@ -45,7 +45,7 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
             department=other_department,
         )
         response = self.client.patch(
-            f'/api/projects/{project.id}/', json.dumps({'title': 'Renamed'}),
+            f'/api/v1/projects/{project.id}/', json.dumps({'title': 'Renamed'}),
             content_type='application/json', **auth_header(self.cm_a),
         )
         self.assertEqual(response.status_code, 200)
@@ -57,14 +57,14 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
             department=other_department,
         )
         response = self.client.patch(
-            f'/api/projects/{project.id}/', json.dumps({'title': 'Renamed'}),
+            f'/api/v1/projects/{project.id}/', json.dumps({'title': 'Renamed'}),
             content_type='application/json', **auth_header(self.dl_a),
         )
         self.assertEqual(response.status_code, 403)
 
     def test_company_manager_can_create_a_department(self):
         response = self.client.post(
-            '/api/departments/', json.dumps({'name': 'Marketing'}),
+            '/api/v1/departments/', json.dumps({'name': 'Marketing'}),
             content_type='application/json', **auth_header(self.cm_a),
         )
         self.assertEqual(response.status_code, 201)
@@ -72,7 +72,7 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
     def test_company_manager_can_send_an_invite(self):
         with patch('users.tasks.send_invitation_email'):
             response = self.client.post(
-                '/api/auth/send_invite/', json.dumps({'email': 'new-member@example.com'}),
+                '/api/v1/auth/send_invite/', json.dumps({'email': 'new-member@example.com'}),
                 content_type='application/json', **auth_header(self.cm_a),
             )
         self.assertEqual(response.status_code, 200)
@@ -82,7 +82,7 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
     def test_company_manager_cannot_start_a_checkout_for_the_company(self):
         plan = Plan.objects.create(name='Pro')
         response = self.client.post(
-            '/api/subscriptions/start-checkout/', json.dumps({'plan_id': str(plan.id)}),
+            '/api/v1/subscriptions/start-checkout/', json.dumps({'plan_id': str(plan.id)}),
             content_type='application/json', **auth_header(self.cm_a),
         )
         self.assertEqual(response.status_code, 400)
@@ -90,7 +90,7 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
     def test_owner_can_invite_a_company_manager(self):
         with patch('users.tasks.send_invitation_email'):
             response = self.client.post(
-                '/api/auth/send_invite/', json.dumps({'email': 'new-cm@example.com', 'role': 'CM'}),
+                '/api/v1/auth/send_invite/', json.dumps({'email': 'new-cm@example.com', 'role': 'CM'}),
                 content_type='application/json', **auth_header(self.owner_a),
             )
         self.assertEqual(response.status_code, 200)
@@ -98,7 +98,7 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
     def test_company_manager_cannot_invite_another_company_manager(self):
         with patch('users.tasks.send_invitation_email'):
             response = self.client.post(
-                '/api/auth/send_invite/', json.dumps({'email': 'new-cm@example.com', 'role': 'CM'}),
+                '/api/v1/auth/send_invite/', json.dumps({'email': 'new-cm@example.com', 'role': 'CM'}),
                 content_type='application/json', **auth_header(self.cm_a),
             )
         self.assertEqual(response.status_code, 403)
@@ -106,7 +106,7 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
     def test_department_leader_cannot_invite_a_company_manager(self):
         with patch('users.tasks.send_invitation_email'):
             response = self.client.post(
-                '/api/auth/send_invite/', json.dumps({'email': 'new-cm@example.com', 'role': 'CM'}),
+                '/api/v1/auth/send_invite/', json.dumps({'email': 'new-cm@example.com', 'role': 'CM'}),
                 content_type='application/json', **auth_header(self.dl_a),
             )
         self.assertEqual(response.status_code, 403)
@@ -173,7 +173,7 @@ class CompanyManagerRoleTests(TwoCompanyTestCase):
 
     def test_requires_authentication(self):
         response = self.client.patch(
-            f'/api/company/members/{self.member_a.id}/role/', json.dumps({'role': 'DL'}),
+            f'/api/v1/company/members/{self.member_a.id}/role/', json.dumps({'role': 'DL'}),
             content_type='application/json',
         )
         self.assertEqual(response.status_code, 401)
@@ -195,14 +195,14 @@ class MemberLifecycleTests(TwoCompanyTestCase):
 
     def set_status(self, target, is_active, requester=None):
         return self.client.patch(
-            f'/api/company/members/{target.id}/status/', json.dumps({'is_active': is_active}),
+            f'/api/v1/company/members/{target.id}/status/', json.dumps({'is_active': is_active}),
             content_type='application/json', **auth_header(requester or self.owner_a),
         )
 
     def remove(self, target, reassign_to=None, requester=None):
         body = {'reassign_to_user_id': str(reassign_to.id)} if reassign_to else {}
         return self.client.post(
-            f'/api/company/members/{target.id}/remove/', json.dumps(body),
+            f'/api/v1/company/members/{target.id}/remove/', json.dumps(body),
             content_type='application/json', **auth_header(requester or self.owner_a),
         )
 
@@ -215,7 +215,7 @@ class MemberLifecycleTests(TwoCompanyTestCase):
 
     def test_deactivated_members_company_scoped_calls_are_rejected_but_login_still_works(self):
         self.set_status(self.member_a, False)
-        response = self.client.get('/api/projects/', **auth_header(self.member_a))
+        response = self.client.get('/api/v1/projects/', **auth_header(self.member_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['meta']['count'], 0)
         # Global Django auth is untouched -- the account itself still logs in.
@@ -250,7 +250,7 @@ class MemberLifecycleTests(TwoCompanyTestCase):
     def test_owner_can_change_a_members_department(self):
         other_department = Department.objects.create(name='Sales', company=self.company_a)
         response = self.client.patch(
-            f'/api/company/members/{self.member_a.id}/department/',
+            f'/api/v1/company/members/{self.member_a.id}/department/',
             json.dumps({'department_id': str(other_department.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -263,7 +263,7 @@ class MemberLifecycleTests(TwoCompanyTestCase):
     def test_department_from_another_company_is_rejected(self):
         other_company_department = Department.objects.create(name='Sales', company=self.company_b)
         response = self.client.patch(
-            f'/api/company/members/{self.member_a.id}/department/',
+            f'/api/v1/company/members/{self.member_a.id}/department/',
             json.dumps({'department_id': str(other_company_department.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -344,13 +344,13 @@ class MemberLifecycleTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_requires_authentication(self):
-        response = self.client.post(f'/api/company/members/{self.member_a.id}/remove/', content_type='application/json')
+        response = self.client.post(f'/api/v1/company/members/{self.member_a.id}/remove/', content_type='application/json')
         self.assertEqual(response.status_code, 401)
 
 
 class MemberDetailTests(TwoCompanyTestCase):
     def get_detail(self, target, requester=None):
-        return self.client.get(f'/api/company/members/{target.id}/', **auth_header(requester or self.owner_a))
+        return self.client.get(f'/api/v1/company/members/{target.id}/', **auth_header(requester or self.owner_a))
 
     def test_owner_can_view_a_members_detail(self):
         response = self.get_detail(self.member_a)
@@ -377,5 +377,5 @@ class MemberDetailTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_requires_authentication(self):
-        response = self.client.get(f'/api/company/members/{self.member_a.id}/')
+        response = self.client.get(f'/api/v1/company/members/{self.member_a.id}/')
         self.assertEqual(response.status_code, 401)

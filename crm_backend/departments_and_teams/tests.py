@@ -17,7 +17,7 @@ class DepartmentListTests(TwoCompanyTestCase):
         Department.objects.create(name='Design', company=self.company_a, leader=self.owner_a)
 
     def list_departments(self, user):
-        return self.client.get('/api/departments/', **auth_header(user))
+        return self.client.get('/api/v1/departments/', **auth_header(user))
 
     def test_owner_lists_their_company_departments(self):
         response = self.list_departments(self.owner_a)
@@ -35,7 +35,7 @@ class DepartmentListTests(TwoCompanyTestCase):
         self.assertEqual(response.json()['data']['results'], [])
 
     def test_requires_authentication(self):
-        response = self.client.get('/api/departments/')
+        response = self.client.get('/api/v1/departments/')
         self.assertEqual(response.status_code, 401)
 
     def test_list_reports_member_count(self):
@@ -63,7 +63,7 @@ class DepartmentCreateTests(TwoCompanyTestCase):
         body = {'name': 'Marketing'}
         body.update(overrides)
         return self.client.post(
-            '/api/departments/', json.dumps(body), content_type='application/json', **auth_header(user),
+            '/api/v1/departments/', json.dumps(body), content_type='application/json', **auth_header(user),
         )
 
     def test_owner_can_create_department(self):
@@ -107,7 +107,7 @@ class DepartmentCreateTests(TwoCompanyTestCase):
 
     def test_requires_authentication(self):
         response = self.client.post(
-            '/api/departments/', json.dumps({'name': 'Marketing'}), content_type='application/json',
+            '/api/v1/departments/', json.dumps({'name': 'Marketing'}), content_type='application/json',
         )
         self.assertEqual(response.status_code, 401)
 
@@ -126,7 +126,7 @@ class DepartmentUpdateTests(TwoCompanyTestCase):
 
     def patch_department(self, department_id, body, user=None):
         return self.client.patch(
-            f'/api/departments/{department_id}/', json.dumps(body), content_type='application/json',
+            f'/api/v1/departments/{department_id}/', json.dumps(body), content_type='application/json',
             **auth_header(user or self.owner_a),
         )
 
@@ -158,12 +158,12 @@ class DepartmentUpdateTests(TwoCompanyTestCase):
 
     def assign_leader(self, department_id, user_id, actor=None):
         return self.client.post(
-            f'/api/departments/{department_id}/leader/', json.dumps({'user_id': str(user_id)}),
+            f'/api/v1/departments/{department_id}/leader/', json.dumps({'user_id': str(user_id)}),
             content_type='application/json', **auth_header(actor or self.owner_a),
         )
 
     def revoke_leader(self, department_id, actor=None):
-        return self.client.delete(f'/api/departments/{department_id}/leader/', **auth_header(actor or self.owner_a))
+        return self.client.delete(f'/api/v1/departments/{department_id}/leader/', **auth_header(actor or self.owner_a))
 
     def test_assigning_a_plain_member_as_leader_promotes_them_to_dl_and_moves_their_department(self):
         response = self.assign_leader(self.other_department.id, self.dm_a.id)
@@ -211,7 +211,7 @@ class DepartmentUpdateTests(TwoCompanyTestCase):
 
     def test_requires_authentication(self):
         response = self.client.patch(
-            f'/api/departments/{self.department_a.id}/', json.dumps({'description': 'x'}),
+            f'/api/v1/departments/{self.department_a.id}/', json.dumps({'description': 'x'}),
             content_type='application/json',
         )
         self.assertEqual(response.status_code, 401)
@@ -247,11 +247,11 @@ class TeamTests(TwoCompanyTestCase):
         body = {'name': 'Launch Task Force', 'member_ids': [str(self.member_a.id), str(self.designer_a.id)]}
         body.update(overrides)
         return self.client.post(
-            '/api/teams/', json.dumps(body), content_type='application/json', **auth_header(user),
+            '/api/v1/teams/', json.dumps(body), content_type='application/json', **auth_header(user),
         )
 
     def list_teams(self, user):
-        return self.client.get('/api/teams/', **auth_header(user))
+        return self.client.get('/api/v1/teams/', **auth_header(user))
 
     def test_owner_can_create_team_mixing_members_from_different_departments(self):
         response = self.create_team(self.owner_a)
@@ -296,7 +296,7 @@ class TeamTests(TwoCompanyTestCase):
         self.assertEqual(names, {'Launch Task Force'})
 
     def test_requires_authentication(self):
-        response = self.client.get('/api/teams/')
+        response = self.client.get('/api/v1/teams/')
         self.assertEqual(response.status_code, 401)
 
 
@@ -307,13 +307,13 @@ class TeamUpdateTests(TwoCompanyTestCase):
 
     def patch_team(self, body, user=None):
         return self.client.patch(
-            f'/api/teams/{self.team.id}/', json.dumps(body), content_type='application/json',
+            f'/api/v1/teams/{self.team.id}/', json.dumps(body), content_type='application/json',
             **auth_header(user or self.owner_a),
         )
 
     def assign_leader(self, user_id, actor=None):
         return self.client.post(
-            f'/api/teams/{self.team.id}/leader/', json.dumps({'user_id': str(user_id)}),
+            f'/api/v1/teams/{self.team.id}/leader/', json.dumps({'user_id': str(user_id)}),
             content_type='application/json', **auth_header(actor or self.owner_a),
         )
 
@@ -341,7 +341,7 @@ class TeamUpdateTests(TwoCompanyTestCase):
 
     def test_revoking_team_leader(self):
         self.assign_leader(self.member_a.id)
-        response = self.client.delete(f'/api/teams/{self.team.id}/leader/', **auth_header(self.owner_a))
+        response = self.client.delete(f'/api/v1/teams/{self.team.id}/leader/', **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.json()['data']['team']['leader_id'])
 
@@ -361,14 +361,14 @@ class DefaultConfigTests(TwoCompanyTestCase):
         self.default = DefaultDepartment.objects.create(name='Marketing', sector=None)
 
     def list_config(self, user=None):
-        return self.client.get('/api/company/default-config/', **auth_header(user or self.owner_a))
+        return self.client.get('/api/v1/company/default-config/', **auth_header(user or self.owner_a))
 
     def enable(self, selected_ids=None, use_all=False, user=None):
         body = {'use_all': use_all}
         if selected_ids is not None:
             body['selected_ids'] = [str(i) for i in selected_ids]
         return self.client.post(
-            '/api/company/default-config/departments/', json.dumps(body),
+            '/api/v1/company/default-config/departments/', json.dumps(body),
             content_type='application/json', **auth_header(user or self.owner_a),
         )
 
@@ -412,5 +412,5 @@ class DefaultConfigTests(TwoCompanyTestCase):
         self.assertFalse(by_name['Marketing']['enabled'])
 
     def test_requires_authentication(self):
-        response = self.client.get('/api/company/default-config/')
+        response = self.client.get('/api/v1/company/default-config/')
         self.assertEqual(response.status_code, 401)

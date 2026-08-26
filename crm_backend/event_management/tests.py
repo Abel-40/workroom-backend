@@ -24,7 +24,7 @@ class EventCrudTests(TwoCompanyTestCase):
         body = {'title': 'All Hands', 'start_at': FUTURE_START_AT}
         body.update(overrides)
         return self.client.post(
-            '/api/events/', json.dumps(body), content_type='application/json',
+            '/api/v1/events/', json.dumps(body), content_type='application/json',
             **auth_header(owner or self.owner_a),
         )
 
@@ -39,14 +39,14 @@ class EventCrudTests(TwoCompanyTestCase):
 
     def test_requires_authentication(self):
         response = self.client.post(
-            '/api/events/', json.dumps({'title': 'x', 'start_at': FUTURE_START_AT}),
+            '/api/v1/events/', json.dumps({'title': 'x', 'start_at': FUTURE_START_AT}),
             content_type='application/json',
         )
         self.assertEqual(response.status_code, 401)
 
     def test_create_rejects_missing_start_at(self):
         response = self.client.post(
-            '/api/events/', json.dumps({'title': 'No start'}), content_type='application/json',
+            '/api/v1/events/', json.dumps({'title': 'No start'}), content_type='application/json',
             **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 422)
@@ -85,19 +85,19 @@ class EventCrudTests(TwoCompanyTestCase):
         # simply aren't authorized to see it. Either status fully blocks cross-tenant
         # access; 403 is this codebase's established convention for that case.
         event = self.create_event().json()['data']['event']
-        response = self.client.get(f"/api/events/{event['id']}/", **auth_header(self.owner_b))
+        response = self.client.get(f"/api/v1/events/{event['id']}/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
     def test_get_event_unknown_id_is_404(self):
         response = self.client.get(
-            '/api/events/00000000-0000-0000-0000-000000000000/', **auth_header(self.owner_a),
+            '/api/v1/events/00000000-0000-0000-0000-000000000000/', **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 404)
 
     def test_update_event_cross_tenant_rejected(self):
         event = self.create_event().json()['data']['event']
         response = self.client.patch(
-            f"/api/events/{event['id']}/", json.dumps({'title': 'Hijacked'}),
+            f"/api/v1/events/{event['id']}/", json.dumps({'title': 'Hijacked'}),
             content_type='application/json', **auth_header(self.owner_b),
         )
         self.assertEqual(response.status_code, 403)
@@ -105,19 +105,19 @@ class EventCrudTests(TwoCompanyTestCase):
 
     def test_member_can_create_but_not_delete_another_organizers_event(self):
         event = self.create_event(owner=self.owner_a).json()['data']['event']
-        response = self.client.delete(f"/api/events/{event['id']}/", **auth_header(self.member_a))
+        response = self.client.delete(f"/api/v1/events/{event['id']}/", **auth_header(self.member_a))
         self.assertEqual(response.status_code, 403)
         self.assertFalse(Event.objects.get(id=event['id']).is_deleted)
 
     def test_organizer_can_delete_their_own_event(self):
         event = self.create_event(owner=self.member_a).json()['data']['event']
-        response = self.client.delete(f"/api/events/{event['id']}/", **auth_header(self.member_a))
+        response = self.client.delete(f"/api/v1/events/{event['id']}/", **auth_header(self.member_a))
         self.assertEqual(response.status_code, 200)
         self.assertTrue(Event.objects.get(id=event['id']).is_deleted)
 
     def test_owner_can_delete_any_company_event(self):
         event = self.create_event(owner=self.member_a).json()['data']['event']
-        response = self.client.delete(f"/api/events/{event['id']}/", **auth_header(self.owner_a))
+        response = self.client.delete(f"/api/v1/events/{event['id']}/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
 
     def test_department_leader_can_manage_only_their_own_department(self):
@@ -134,10 +134,10 @@ class EventCrudTests(TwoCompanyTestCase):
         other_dept_event = self.create_event(owner=self.owner_a, department_id=str(other_department.id)).json()['data']['event']
 
         self.assertEqual(
-            self.client.delete(f"/api/events/{own_dept_event['id']}/", **auth_header(dl)).status_code, 200,
+            self.client.delete(f"/api/v1/events/{own_dept_event['id']}/", **auth_header(dl)).status_code, 200,
         )
         self.assertEqual(
-            self.client.delete(f"/api/events/{other_dept_event['id']}/", **auth_header(dl)).status_code, 403,
+            self.client.delete(f"/api/v1/events/{other_dept_event['id']}/", **auth_header(dl)).status_code, 403,
         )
 
 
@@ -158,21 +158,21 @@ class EventFilterAndPaginationTests(TwoCompanyTestCase):
         Event.objects.create(title='Other company event', company=self.company_b, organizer=self.owner_b, start_at='2026-01-01T10:00:00Z')
 
     def test_list_scoped_to_own_company(self):
-        response = self.client.get('/api/events/', **auth_header(self.owner_a))
+        response = self.client.get('/api/v1/events/', **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         titles = {e['title'] for e in response.json()['data']['results']}
         self.assertEqual(titles, {'Meeting 0', 'Meeting 1', 'Meeting 2', 'Party'})
 
     def test_filter_by_event_type(self):
         response = self.client.get(
-            f'/api/events/?event_type_id={self.social_type.id}', **auth_header(self.owner_a),
+            f'/api/v1/events/?event_type_id={self.social_type.id}', **auth_header(self.owner_a),
         )
         titles = {e['title'] for e in response.json()['data']['results']}
         self.assertEqual(titles, {'Party'})
 
     def test_filter_by_department(self):
         response = self.client.get(
-            f'/api/events/?department_id={self.department_a.id}', **auth_header(self.owner_a),
+            f'/api/v1/events/?department_id={self.department_a.id}', **auth_header(self.owner_a),
         )
         titles = {e['title'] for e in response.json()['data']['results']}
         self.assertEqual(titles, {'Meeting 0', 'Meeting 1', 'Meeting 2'})
@@ -181,13 +181,13 @@ class EventFilterAndPaginationTests(TwoCompanyTestCase):
         # Both bounds are inclusive (start_at__date__gte/lte) -- 2026-03-01
         # (Meeting 2's date) is the end_date itself, so it's correctly included.
         response = self.client.get(
-            '/api/events/?start_date=2026-02-01&end_date=2026-03-01', **auth_header(self.owner_a),
+            '/api/v1/events/?start_date=2026-02-01&end_date=2026-03-01', **auth_header(self.owner_a),
         )
         titles = {e['title'] for e in response.json()['data']['results']}
         self.assertEqual(titles, {'Meeting 1', 'Meeting 2'})
 
     def test_pagination(self):
-        response = self.client.get('/api/events/?page=1&page_size=2', **auth_header(self.owner_a))
+        response = self.client.get('/api/v1/events/?page=1&page_size=2', **auth_header(self.owner_a))
         data = response.json()['data']
         self.assertEqual(len(data['results']), 2)
         self.assertEqual(data['meta']['count'], 4)
@@ -200,14 +200,14 @@ class EventTypeConfigTests(TwoCompanyTestCase):
         self.default = DefaultEventType.objects.create(name='Meeting', sector=None)
 
     def list_config(self, user=None):
-        return self.client.get('/api/company/default-config/', **auth_header(user or self.owner_a))
+        return self.client.get('/api/v1/company/default-config/', **auth_header(user or self.owner_a))
 
     def enable(self, selected_ids=None, use_all=False, user=None):
         body = {'use_all': use_all}
         if selected_ids is not None:
             body['selected_ids'] = [str(i) for i in selected_ids]
         return self.client.post(
-            '/api/company/default-config/event-types/', json.dumps(body),
+            '/api/v1/company/default-config/event-types/', json.dumps(body),
             content_type='application/json', **auth_header(user or self.owner_a),
         )
 
@@ -238,7 +238,7 @@ class EventTypeConfigTests(TwoCompanyTestCase):
 
     def test_create_custom_event_type(self):
         response = self.client.post(
-            '/api/event-types/', json.dumps({'name': 'Hackathon', 'description': 'Internal hackathon'}),
+            '/api/v1/event-types/', json.dumps({'name': 'Hackathon', 'description': 'Internal hackathon'}),
             content_type='application/json', **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 201)
@@ -247,14 +247,14 @@ class EventTypeConfigTests(TwoCompanyTestCase):
     def test_create_custom_event_type_rejects_duplicate_name(self):
         EventType.objects.create(name='Hackathon', company=self.company_a)
         response = self.client.post(
-            '/api/event-types/', json.dumps({'name': 'Hackathon'}),
+            '/api/v1/event-types/', json.dumps({'name': 'Hackathon'}),
             content_type='application/json', **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 400)
 
     def test_department_member_cannot_create_custom_event_type(self):
         response = self.client.post(
-            '/api/event-types/', json.dumps({'name': 'Hackathon'}),
+            '/api/v1/event-types/', json.dumps({'name': 'Hackathon'}),
             content_type='application/json', **auth_header(self.member_a),
         )
         self.assertEqual(response.status_code, 403)
@@ -262,6 +262,6 @@ class EventTypeConfigTests(TwoCompanyTestCase):
     def test_list_event_types_scoped_to_own_company(self):
         EventType.objects.create(name='Mine', company=self.company_a)
         EventType.objects.create(name='Theirs', company=self.company_b)
-        response = self.client.get('/api/event-types/', **auth_header(self.owner_a))
+        response = self.client.get('/api/v1/event-types/', **auth_header(self.owner_a))
         names = {t['name'] for t in response.json()['data']['results']}
         self.assertEqual(names, {'Mine'})

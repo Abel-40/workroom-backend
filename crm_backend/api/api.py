@@ -6,7 +6,7 @@ from uuid import UUID
 import stripe
 from asgiref.sync import sync_to_async
 from company.models import Company, Sector
-from company.services import get_company_role, get_managed_company, get_member_company
+from company.services import get_company_role, get_managed_company, get_member_company, get_member_department_id
 from departments_and_teams import services as departments_and_teams_services
 from departments_and_teams.models import DefaultDepartment, Department
 from django.conf import settings
@@ -199,6 +199,7 @@ async def signin(request, data: SignInIn):
     # from a Department Leader/Member without a separate round trip.
     company = await get_member_company(user)
     role = await get_company_role(user, company) if company else None
+    department_id = await get_member_department_id(user, company) if company else None
     refresh = RefreshToken.for_user(user)
     response = JsonResponse({
         'success': True, 'message': 'Login successful', 'statusCode': 200,
@@ -207,6 +208,7 @@ async def signin(request, data: SignInIn):
             'role': role, 'company_id': str(company.id) if company else None,
             'company_name': company.name if company else None,
             'company_created_at': company.created_at.isoformat() if company else None,
+            'department_id': str(department_id) if department_id else None,
         },
     }, status=200)
     response.set_cookie(
@@ -468,15 +470,20 @@ def _check_database() -> bool:
         return cursor.fetchone() == (1,)
 
 
-@api.get('/health/', response={200: ApiResponse, 503: ApiResponse})
-async def check_server_health(request):
+async def health_check(request):
     """Readiness check (Phase 11): reports unhealthy if the database isn't
-    reachable, rather than an unconditional 'running'."""
+    reachable, rather than an unconditional 'running'. Registered as a plain
+    Django view at an unversioned path (crm_backend/urls.py) rather than on
+    the versioned NinjaAPI instance, so infra healthchecks don't need to
+    track API version bumps."""
     try:
         db_ok = await sync_to_async(_check_database, thread_sensitive=True)()
     except Exception:
         logger.exception('health_check.database_unreachable')
         db_ok = False
-    if not db_ok:
-        return payload('Service unavailable.', 503, False, {'database': 'down'})
-    return payload('Service healthy.', 200, True, {'database': 'up'})
+    status_code, body = (
+        payload('Service unavailable.', 503, False, {'database': 'down'})
+        if not db_ok
+        else payload('Service healthy.', 200, True, {'database': 'up'})
+    )
+    return JsonResponse(body, status=status_code)

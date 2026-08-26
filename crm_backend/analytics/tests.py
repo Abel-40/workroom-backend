@@ -27,7 +27,7 @@ class ProjectAnalyticsTests(TwoCompanyTestCase):
         Task.objects.create(project=self.project, title='Deleted task', status=Task.STATUS.TODO, is_deleted=True)
 
     def get_stats(self, owner):
-        return self.client.get(f'/api/analytics/projects/{self.project.id}/', **auth_header(owner))
+        return self.client.get(f'/api/v1/analytics/projects/{self.project.id}/', **auth_header(owner))
 
     def test_project_stats_are_correct(self):
         response = self.get_stats(self.owner_a)
@@ -45,7 +45,7 @@ class ProjectAnalyticsTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_project_stats_require_authentication(self):
-        response = self.client.get(f'/api/analytics/projects/{self.project.id}/')
+        response = self.client.get(f'/api/v1/analytics/projects/{self.project.id}/')
         self.assertEqual(response.status_code, 401)
 
 
@@ -62,7 +62,7 @@ class CompanyAnalyticsTests(TwoCompanyTestCase):
         Task.objects.create(project=self.active_project, title='T2', status=Task.STATUS.TODO)
 
     def test_company_stats_are_correct(self):
-        response = self.client.get('/api/analytics/company/', **auth_header(self.owner_a))
+        response = self.client.get('/api/v1/analytics/company/', **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         data = response.json()['data']
         self.assertEqual(data['project_count'], 2)
@@ -73,7 +73,7 @@ class CompanyAnalyticsTests(TwoCompanyTestCase):
         self.assertEqual(data['completed_tasks'], 1)
 
     def test_company_stats_are_scoped_to_the_caller_own_company(self):
-        response = self.client.get('/api/analytics/company/', **auth_header(self.owner_b))
+        response = self.client.get('/api/v1/analytics/company/', **auth_header(self.owner_b))
         data = response.json()['data']
         self.assertEqual(data['project_count'], 0)  # company B has no projects of its own
 
@@ -88,7 +88,7 @@ class CompanyWorkloadTests(TwoCompanyTestCase):
         Task.objects.create(project=self.project, title='Unassigned', status=Task.STATUS.TODO)
 
     def get_workload(self, user):
-        return self.client.get('/api/analytics/company/members/', **auth_header(user))
+        return self.client.get('/api/v1/analytics/company/members/', **auth_header(user))
 
     def test_workload_lists_owner_and_members_with_active_task_counts(self):
         response = self.get_workload(self.owner_a)
@@ -118,7 +118,7 @@ class CompanyWorkloadTests(TwoCompanyTestCase):
         self.assertEqual(members[0]['active_task_count'], 0)
 
     def test_workload_requires_authentication(self):
-        response = self.client.get('/api/analytics/company/members/')
+        response = self.client.get('/api/v1/analytics/company/members/')
         self.assertEqual(response.status_code, 401)
 
     def test_workload_reports_company_manager_role(self):
@@ -147,7 +147,7 @@ class DepartmentAnalyticsTests(TwoCompanyTestCase):
         Task.objects.create(project=self.project, title='T3', status=Task.STATUS.TODO, department=self.sales_department)
 
     def get_department_stats(self, user):
-        return self.client.get('/api/analytics/company/departments/', **auth_header(user))
+        return self.client.get('/api/v1/analytics/company/departments/', **auth_header(user))
 
     def test_department_stats_bucket_by_the_tasks_own_department(self):
         response = self.get_department_stats(self.owner_a)
@@ -176,5 +176,5 @@ class DepartmentAnalyticsTests(TwoCompanyTestCase):
         self.assertNotIn('Engineering', names)
 
     def test_requires_authentication(self):
-        response = self.client.get('/api/analytics/company/departments/')
+        response = self.client.get('/api/v1/analytics/company/departments/')
         self.assertEqual(response.status_code, 401)

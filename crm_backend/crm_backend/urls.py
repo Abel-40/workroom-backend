@@ -17,7 +17,12 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 
+from api.api import health_check
+
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', include('api.urls')),
+    # Unversioned so infra healthchecks (docker-compose, load balancers) don't
+    # need to track API version bumps.
+    path('api/health/', health_check),
+    path('api/v1/', include('api.urls')),
 ]

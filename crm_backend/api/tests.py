@@ -57,7 +57,7 @@ class TwoCompanyTestCase(TestCase):
         body = {'title': 'Website Revamp', 'visibility': 'company'}
         body.update(overrides)
         response = self.client.post(
-            '/api/projects/', json.dumps(body), content_type='application/json',
+            '/api/v1/projects/', json.dumps(body), content_type='application/json',
             **auth_header(owner or self.owner_a),
         )
         return response.json()['data']['project']
@@ -70,7 +70,7 @@ class UnhandledExceptionEnvelopeTests(TwoCompanyTestCase):
 
     def test_unexpected_exception_returns_safe_envelope(self):
         with patch('projects_and_tasks.services.list_projects_for_user', side_effect=RuntimeError('boom, contains secret db info')):
-            response = self.client.get('/api/projects/', **auth_header(self.owner_a))
+            response = self.client.get('/api/v1/projects/', **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 500)
         body = response.json()
         self.assertFalse(body['success'])
@@ -86,7 +86,7 @@ class CompanyRegistrationSecurityTests(TestCase):
 
     def test_register_company_requires_authentication(self):
         response = self.client.post(
-            '/api/company/register/', {'name': 'Acme', 'sector': self.sector.id}, content_type='application/json',
+            '/api/v1/company/register/', {'name': 'Acme', 'sector': self.sector.id}, content_type='application/json',
         )
         self.assertEqual(response.status_code, 401)
 
@@ -94,7 +94,7 @@ class CompanyRegistrationSecurityTests(TestCase):
         """A client-supplied 'owner' must never override the authenticated user."""
         victim = User.objects.create_user(email='victim@example.com', username='victim', password='Kx9#mQ2vLp8Z')
         response = self.client.post(
-            '/api/company/register/',
+            '/api/v1/company/register/',
             {'name': 'Acme', 'sector': self.sector.id, 'owner': victim.id},
             content_type='application/json',
             **auth_header(self.user),
@@ -106,7 +106,7 @@ class CompanyRegistrationSecurityTests(TestCase):
     def test_user_cannot_register_a_second_company(self):
         Company.objects.create(name='First', owner=self.user, sector=self.sector)
         response = self.client.post(
-            '/api/company/register/', {'name': 'Second', 'sector': self.sector.id},
+            '/api/v1/company/register/', {'name': 'Second', 'sector': self.sector.id},
             content_type='application/json', **auth_header(self.user),
         )
         self.assertEqual(response.status_code, 400)
@@ -119,13 +119,43 @@ class SignInCompanyContextTests(TestCase):
         company = Company.objects.create(name='Acme', owner=user, sector=sector)
 
         response = self.client.post(
-            '/api/auth/signin/', json.dumps({'email': user.email, 'password': 'Kx9#mQ2vLp8Z'}),
+            '/api/v1/auth/signin/', json.dumps({'email': user.email, 'password': 'Kx9#mQ2vLp8Z'}),
             content_type='application/json', secure=True,
         )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['company_id'], str(company.id))
         self.assertEqual(response.json()['data']['company_created_at'], company.created_at.isoformat())
+
+    def test_signin_department_id_is_null_for_the_owner(self):
+        sector = Sector.objects.create(name='Software')
+        user = User.objects.create_user(email='owner@example.com', username='owner', password='Kx9#mQ2vLp8Z')
+        Company.objects.create(name='Acme', owner=user, sector=sector)
+
+        response = self.client.post(
+            '/api/v1/auth/signin/', json.dumps({'email': user.email, 'password': 'Kx9#mQ2vLp8Z'}),
+            content_type='application/json', secure=True,
+        )
+
+        self.assertIsNone(response.json()['data']['department_id'])
+
+    def test_signin_includes_department_id_for_a_department_scoped_member(self):
+        sector = Sector.objects.create(name='Software')
+        owner = User.objects.create_user(email='owner@example.com', username='owner', password='Kx9#mQ2vLp8Z')
+        company = Company.objects.create(name='Acme', owner=owner, sector=sector)
+        department = Department.objects.create(name='Engineering', company=company)
+        leader = User.objects.create_user(email='leader@example.com', username='leader', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=leader, company=company, department=department,
+            role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        )
+
+        response = self.client.post(
+            '/api/v1/auth/signin/', json.dumps({'email': leader.email, 'password': 'Kx9#mQ2vLp8Z'}),
+            content_type='application/json', secure=True,
+        )
+
+        self.assertEqual(response.json()['data']['department_id'], str(department.id))
 
 
 class SectorSharingTests(TestCase):
@@ -152,28 +182,28 @@ class InvitationRoleTests(TestCase):
     def test_invite_cannot_grant_owner_role(self):
         """A company must never gain a second Owner-role profile via invitation."""
         response = self.client.post(
-            '/api/auth/send_invite/', {'email': 'new@example.com', 'role': 'Owner'},
+            '/api/v1/auth/send_invite/', {'email': 'new@example.com', 'role': 'Owner'},
             content_type='application/json', **auth_header(self.owner),
         )
         self.assertEqual(response.status_code, 422)
 
     def test_default_invite_role_is_department_member(self):
         response = self.client.post(
-            '/api/auth/send_invite/', {'email': 'new@example.com'},
+            '/api/v1/auth/send_invite/', {'email': 'new@example.com'},
             content_type='application/json', **auth_header(self.owner),
         )
         self.assertEqual(response.status_code, 200)
 
     def test_department_leader_invite_requires_a_department(self):
         response = self.client.post(
-            '/api/auth/send_invite/', {'email': 'leader@example.com', 'role': 'DL'},
+            '/api/v1/auth/send_invite/', {'email': 'leader@example.com', 'role': 'DL'},
             content_type='application/json', **auth_header(self.owner),
         )
         self.assertEqual(response.status_code, 400)
 
     def test_user_without_company_cannot_send_invite(self):
         response = self.client.post(
-            '/api/auth/send_invite/', {'email': 'new@example.com'},
+            '/api/v1/auth/send_invite/', {'email': 'new@example.com'},
             content_type='application/json', **auth_header(self.outsider),
         )
         self.assertEqual(response.status_code, 403)
@@ -192,7 +222,7 @@ class InvitationTokenSecurityTests(TestCase):
         payload = {'email': email, **invite_fields}
         with patch('users.tasks.send_invitation_email') as mock_send:
             self.client.post(
-                '/api/auth/send_invite/', payload,
+                '/api/v1/auth/send_invite/', payload,
                 content_type='application/json', **auth_header(self.owner),
             )
         raw_token = mock_send.call_args.args[-1].split('token=')[-1]
@@ -217,7 +247,7 @@ class InvitationTokenSecurityTests(TestCase):
     def test_accept_invite_rejects_wrong_token(self):
         self.send_invite_and_get_raw_token()
         response = self.client.post(
-            '/api/emp/accept_invite/',
+            '/api/v1/emp/accept_invite/',
             self.accept_payload('not-the-real-token'),
         )
         self.assertEqual(response.status_code, 400)
@@ -226,7 +256,7 @@ class InvitationTokenSecurityTests(TestCase):
         raw_token = self.send_invite_and_get_raw_token()
         self.assertEqual(PendingInvite.objects.filter(email='invitee@example.com').count(), 1)
         response = self.client.post(
-            '/api/emp/accept_invite/',
+            '/api/v1/emp/accept_invite/',
             self.accept_payload(raw_token),
         )
         self.assertEqual(response.status_code, 201)
@@ -240,7 +270,7 @@ class InvitationTokenSecurityTests(TestCase):
     def test_send_invite_marks_email_sent_false_on_delivery_failure(self):
         with patch('users.tasks.send_invitation_email', side_effect=RuntimeError('smtp down')):
             response = self.client.post(
-                '/api/auth/send_invite/', {'email': 'invitee@example.com'},
+                '/api/v1/auth/send_invite/', {'email': 'invitee@example.com'},
                 content_type='application/json', **auth_header(self.owner),
             )
         self.assertEqual(response.status_code, 200)
@@ -257,7 +287,7 @@ class InvitationTokenSecurityTests(TestCase):
         self.assertEqual(invite.department_id, department.id)
         self.assertEqual(invite.role, CompanyUserProfile.Role.DEPARTMENT_LEADER)
 
-        response = self.client.post('/api/emp/accept_invite/', self.accept_payload(raw_token))
+        response = self.client.post('/api/v1/emp/accept_invite/', self.accept_payload(raw_token))
         self.assertEqual(response.status_code, 201)
         profile = CompanyUserProfile.objects.get(user__email='leader@example.com', company=self.company)
         self.assertEqual(profile.department_id, department.id)
@@ -281,22 +311,22 @@ class InvitationTokenSecurityTests(TestCase):
         invite.expires_at = timezone.now() - timedelta(seconds=1)
         invite.save(update_fields=['expires_at'])
 
-        response = self.client.post('/api/emp/accept_invite/', self.accept_payload(raw_token))
+        response = self.client.post('/api/v1/emp/accept_invite/', self.accept_payload(raw_token))
         self.assertEqual(response.status_code, 400)
         self.assertFalse(PendingInvite.objects.filter(id=invite.id).exists())
 
     def test_workload_exposes_and_streams_a_registered_members_profile_picture(self):
         raw_token = self.send_invite_and_get_raw_token()
-        accepted = self.client.post('/api/emp/accept_invite/', self.accept_payload(raw_token))
+        accepted = self.client.post('/api/v1/emp/accept_invite/', self.accept_payload(raw_token))
         self.assertEqual(accepted.status_code, 201)
         user_id = accepted.json()['data']['user']['id']
 
-        workload = self.client.get('/api/analytics/company/members/', **auth_header(self.owner))
+        workload = self.client.get('/api/v1/analytics/company/members/', **auth_header(self.owner))
         self.assertEqual(workload.status_code, 200)
         member = next(row for row in workload.json()['data']['members'] if row['id'] == user_id)
         self.assertEqual(member['profile_picture_url'], f'/company/members/{user_id}/profile-image/')
 
-        image = self.client.get(f"/api{member['profile_picture_url']}", **auth_header(self.owner))
+        image = self.client.get(f"/api/v1{member['profile_picture_url']}", **auth_header(self.owner))
         self.assertEqual(image.status_code, 200)
         self.assertTrue(image.streaming)
 
@@ -327,14 +357,14 @@ class DefaultDepartmentAndTaskTypeSelectionTests(TwoCompanyTestCase):
 
     def create_departments(self, user):
         return self.client.post(
-            '/api/department/create_departments_from_defaults/',
+            '/api/v1/department/create_departments_from_defaults/',
             json.dumps({'company_id': str(self.company_a.id), 'use_all_default_departments': True}),
             content_type='application/json', **auth_header(user),
         )
 
     def create_task_types(self, user):
         return self.client.post(
-            '/api/default_task_type/default_task_type/',
+            '/api/v1/default_task_type/default_task_type/',
             json.dumps({'company_id': str(self.company_a.id), 'use_all_default_task_types': True}),
             content_type='application/json', **auth_header(user),
         )
@@ -364,7 +394,7 @@ class DefaultDepartmentAndTaskTypeSelectionTests(TwoCompanyTestCase):
 class SignupPasswordValidationTests(TestCase):
     def test_signup_rejects_weak_password(self):
         response = self.client.post(
-            '/api/auth/signup/',
+            '/api/v1/auth/signup/',
             {'email': 'weak@example.com', 'username': 'weak', 'password': 'password'},
             content_type='application/json',
         )
@@ -372,7 +402,7 @@ class SignupPasswordValidationTests(TestCase):
 
     def test_signup_accepts_strong_password(self):
         response = self.client.post(
-            '/api/auth/signup/',
+            '/api/v1/auth/signup/',
             {'email': 'strong@example.com', 'username': 'strong', 'password': 'Kx9#mQ2vLp8Z'},
             content_type='application/json',
         )
@@ -383,7 +413,7 @@ class ProjectSecurityTests(TwoCompanyTestCase):
     def test_create_project_requires_company_membership(self):
         outsider = User.objects.create_user(email='outsider@example.com', username='outsider', password='Kx9#mQ2vLp8Z')
         response = self.client.post(
-            '/api/projects/', json.dumps({'title': 'Ghost Project'}), content_type='application/json',
+            '/api/v1/projects/', json.dumps({'title': 'Ghost Project'}), content_type='application/json',
             **auth_header(outsider),
         )
         self.assertEqual(response.status_code, 400)
@@ -394,29 +424,29 @@ class ProjectSecurityTests(TwoCompanyTestCase):
 
     def test_company_project_hidden_from_other_company(self):
         project = self.create_project(owner=self.owner_a, visibility='company')
-        response = self.client.get(f"/api/projects/{project['id']}/", **auth_header(self.owner_b))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
     def test_company_project_listed_only_for_own_company(self):
         self.create_project(owner=self.owner_a, visibility='company')
-        response = self.client.get('/api/projects/', **auth_header(self.owner_b))
+        response = self.client.get('/api/v1/projects/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['meta']['count'], 0)
 
     def test_private_project_hidden_from_non_collaborator_company_member(self):
         project = self.create_project(owner=self.owner_a, visibility='private')
-        response = self.client.get(f"/api/projects/{project['id']}/", **auth_header(self.member_a))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/", **auth_header(self.member_a))
         self.assertEqual(response.status_code, 403)
 
     def test_public_project_visible_across_companies(self):
         project = self.create_project(owner=self.owner_a, visibility='public')
-        response = self.client.get(f"/api/projects/{project['id']}/", **auth_header(self.owner_b))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 200)
 
     def test_only_manager_can_update_project(self):
         project = self.create_project(owner=self.owner_a)
         response = self.client.patch(
-            f"/api/projects/{project['id']}/", json.dumps({'title': 'Hijacked'}), content_type='application/json',
+            f"/api/v1/projects/{project['id']}/", json.dumps({'title': 'Hijacked'}), content_type='application/json',
             **auth_header(self.member_a),
         )
         self.assertEqual(response.status_code, 403)
@@ -424,7 +454,7 @@ class ProjectSecurityTests(TwoCompanyTestCase):
     def test_client_supplied_company_field_is_ignored(self):
         """ProjectIn has no company field at all; sending one must have zero effect."""
         response = self.client.post(
-            '/api/projects/',
+            '/api/v1/projects/',
             json.dumps({'title': 'Sneaky', 'company': str(self.company_b.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -437,7 +467,7 @@ class TaskSecurityTests(TwoCompanyTestCase):
         body = {'title': 'Build login page'}
         body.update(overrides)
         response = self.client.post(
-            f'/api/projects/{project_id}/tasks/', json.dumps(body), content_type='application/json',
+            f'/api/v1/projects/{project_id}/tasks/', json.dumps(body), content_type='application/json',
             **auth_header(owner or self.owner_a),
         )
         return response
@@ -451,7 +481,7 @@ class TaskSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         task = self.create_task(project['id']).json()['data']['task']
         response = self.client.post(
-            f"/api/tasks/{task['id']}/assign/",
+            f"/api/v1/tasks/{task['id']}/assign/",
             json.dumps({'assigned_to_id': str(self.owner_b.id)}), content_type='application/json',
             **auth_header(self.owner_a),
         )
@@ -461,7 +491,7 @@ class TaskSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         task = self.create_task(project['id']).json()['data']['task']
         response = self.client.post(
-            f"/api/tasks/{task['id']}/assign/",
+            f"/api/v1/tasks/{task['id']}/assign/",
             json.dumps({'assigned_to_id': str(self.member_a.id)}), content_type='application/json',
             **auth_header(self.owner_a),
         )
@@ -471,17 +501,17 @@ class TaskSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         task = self.create_task(project['id']).json()['data']['task']
         self.client.post(
-            f"/api/tasks/{task['id']}/assign/",
+            f"/api/v1/tasks/{task['id']}/assign/",
             json.dumps({'assigned_to_id': str(self.member_a.id)}), content_type='application/json',
             **auth_header(self.owner_a),
         )
         ok = self.client.patch(
-            f"/api/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}), content_type='application/json',
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}), content_type='application/json',
             **auth_header(self.member_a),
         )
         self.assertEqual(ok.status_code, 200)
         forbidden = self.client.patch(
-            f"/api/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}), content_type='application/json',
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}), content_type='application/json',
             **auth_header(self.owner_b),
         )
         self.assertEqual(forbidden.status_code, 403)
@@ -490,7 +520,7 @@ class TaskSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         task = self.create_task(project['id']).json()['data']['task']
         response = self.client.patch(
-            f"/api/tasks/{task['id']}/status/", json.dumps({'status': 'Cancelled'}), content_type='application/json',
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'Cancelled'}), content_type='application/json',
             **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 422)
@@ -501,7 +531,7 @@ class DocumentSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         upload = SimpleUploadedFile('payload.exe', b'MZ...', content_type='application/x-msdownload')
         response = self.client.post(
-            f"/api/projects/{project['id']}/documents/", {'file': upload, 'label': 'binary'},
+            f"/api/v1/projects/{project['id']}/documents/", {'file': upload, 'label': 'binary'},
             **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 400)
@@ -510,16 +540,16 @@ class DocumentSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         upload = SimpleUploadedFile('spec.txt', b'project spec', content_type='text/plain')
         created = self.client.post(
-            f"/api/projects/{project['id']}/documents/", {'file': upload, 'label': 'spec'},
+            f"/api/v1/projects/{project['id']}/documents/", {'file': upload, 'label': 'spec'},
             **auth_header(self.owner_a),
         )
         self.assertEqual(created.status_code, 201)
         document_id = created.json()['data']['document']['id']
 
-        outsider_download = self.client.get(f'/api/documents/{document_id}/download/', **auth_header(self.owner_b))
+        outsider_download = self.client.get(f'/api/v1/documents/{document_id}/download/', **auth_header(self.owner_b))
         self.assertEqual(outsider_download.status_code, 403)
 
-        owner_download = self.client.get(f'/api/documents/{document_id}/download/', **auth_header(self.owner_a))
+        owner_download = self.client.get(f'/api/v1/documents/{document_id}/download/', **auth_header(self.owner_a))
         self.assertEqual(owner_download.status_code, 200)
 
 
@@ -529,7 +559,7 @@ class AIGenerationSecurityTests(TwoCompanyTestCase):
         if mentioned_user_ids is not None:
             body['mentioned_user_ids'] = mentioned_user_ids
         return self.client.post(
-            f"/api/projects/{project['id']}/ai-plan/", json.dumps(body), content_type='application/json',
+            f"/api/v1/projects/{project['id']}/ai-plan/", json.dumps(body), content_type='application/json',
             **auth_header(owner),
         )
 
@@ -554,7 +584,7 @@ class AIGenerationSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a, visibility='private')
         created = self._request_plan(project, self.owner_a)
         generation_id = created.json()['data']['generation']['id']
-        response = self.client.get(f'/api/ai/generations/{generation_id}/', **auth_header(self.owner_b))
+        response = self.client.get(f'/api/v1/ai/generations/{generation_id}/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
     @patch('ai_agent.services.process_ai_generation.delay')
@@ -572,7 +602,7 @@ class AIGenerationSecurityTests(TwoCompanyTestCase):
     def test_plan_request_accepts_an_eligible_assignee_pool_and_stores_it(self, mock_delay):
         project = self.create_project(owner=self.owner_a)
         response = self.client.post(
-            f"/api/projects/{project['id']}/ai-plan/",
+            f"/api/v1/projects/{project['id']}/ai-plan/",
             json.dumps({'prompt': 'Build a login flow', 'assignee_ids': [str(self.member_a.id)], 'max_tasks': 5}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -585,7 +615,7 @@ class AIGenerationSecurityTests(TwoCompanyTestCase):
     def test_plan_request_rejects_an_assignee_outside_the_company(self, mock_delay):
         project = self.create_project(owner=self.owner_a)
         response = self.client.post(
-            f"/api/projects/{project['id']}/ai-plan/",
+            f"/api/v1/projects/{project['id']}/ai-plan/",
             json.dumps({'prompt': 'Build a login flow', 'assignee_ids': [str(self.owner_b.id)]}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -598,7 +628,7 @@ class AIGenerationSecurityTests(TwoCompanyTestCase):
         response = self._request_plan(project, self.owner_a)
         self.assertEqual(response.status_code, 202)  # default max_tasks applies
         over_limit = self.client.post(
-            f"/api/projects/{project['id']}/ai-plan/",
+            f"/api/v1/projects/{project['id']}/ai-plan/",
             json.dumps({'prompt': 'Build a login flow', 'max_tasks': 999}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -610,7 +640,7 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
     def test_request_assistant_query_creates_pending_query(self, mock_delay):
         project = self.create_project(owner=self.owner_a)
         response = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
             **auth_header(self.owner_a),
         )
@@ -623,18 +653,18 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
     def test_assistant_query_hidden_from_other_company(self, mock_delay):
         project = self.create_project(owner=self.owner_a, visibility='private')
         created = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
             **auth_header(self.owner_a),
         )
         query_id = created.json()['data']['assistant_query']['id']
-        response = self.client.get(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
+        response = self.client.get(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
     def test_question_over_max_length_is_rejected(self):
         project = self.create_project(owner=self.owner_a)
         response = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'x' * 2001}), content_type='application/json',
             **auth_header(self.owner_a),
         )
@@ -643,7 +673,7 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
     def test_request_assistant_query_requires_authentication(self):
         project = self.create_project(owner=self.owner_a)
         response = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
         )
         self.assertEqual(response.status_code, 401)
@@ -654,7 +684,7 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
         folder = PageFolder.objects.create(name='Docs', company=self.company_a, created_by=self.owner_a)
         page = Page.objects.create(folder=folder, title='Spec', created_by=self.owner_a)
         response = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'Summarize the spec.', 'page_ids': [str(page.id)]}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -668,7 +698,7 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
         other_folder = PageFolder.objects.create(name='B Docs', company=self.company_b, created_by=self.owner_b)
         other_page = Page.objects.create(folder=other_folder, title='Not yours', created_by=self.owner_b)
         response = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'Summarize this.', 'page_ids': [str(other_page.id)]}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -679,41 +709,41 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
     def test_delete_assistant_query_removes_it(self, mock_delay):
         project = self.create_project(owner=self.owner_a)
         created = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
             **auth_header(self.owner_a),
         )
         query_id = created.json()['data']['assistant_query']['id']
-        response = self.client.delete(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.owner_a))
+        response = self.client.delete(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            self.client.get(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.owner_a)).status_code, 404,
+            self.client.get(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.owner_a)).status_code, 404,
         )
 
     @patch('ai_agent.assistant_services.process_assistant_query.delay')
     def test_delete_assistant_query_hidden_from_other_company(self, mock_delay):
         project = self.create_project(owner=self.owner_a, visibility='private')
         created = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
             **auth_header(self.owner_a),
         )
         query_id = created.json()['data']['assistant_query']['id']
-        response = self.client.delete(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
+        response = self.client.delete(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
     @patch('ai_agent.assistant_services.process_assistant_query.delay')
     def test_delete_assistant_query_forbidden_for_non_requester_member(self, mock_delay):
         project = self.create_project(owner=self.owner_a, visibility='company')
         created = self.client.post(
-            f"/api/projects/{project['id']}/ai-assistant/",
+            f"/api/v1/projects/{project['id']}/ai-assistant/",
             json.dumps({'question': 'What tasks are To Do?'}), content_type='application/json',
             **auth_header(self.owner_a),
         )
         query_id = created.json()['data']['assistant_query']['id']
         # member_a can view the query (company-visible project) but didn't
         # ask it and has no manage rights on the project -- must not delete it.
-        response = self.client.delete(f'/api/ai/assistant-queries/{query_id}/', **auth_header(self.member_a))
+        response = self.client.delete(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.member_a))
         self.assertEqual(response.status_code, 403)
 
     def test_save_as_page_splits_the_answer_into_structured_blocks(self):
@@ -724,7 +754,7 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
             answer='**Overview**\n\nSome context.\n\n- First point\n- Second point',
         )
         response = self.client.post(
-            f'/api/ai/assistant-queries/{query.id}/save-as-page/',
+            f'/api/v1/ai/assistant-queries/{query.id}/save-as-page/',
             json.dumps({'title': 'Saved answer', 'new_folder_name': 'AI Answers'}),
             content_type='application/json', **auth_header(self.owner_a),
         )
@@ -741,7 +771,7 @@ class AIHealthSummarySecurityTests(TwoCompanyTestCase):
     @patch('ai_agent.health_services.process_health_summary.delay')
     def test_request_health_summary_creates_pending_summary(self, mock_delay):
         project = self.create_project(owner=self.owner_a)
-        response = self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
+        response = self.client.post(f"/api/v1/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 202)
         summary = response.json()['data']['health_summary']
         self.assertEqual(summary['status'], 'pending')
@@ -750,9 +780,9 @@ class AIHealthSummarySecurityTests(TwoCompanyTestCase):
     @patch('ai_agent.health_services.process_health_summary.delay')
     def test_health_summary_hidden_from_other_company(self, mock_delay):
         project = self.create_project(owner=self.owner_a, visibility='private')
-        created = self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
+        created = self.client.post(f"/api/v1/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
         summary_id = created.json()['data']['health_summary']['id']
-        response = self.client.get(f'/api/ai/health-summaries/{summary_id}/', **auth_header(self.owner_b))
+        response = self.client.get(f'/api/v1/ai/health-summaries/{summary_id}/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
     @patch('ai_agent.health_services.process_health_summary.delay')
@@ -763,8 +793,8 @@ class AIHealthSummarySecurityTests(TwoCompanyTestCase):
         with self.settings(RATE_LIMIT_ENABLED=True):
             project = self.create_project(owner=self.owner_a)
             for _ in range(6):
-                self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
-            response = self.client.post(f"/api/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
+                self.client.post(f"/api/v1/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
+            response = self.client.post(f"/api/v1/projects/{project['id']}/ai-health-summary/", **auth_header(self.owner_a))
             self.assertEqual(response.status_code, 429)
 
     def test_export_returns_an_xlsx_workbook_for_a_completed_summary(self):
@@ -774,7 +804,7 @@ class AIHealthSummarySecurityTests(TwoCompanyTestCase):
             summary='On track.', risk_level=AIProjectHealthSummary.RISK_LEVEL.LOW,
         )
         response = self.client.get(
-            f"/api/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_a),
+            f"/api/v1/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -786,7 +816,7 @@ class AIHealthSummarySecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         summary = AIProjectHealthSummary.objects.create(project_id=project['id'], requested_by=self.owner_a)
         response = self.client.get(
-            f"/api/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_a),
+            f"/api/v1/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 400)
 
@@ -796,7 +826,7 @@ class AIHealthSummarySecurityTests(TwoCompanyTestCase):
             project_id=project['id'], requested_by=self.owner_a, status=AIProjectHealthSummary.STATUS.COMPLETED,
         )
         response = self.client.get(
-            f"/api/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_b),
+            f"/api/v1/projects/{project['id']}/ai-health-summary/{summary.id}/export/", **auth_header(self.owner_b),
         )
         self.assertEqual(response.status_code, 403)
 
@@ -806,7 +836,7 @@ class NotificationTests(TwoCompanyTestCase):
 
     def test_user_cannot_see_another_users_notifications(self):
         Notification.objects.create(recipient=self.owner_a, type=Notification.Type.TASK_ASSIGNED, title='For A only')
-        response = self.client.get('/api/notifications/', **auth_header(self.owner_b))
+        response = self.client.get('/api/v1/notifications/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['meta']['count'], 0)
 
@@ -814,7 +844,7 @@ class NotificationTests(TwoCompanyTestCase):
         notification = Notification.objects.create(
             recipient=self.owner_a, type=Notification.Type.TASK_ASSIGNED, title='For A only',
         )
-        response = self.client.post(f'/api/notifications/{notification.id}/read/', **auth_header(self.owner_b))
+        response = self.client.post(f'/api/v1/notifications/{notification.id}/read/', **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 404)
         notification.refresh_from_db()
         self.assertFalse(notification.is_read)
@@ -822,11 +852,11 @@ class NotificationTests(TwoCompanyTestCase):
     def test_task_assignment_notifies_the_assignee(self):
         project = self.create_project(owner=self.owner_a)
         task = self.client.post(
-            f"/api/projects/{project['id']}/tasks/", json.dumps({'title': 'Build login page'}),
+            f"/api/v1/projects/{project['id']}/tasks/", json.dumps({'title': 'Build login page'}),
             content_type='application/json', **auth_header(self.owner_a),
         ).json()['data']['task']
         self.client.post(
-            f"/api/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
         self.assertTrue(Notification.objects.filter(
@@ -836,15 +866,15 @@ class NotificationTests(TwoCompanyTestCase):
     def test_task_completion_notifies_the_creator_but_not_the_assignee_completing_it(self):
         project = self.create_project(owner=self.owner_a)
         task = self.client.post(
-            f"/api/projects/{project['id']}/tasks/", json.dumps({'title': 'Build login page'}),
+            f"/api/v1/projects/{project['id']}/tasks/", json.dumps({'title': 'Build login page'}),
             content_type='application/json', **auth_header(self.owner_a),
         ).json()['data']['task']
         self.client.post(
-            f"/api/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
         self.client.patch(
-            f"/api/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}),
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}),
             content_type='application/json', **auth_header(self.member_a),
         )
         self.assertTrue(Notification.objects.filter(
@@ -858,7 +888,7 @@ class NotificationTests(TwoCompanyTestCase):
 class EligibleAssigneesTests(TwoCompanyTestCase):
     def test_falls_back_to_full_company_roster_when_project_has_no_department_or_team(self):
         project = self.create_project(owner=self.owner_a)
-        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         ids = {row['id'] for row in response.json()['data']['results']}
         self.assertIn(str(self.member_a.id), ids)
@@ -873,7 +903,7 @@ class EligibleAssigneesTests(TwoCompanyTestCase):
             role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
         )
         project = self.create_project(owner=self.owner_a, department_id=str(self.department_a.id))
-        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
         ids = {row['id'] for row in response.json()['data']['results']}
         self.assertIn(str(self.member_a.id), ids)  # member_a is in department_a
         self.assertNotIn(str(other_member.id), ids)  # in Sales, not this project's department
@@ -884,18 +914,18 @@ class EligibleAssigneesTests(TwoCompanyTestCase):
         project = self.create_project(
             owner=self.owner_a, department_id=str(self.department_a.id), team_id=str(team.id),
         )
-        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
         ids = {row['id'] for row in response.json()['data']['results']}
         self.assertEqual(ids, {str(self.member_a.id)})  # team takes precedence over department
 
     def test_outsider_cannot_view_eligible_assignees_for_a_private_project(self):
         project = self.create_project(owner=self.owner_a, visibility='private')
-        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_b))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
     def test_results_include_role_and_department_for_the_mention_and_assignee_picker(self):
         project = self.create_project(owner=self.owner_a, department_id=str(self.department_a.id))
-        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
         rows = {row['id']: row for row in response.json()['data']['results']}
         member_row = rows[str(self.member_a.id)]
         self.assertEqual(member_row['role'], CompanyUserProfile.Role.DEPARTMENT_MEMBER)
@@ -904,7 +934,7 @@ class EligibleAssigneesTests(TwoCompanyTestCase):
         # The owner has no CompanyUserProfile row -- only reachable via the
         # unscoped company-roster fallback (no department/team on the project).
         unscoped_project = self.create_project(owner=self.owner_a)
-        response = self.client.get(f"/api/projects/{unscoped_project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        response = self.client.get(f"/api/v1/projects/{unscoped_project['id']}/eligible-assignees/", **auth_header(self.owner_a))
         owner_row = {row['id']: row for row in response.json()['data']['results']}[str(self.owner_a.id)]
         self.assertEqual(owner_row['role'], CompanyUserProfile.Role.Owner)
         self.assertIsNone(owner_row['department'])
@@ -919,7 +949,7 @@ class EligibleAssigneesTests(TwoCompanyTestCase):
         # Open work on a DIFFERENT project must not leak into this count.
         Task.objects.create(project_id=other_project['id'], assigned_to=self.member_a, status=Task.STATUS.TODO)
 
-        response = self.client.get(f"/api/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
+        response = self.client.get(f"/api/v1/projects/{project['id']}/eligible-assignees/", **auth_header(self.owner_a))
         member_row = {row['id']: row for row in response.json()['data']['results']}[str(self.member_a.id)]
         self.assertEqual(member_row['open_task_count'], 2)
 
@@ -938,7 +968,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
         response = self.client.patch(
-            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/comment/",
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/comment/",
             json.dumps({'comment': 'Add more technical detail.'}), content_type='application/json',
             **auth_header(self.owner_a),
         )
@@ -951,7 +981,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
         response = self.client.patch(
-            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/comment/",
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/comment/",
             json.dumps({'comment': 'x'}), content_type='application/json',
             **auth_header(self.owner_b),
         )
@@ -961,7 +991,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
         response = self.client.patch(
-            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
             json.dumps({'assigned_to_id': str(self.owner_b.id)}), content_type='application/json',
             **auth_header(self.owner_a),
         )
@@ -971,7 +1001,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
         set_response = self.client.patch(
-            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
             json.dumps({'assigned_to_id': str(self.member_a.id)}), content_type='application/json',
             **auth_header(self.owner_a),
         )
@@ -980,7 +1010,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         self.assertEqual(draft.assigned_to_id, self.member_a.id)
 
         clear_response = self.client.patch(
-            f"/api/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/assign/",
             json.dumps({'assigned_to_id': None}), content_type='application/json',
             **auth_header(self.owner_a),
         )
@@ -992,7 +1022,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
         response = self.client.post(
-            f"/api/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
+            f"/api/v1/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 400)
 
@@ -1003,7 +1033,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
             project['id'], self.owner_a, reviewer_comment='Needs detail.', comment_resolved=False,
         )
         response = self.client.post(
-            f"/api/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
+            f"/api/v1/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()['data']['generation']['status'], 'processing')
@@ -1017,14 +1047,14 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         generation.saved_at = timezone.now()
         generation.save(update_fields=['saved_at'])
         response = self.client.post(
-            f"/api/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
+            f"/api/v1/ai/generations/{generation.id}/regenerate/", **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 400)
 
     def test_save_persists_tasks_and_is_idempotent(self):
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
-        first = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        first = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(first.status_code, 200)
         self.assertEqual(len(first.json()['data']['tasks']), 1)
         self.assertEqual(first.json()['data']['tasks'][0]['source'], 'ai_generated')
@@ -1032,7 +1062,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         generation.refresh_from_db()
         self.assertIsNotNone(generation.saved_at)
 
-        second = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        second = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(second.status_code, 409)
 
     def test_save_drops_an_assignee_that_became_ineligible_and_reports_it(self):
@@ -1045,10 +1075,10 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         draft.save(update_fields=['assigned_to'])
         other_department = Department.objects.create(name='Sales', company=self.company_a)
         self.client.patch(
-            f"/api/projects/{project['id']}/", json.dumps({'department_id': str(other_department.id)}),
+            f"/api/v1/projects/{project['id']}/", json.dumps({'department_id': str(other_department.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
-        response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         body = response.json()['data']
         self.assertEqual(body['invalid_assignee_temp_ids'], ['t1'])
@@ -1057,7 +1087,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
     def test_save_hidden_from_other_company(self):
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(project['id'], self.owner_a)
-        response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_b))
+        response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
     def test_save_applies_the_ai_suggested_assignee_when_no_human_override_exists(self):
@@ -1065,7 +1095,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         generation, draft = self._make_generation_with_draft(
             project['id'], self.owner_a, suggested_assignee=self.member_a,
         )
-        response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['tasks'][0]['assigned_to'], str(self.member_a.id))
 
@@ -1078,7 +1108,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         generation, draft = self._make_generation_with_draft(
             project['id'], self.owner_a, suggested_assignee=self.member_a, assigned_to=other_member,
         )
-        response = self.client.post(f"/api/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['tasks'][0]['assigned_to'], str(other_member.id))
 
@@ -1086,7 +1116,7 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
 class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
     def _create_ai_generated_task(self, project_id, owner):
         task = self.client.post(
-            f'/api/projects/{project_id}/tasks/', json.dumps({'title': 'Define requirements'}),
+            f'/api/v1/projects/{project_id}/tasks/', json.dumps({'title': 'Define requirements'}),
             content_type='application/json', **auth_header(owner),
         ).json()['data']['task']
         Task.objects.filter(id=task['id']).update(source=Task.SOURCE.AI_GENERATED)
@@ -1097,7 +1127,7 @@ class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         task = self._create_ai_generated_task(project['id'], self.owner_a)
         response = self.client.post(
-            f"/api/tasks/{task['id']}/regenerate-ai-content/", json.dumps({'instructions': 'More detail.'}),
+            f"/api/v1/tasks/{task['id']}/regenerate-ai-content/", json.dumps({'instructions': 'More detail.'}),
             content_type='application/json', **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 202)
@@ -1106,11 +1136,11 @@ class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
     def test_regenerate_ai_content_rejects_a_manual_task(self):
         project = self.create_project(owner=self.owner_a)
         task = self.client.post(
-            f"/api/projects/{project['id']}/tasks/", json.dumps({'title': 'Manual task'}),
+            f"/api/v1/projects/{project['id']}/tasks/", json.dumps({'title': 'Manual task'}),
             content_type='application/json', **auth_header(self.owner_a),
         ).json()['data']['task']
         response = self.client.post(
-            f"/api/tasks/{task['id']}/regenerate-ai-content/", json.dumps({}),
+            f"/api/v1/tasks/{task['id']}/regenerate-ai-content/", json.dumps({}),
             content_type='application/json', **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 400)
@@ -1119,7 +1149,7 @@ class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
         project = self.create_project(owner=self.owner_a)
         task = self._create_ai_generated_task(project['id'], self.owner_a)
         response = self.client.post(
-            f"/api/tasks/{task['id']}/regenerate-ai-content/", json.dumps({}),
+            f"/api/v1/tasks/{task['id']}/regenerate-ai-content/", json.dumps({}),
             content_type='application/json', **auth_header(self.owner_b),
         )
         self.assertEqual(response.status_code, 403)

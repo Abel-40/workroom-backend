@@ -12,14 +12,15 @@ Start the server from the repository root:
 
 Remove `--reload` in production and run Uvicorn behind a reverse proxy/process manager.
 
-- Interactive API docs: `http://localhost:8000/api/docs`
-- OpenAPI JSON: `http://localhost:8000/api/openapi.json`
-- API base path: `http://localhost:8000/api/`
+- Interactive API docs: `http://localhost:8000/api/v1/docs`
+- OpenAPI JSON: `http://localhost:8000/api/v1/openapi.json`
+- API base path: `http://localhost:8000/api/v1/`
+- Health check (unversioned, for infra healthchecks): `http://localhost:8000/api/health/`
 
 Example Pydantic-validated request:
 
 ```http
-POST /api/auth/signup/
+POST /api/v1/auth/signup/
 Content-Type: application/json
 
 {

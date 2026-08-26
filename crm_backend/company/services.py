@@ -78,6 +78,16 @@ async def get_company_role(user, company: Company) -> str | None:
     return profile.role if profile else None
 
 
+async def get_member_department_id(user, company: Company):
+    """The department this user belongs to, if any. The owner is never
+    department-scoped; returns None for them same as for a member with no
+    department assigned."""
+    if company.owner_id == user.id:
+        return None
+    profile = await CompanyUserProfile.objects.filter(user=user, company=company, is_active=True).afirst()
+    return profile.department_id if profile else None
+
+
 # --------------------------------------------------------------------------
 # Sync mirrors
 # --------------------------------------------------------------------------

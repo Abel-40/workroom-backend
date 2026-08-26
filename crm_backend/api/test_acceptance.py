@@ -49,24 +49,24 @@ class V1AcceptanceJourneyTests(TestCase):
 
     def _run_journey(self, tag: str) -> dict:
         # 1. Register
-        signup = self._post('/api/auth/signup/', {
+        signup = self._post('/api/v1/auth/signup/', {
             'email': f'owner-{tag}@example.com', 'username': f'owner-{tag}', 'password': 'Kx9#mQ2vLp8Z',
         })
         self.assertEqual(signup.status_code, 201)
         owner = User.objects.get(email=f'owner-{tag}@example.com')
 
         # 2. Company
-        register = self._post('/api/company/register/', {'name': f'Acme {tag}', 'sector': str(self.sector.id)}, owner)
+        register = self._post('/api/v1/company/register/', {'name': f'Acme {tag}', 'sector': str(self.sector.id)}, owner)
         self.assertEqual(register.status_code, 201)
         company_id = register.json()['data']['id']
 
         # 3. Invite + accept
         with patch('users.tasks.send_invitation_email') as mock_send:
-            invite = self._post('/api/auth/send_invite/', {'email': f'member-{tag}@example.com'}, owner)
+            invite = self._post('/api/v1/auth/send_invite/', {'email': f'member-{tag}@example.com'}, owner)
         self.assertEqual(invite.status_code, 200)
         self.assertTrue(invite.json()['data']['email_sent'])
         raw_token = mock_send.call_args.args[-1].split('token=')[-1]
-        accept = self.client.post('/api/emp/accept_invite/', {
+        accept = self.client.post('/api/v1/emp/accept_invite/', {
             'token': raw_token,
             'password': 'Kx9#mQ2vLp8Z',
             'full_name': f'Member {tag}',
@@ -79,28 +79,28 @@ class V1AcceptanceJourneyTests(TestCase):
         member = User.objects.get(id=member_id)
 
         # 4. Project
-        project = self._post('/api/projects/', {'title': f'Project {tag}', 'visibility': 'company'}, owner)
+        project = self._post('/api/v1/projects/', {'title': f'Project {tag}', 'visibility': 'company'}, owner)
         self.assertEqual(project.status_code, 201)
         project_id = project.json()['data']['project']['id']
 
         # 5. Manual task
-        task = self._post(f'/api/projects/{project_id}/tasks/', {'title': f'Manual task {tag}'}, owner)
+        task = self._post(f'/api/v1/projects/{project_id}/tasks/', {'title': f'Manual task {tag}'}, owner)
         self.assertEqual(task.status_code, 201)
         task_id = task.json()['data']['task']['id']
 
         # 6. Assignment
-        assign = self._post(f'/api/tasks/{task_id}/assign/', {'assigned_to_id': member_id}, owner)
+        assign = self._post(f'/api/v1/tasks/{task_id}/assign/', {'assigned_to_id': member_id}, owner)
         self.assertEqual(assign.status_code, 200)
 
         # 7. Kanban status updates (owner has manage rights; the last one
         # completes the task, which notifies the creator since it wasn't
         # self-assigned).
         self.client.patch(
-            f'/api/tasks/{task_id}/status/', json.dumps({'status': 'In Progress'}),
+            f'/api/v1/tasks/{task_id}/status/', json.dumps({'status': 'In Progress'}),
             content_type='application/json', **auth_header(owner),
         )
         done = self.client.patch(
-            f'/api/tasks/{task_id}/status/', json.dumps({'status': 'Done'}),
+            f'/api/v1/tasks/{task_id}/status/', json.dumps({'status': 'Done'}),
             content_type='application/json', **auth_header(owner),
         )
         self.assertEqual(done.status_code, 200)
@@ -110,30 +110,30 @@ class V1AcceptanceJourneyTests(TestCase):
         # only stores a draft plan for review -- nothing lands in the backlog
         # until it's explicitly saved (step 9).
         with patch('ai_agent.tasks.requests.post', return_value=_mock_ai_response()):
-            ai_plan = self._post(f'/api/projects/{project_id}/ai-plan/', {'prompt': f'Build a simple {tag} feature'}, owner)
+            ai_plan = self._post(f'/api/v1/projects/{project_id}/ai-plan/', {'prompt': f'Build a simple {tag} feature'}, owner)
         self.assertEqual(ai_plan.status_code, 202)
         generation_id = ai_plan.json()['data']['generation']['id']
 
         # 9. Reviewer saves the plan -- only now do real backlog Tasks exist.
-        save_resp = self._post(f'/api/ai/generations/{generation_id}/save/', {}, owner)
+        save_resp = self._post(f'/api/v1/ai/generations/{generation_id}/save/', {}, owner)
         self.assertEqual(save_resp.status_code, 200)
         ai_tasks = Task.objects.filter(project_id=project_id, source=Task.SOURCE.AI_GENERATED)
         self.assertEqual(ai_tasks.count(), 2)
         self.assertTrue(all(t.assigned_to_id is None for t in ai_tasks))
 
         # 10. Notifications
-        owner_notifications = self.client.get('/api/notifications/', **auth_header(owner)).json()['data']['results']
-        member_notifications = self.client.get('/api/notifications/', **auth_header(member)).json()['data']['results']
+        owner_notifications = self.client.get('/api/v1/notifications/', **auth_header(owner)).json()['data']['results']
+        member_notifications = self.client.get('/api/v1/notifications/', **auth_header(member)).json()['data']['results']
         self.assertTrue(any(n['type'] == 'ai_generation_completed' for n in owner_notifications))
         self.assertTrue(any(n['type'] == 'task_completed' for n in owner_notifications))
         self.assertTrue(any(n['type'] == 'invitation_accepted' for n in member_notifications))
         self.assertTrue(any(n['type'] == 'task_assigned' for n in member_notifications))
 
         # 11. Analytics
-        project_stats = self.client.get(f'/api/analytics/projects/{project_id}/', **auth_header(owner)).json()['data']
+        project_stats = self.client.get(f'/api/v1/analytics/projects/{project_id}/', **auth_header(owner)).json()['data']
         self.assertEqual(project_stats['total_tasks'], 3)  # 1 manual + 2 AI-generated
         self.assertEqual(project_stats['completed_tasks'], 1)
-        company_stats = self.client.get('/api/analytics/company/', **auth_header(owner)).json()['data']
+        company_stats = self.client.get('/api/v1/analytics/company/', **auth_header(owner)).json()['data']
         self.assertEqual(company_stats['project_count'], 1)
         self.assertEqual(company_stats['member_count'], 2)
 
@@ -151,35 +151,35 @@ class V1AcceptanceJourneyTests(TestCase):
 
         # Company B's owner must be rejected everywhere they try to touch
         # Company A's objects by id.
-        project_resp = self.client.get(f"/api/projects/{company_a['project_id']}/", **auth_header(owner_b))
+        project_resp = self.client.get(f"/api/v1/projects/{company_a['project_id']}/", **auth_header(owner_b))
         self.assertEqual(project_resp.status_code, 403)
 
-        task_resp = self.client.get(f"/api/tasks/{company_a['task_id']}/", **auth_header(owner_b))
+        task_resp = self.client.get(f"/api/v1/tasks/{company_a['task_id']}/", **auth_header(owner_b))
         self.assertEqual(task_resp.status_code, 403)
 
         generation_resp = self.client.get(
-            f"/api/ai/generations/{company_a['generation_id']}/", **auth_header(owner_b),
+            f"/api/v1/ai/generations/{company_a['generation_id']}/", **auth_header(owner_b),
         )
         self.assertEqual(generation_resp.status_code, 403)
 
         analytics_resp = self.client.get(
-            f"/api/analytics/projects/{company_a['project_id']}/", **auth_header(owner_b),
+            f"/api/v1/analytics/projects/{company_a['project_id']}/", **auth_header(owner_b),
         )
         self.assertEqual(analytics_resp.status_code, 403)
 
-        company_stats_b = self.client.get('/api/analytics/company/', **auth_header(owner_b)).json()['data']
+        company_stats_b = self.client.get('/api/v1/analytics/company/', **auth_header(owner_b)).json()['data']
         self.assertEqual(company_stats_b['project_count'], 1)  # only company B's own project
 
         # Company B's owner can't read or mark-read Company A's notification.
         read_resp = self.client.post(
-            f"/api/notifications/{company_a['owner_notification_id']}/read/", **auth_header(owner_b),
+            f"/api/v1/notifications/{company_a['owner_notification_id']}/read/", **auth_header(owner_b),
         )
         self.assertEqual(read_resp.status_code, 404)
         self.assertTrue(Notification.objects.filter(id=company_a['owner_notification_id'], is_read=False).exists())
 
         # Assigning Company B's task to Company A's member must be rejected.
         cross_assign = self.client.post(
-            f"/api/tasks/{company_b['task_id']}/assign/",
+            f"/api/v1/tasks/{company_b['task_id']}/assign/",
             json.dumps({'assigned_to_id': str(company_a['member'].id)}),
             content_type='application/json', **auth_header(owner_b),
         )
