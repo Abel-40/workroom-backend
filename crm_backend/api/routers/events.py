@@ -95,6 +95,11 @@ async def create_event(request, data: EventIn):
     )
     if error == 'no_company':
         return payload('You must belong to a company to create an event.', 400, False)
+    if error == 'past_start_at':
+        return payload(
+            'Events cannot be scheduled in the past.', 400, False,
+            errors={'start_at': ['Must be now or in the future']},
+        )
     if error:
         field = error.removeprefix('invalid_')
         return payload(f'Invalid {field} for this company.', 400, False, errors={error: ['Invalid reference']})

@@ -13,6 +13,7 @@ from company.services import get_company_role, get_member_company, is_company_me
 from departments_and_teams.models import Department, Team
 from django.contrib.auth import get_user_model
 from django.db.models import Q
+from django.utils import timezone
 from users.models import CompanyUserProfile
 
 from .models import DefaultEventType, Event, EventType
@@ -178,6 +179,8 @@ async def create_event(user, *, title, description, start_at, end_at, location,
     company = await get_member_company(user)
     if company is None:
         return None, 'no_company'
+    if start_at < timezone.now():
+        return None, 'past_start_at'
     event_type, error = await _resolve_event_type(company, event_type_id)
     if error:
         return None, error

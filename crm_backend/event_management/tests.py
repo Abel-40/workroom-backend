@@ -5,16 +5,23 @@ checked the same way every other endpoint's tests check it.
 """
 
 import json
+from datetime import timedelta
 
 from api.tests import TwoCompanyTestCase, auth_header
+from django.utils import timezone
 from users.models import CompanyUserProfile, User
 
 from event_management.models import DefaultEventType, Event, EventType
 
+# A fixed future-looking literal (e.g. '2026-06-01') silently turns into a
+# past date -- and starts failing the create_event "no backdating" rule --
+# the moment the real clock catches up to it. Always relative to "now" instead.
+FUTURE_START_AT = (timezone.now() + timedelta(days=30)).isoformat()
+
 
 class EventCrudTests(TwoCompanyTestCase):
     def create_event(self, owner=None, **overrides):
-        body = {'title': 'All Hands', 'start_at': '2026-06-01T17:00:00Z'}
+        body = {'title': 'All Hands', 'start_at': FUTURE_START_AT}
         body.update(overrides)
         return self.client.post(
             '/api/events/', json.dumps(body), content_type='application/json',
@@ -32,7 +39,7 @@ class EventCrudTests(TwoCompanyTestCase):
 
     def test_requires_authentication(self):
         response = self.client.post(
-            '/api/events/', json.dumps({'title': 'x', 'start_at': '2026-06-01T17:00:00Z'}),
+            '/api/events/', json.dumps({'title': 'x', 'start_at': FUTURE_START_AT}),
             content_type='application/json',
         )
         self.assertEqual(response.status_code, 401)
@@ -43,6 +50,11 @@ class EventCrudTests(TwoCompanyTestCase):
             **auth_header(self.owner_a),
         )
         self.assertEqual(response.status_code, 422)
+
+    def test_create_rejects_past_start_at(self):
+        response = self.create_event(start_at=(timezone.now() - timedelta(days=1)).isoformat())
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Event.objects.filter(title='All Hands').exists())
 
     def test_create_rejects_department_from_another_company(self):
         from departments_and_teams.models import Department
