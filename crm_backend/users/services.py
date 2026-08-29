@@ -349,6 +349,26 @@ async def get_member_detail(requester, target_user_id):
     if company is None:
         return None, 'forbidden'
 
+    # Real profile first -- this now covers the owner too, for any company
+    # registered since register_company started creating one. Only a legacy
+    # company (owner predates that) falls through to the synthesized branch
+    # below.
+    profile = await CompanyUserProfile.objects.select_related('user', 'department').filter(
+        user_id=target_user_id, company=company,
+    ).afirst()
+    if profile is not None:
+        workload = await get_member_workload(company, profile.user)
+        profile_picture_url = (
+            f'/company/members/{profile.user_id}/profile-image/' if profile.profile_picture else None
+        )
+        return {
+            'user': profile.user, 'role': profile.role,
+            'email_notifications_enabled': profile.email_notifications_enabled,
+            'department_name': profile.department.name if profile.department_id else None,
+            'profile_picture_url': profile_picture_url,
+            'is_active': profile.is_active, 'workload': workload,
+        }, None
+
     if company.owner_id == target_user_id:
         target = await User.objects.filter(id=target_user_id).afirst()
         if target is None:
@@ -358,27 +378,12 @@ async def get_member_detail(requester, target_user_id):
             'user': target, 'role': CompanyUserProfile.Role.Owner,
             'department_name': None, 'is_active': True,
             'profile_picture_url': None,
-            # The owner has no profile row to store a preference on -- always
-            # gets critical-only-style behavior, see _should_email's fallback.
+            # No profile row to store a preference on -- always gets
+            # critical-only-style behavior, see _should_email's fallback.
             'email_notifications_enabled': True, 'workload': workload,
         }, None
 
-    profile = await CompanyUserProfile.objects.select_related('user', 'department').filter(
-        user_id=target_user_id, company=company,
-    ).afirst()
-    if profile is None:
-        return None, 'not_found'
-    workload = await get_member_workload(company, profile.user)
-    profile_picture_url = (
-        f'/company/members/{profile.user_id}/profile-image/' if profile.profile_picture else None
-    )
-    return {
-        'user': profile.user, 'role': profile.role,
-        'email_notifications_enabled': profile.email_notifications_enabled,
-        'department_name': profile.department.name if profile.department_id else None,
-        'profile_picture_url': profile_picture_url,
-        'is_active': profile.is_active, 'workload': workload,
-    }, None
+    return None, 'not_found'
 
 
 def get_removal_blockers(company, target_user_id) -> dict:
@@ -463,9 +468,10 @@ def remove_member(requester, target_user_id, *, reassign_to_user_id=None):
 async def update_notification_preference(user, email_notifications_enabled: bool):
     """Self-service: a member updates their own email-notification
     preference. Returns (profile, error) where error is 'forbidden' (no
-    company) or 'no_profile' (the company owner has no CompanyUserProfile
-    row to store a preference on -- they always get critical-only behavior,
-    see notifications_and_activity.services._should_email)."""
+    company) or 'no_profile' (only reachable for a legacy company whose
+    owner predates register_company always creating an Owner profile row --
+    they always get critical-only behavior, see
+    notifications_and_activity.services._should_email)."""
     company = await get_member_company(user)
     if company is None:
         return None, 'forbidden'

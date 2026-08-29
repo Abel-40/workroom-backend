@@ -246,6 +246,12 @@ async def register_company(request, data: CompanyRegistrationIn):
     if await Company.objects.filter(owner=owner).aexists():
         return payload('User already has a company.', 400, False, errors={'owner': ['User already has a company.']})
     company = await Company.objects.acreate(name=data.name, owner=owner, sector=sector)
+    # The owner is a full company member like any other -- give them a real
+    # CompanyUserProfile row (role=Owner, every other field left at its model
+    # default) instead of leaving them reachable only through Company.owner.
+    # See users/models.py, analytics/services.py, users/services.py for the
+    # fallback paths that still cover a company that predates this row.
+    await CompanyUserProfile.objects.acreate(user=owner, company=company, role=CompanyUserProfile.Role.Owner)
     return payload('Company registered successfully.', 201, True, {
         'id': company.id, 'company_name': company.name, 'owner': owner.email, 'sector': sector.id,
     })
