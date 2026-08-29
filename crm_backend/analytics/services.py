@@ -48,16 +48,21 @@ async def get_company_stats(company) -> dict:
     task_count = await tasks.acount()
     completed_tasks = await tasks.filter(status=Task.STATUS.DONE).acount()
 
-    # The company owner has no CompanyUserProfile row (see company/models.py
-    # -- Company.owner is a direct OneToOneField), so member_count is every
-    # profile in this company plus the owner themself.
+    # A company registered since register_company started creating an Owner
+    # profile row has the owner counted in profile_count already; a company
+    # that predates that (no CompanyUserProfile row for its owner) needs the
+    # +1 so the owner still gets counted. See get_company_workload below for
+    # the same fallback applied to the actual member list.
     profile_count = await CompanyUserProfile.objects.filter(company=company).acount()
+    owner_has_profile = await CompanyUserProfile.objects.filter(
+        company=company, user_id=company.owner_id,
+    ).aexists()
 
     return {
         'project_count': project_count,
         'active_projects': active_projects,
         'completed_projects': completed_projects,
-        'member_count': profile_count + 1,
+        'member_count': profile_count if owner_has_profile else profile_count + 1,
         'task_count': task_count,
         'completed_tasks': completed_tasks,
     }
@@ -103,21 +108,29 @@ async def get_company_workload(company) -> list[dict]:
             'in_review_count': in_review,
         }
 
-    # The owner has no CompanyUserProfile row (see get_company_stats above),
-    # so they're assembled separately and always listed first.
     owner = await User.objects.aget(id=company.owner_id)
-    members = [{
-        'id': str(owner.id),
-        'first_name': owner.first_name,
-        'last_name': owner.last_name,
-        'username': owner.username,
-        'email': owner.email,
-        'role': CompanyUserProfile.Role.Owner,
-        'department': None,
-        'profile_picture_url': None,
-        'is_active': True,
-        **workload_fields(str(owner.id)),
-    }]
+    owner_has_profile = await CompanyUserProfile.objects.filter(
+        company=company, user_id=owner.id,
+    ).aexists()
+
+    members = []
+    if not owner_has_profile:
+        # Legacy company that predates register_company always creating an
+        # Owner profile row -- synthesize a placeholder so it still shows up.
+        # A company registered since then has a real row and is picked up
+        # naturally by the loop below instead.
+        members.append({
+            'id': str(owner.id),
+            'first_name': owner.first_name,
+            'last_name': owner.last_name,
+            'username': owner.username,
+            'email': owner.email,
+            'role': CompanyUserProfile.Role.Owner,
+            'department': None,
+            'profile_picture_url': None,
+            'is_active': True,
+            **workload_fields(str(owner.id)),
+        })
 
     profiles = CompanyUserProfile.objects.filter(company=company).select_related('user', 'department')
     async for profile in profiles:
@@ -139,6 +152,9 @@ async def get_company_workload(company) -> list[dict]:
             'is_active': profile.is_active,
             **workload_fields(str(profile.user_id)),
         })
+
+    # Owner listed first regardless of which branch produced their row.
+    members.sort(key=lambda m: m['id'] != str(owner.id))
     return members
 
 

@@ -103,6 +103,20 @@ class CompanyRegistrationSecurityTests(TestCase):
         company = Company.objects.get(name='Acme')
         self.assertEqual(company.owner_id, self.user.id)
 
+    def test_register_company_creates_an_owner_profile(self):
+        """The registering user must be a real CompanyUserProfile member
+        (role=Owner), not reachable only through Company.owner -- otherwise
+        they're invisible to any endpoint that lists members off that model."""
+        response = self.client.post(
+            '/api/v1/company/register/', {'name': 'Acme', 'sector': self.sector.id},
+            content_type='application/json', **auth_header(self.user),
+        )
+        self.assertEqual(response.status_code, 201)
+        company = Company.objects.get(name='Acme')
+        profile = CompanyUserProfile.objects.get(company=company, user=self.user)
+        self.assertEqual(profile.role, CompanyUserProfile.Role.Owner)
+        self.assertTrue(profile.is_active)
+
     def test_user_cannot_register_a_second_company(self):
         Company.objects.create(name='First', owner=self.user, sector=self.sector)
         response = self.client.post(
