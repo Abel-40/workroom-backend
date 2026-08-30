@@ -77,6 +77,8 @@ class CompanyUserProfile(UUIDModel):
     phone_number = models.CharField(max_length=20, default='Not provided')
     resume = models.FileField(upload_to='user_resume/', blank=True, null=True)
     profession = models.CharField(max_length=100,default='Not provided')
+    birthday = models.DateField(null=True, blank=True)
+    skype = models.CharField(max_length=100, blank=True, default='')
 
     created_at = models.DateTimeField(auto_now_add=True)
 

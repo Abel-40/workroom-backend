@@ -8,11 +8,13 @@ Notifications -> Analytics.
 """
 
 import json
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 from company.models import Sector
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
+from django.utils import timezone
 from notifications_and_activity.models import Notification
 from projects_and_tasks.models import Task
 from users.models import User
@@ -79,12 +81,17 @@ class V1AcceptanceJourneyTests(TestCase):
         member = User.objects.get(id=member_id)
 
         # 4. Project
-        project = self._post('/api/v1/projects/', {'title': f'Project {tag}', 'visibility': 'company'}, owner)
+        project = self._post('/api/v1/projects/', {
+            'title': f'Project {tag}', 'visibility': 'company',
+            'deadline': (timezone.now() + timedelta(days=365)).isoformat(),
+        }, owner)
         self.assertEqual(project.status_code, 201)
         project_id = project.json()['data']['project']['id']
 
         # 5. Manual task
-        task = self._post(f'/api/v1/projects/{project_id}/tasks/', {'title': f'Manual task {tag}'}, owner)
+        task = self._post(f'/api/v1/projects/{project_id}/tasks/', {
+            'title': f'Manual task {tag}', 'deadline': (timezone.now() + timedelta(days=30)).isoformat(),
+        }, owner)
         self.assertEqual(task.status_code, 201)
         task_id = task.json()['data']['task']['id']
 
@@ -92,18 +99,22 @@ class V1AcceptanceJourneyTests(TestCase):
         assign = self._post(f'/api/v1/tasks/{task_id}/assign/', {'assigned_to_id': member_id}, owner)
         self.assertEqual(assign.status_code, 200)
 
-        # 7. Kanban status updates (owner has manage rights; the last one
-        # completes the task, which notifies the creator since it wasn't
-        # self-assigned).
+        # 7. Kanban status update (assignee-only) into In Progress, then the
+        # assignee submits evidence and the creator approves it -- Done is
+        # only reachable through this approval workflow now, never a direct
+        # status PATCH (see projects_and_tasks.services.update_task_status).
         self.client.patch(
             f'/api/v1/tasks/{task_id}/status/', json.dumps({'status': 'In Progress'}),
-            content_type='application/json', **auth_header(owner),
+            content_type='application/json', **auth_header(member),
         )
-        done = self.client.patch(
-            f'/api/v1/tasks/{task_id}/status/', json.dumps({'status': 'Done'}),
-            content_type='application/json', **auth_header(owner),
+        submitted = self.client.post(
+            f'/api/v1/tasks/{task_id}/submit-for-approval/',
+            {'links': ['https://example.com/evidence']}, **auth_header(member),
         )
+        self.assertEqual(submitted.status_code, 202)
+        done = self.client.post(f'/api/v1/tasks/{task_id}/approve/', **auth_header(owner))
         self.assertEqual(done.status_code, 200)
+        self.assertEqual(done.json()['data']['task']['status'], 'Done')
 
         # 8. AI plan (Celery runs eagerly -- see conftest.py -- and the
         # FastAPI HTTP call is mocked, matching ai_agent/tests.py). Completion
@@ -125,9 +136,12 @@ class V1AcceptanceJourneyTests(TestCase):
         owner_notifications = self.client.get('/api/v1/notifications/', **auth_header(owner)).json()['data']['results']
         member_notifications = self.client.get('/api/v1/notifications/', **auth_header(member)).json()['data']['results']
         self.assertTrue(any(n['type'] == 'ai_generation_completed' for n in owner_notifications))
-        self.assertTrue(any(n['type'] == 'task_completed' for n in owner_notifications))
         self.assertTrue(any(n['type'] == 'invitation_accepted' for n in member_notifications))
         self.assertTrue(any(n['type'] == 'task_assigned' for n in member_notifications))
+        # Approval (step 7) notifies the submitting assignee, not the
+        # approving creator -- see notifications_and_activity.services
+        # .notify_task_approved.
+        self.assertTrue(any(n['type'] == 'task_approved' for n in member_notifications))
 
         # 11. Analytics
         project_stats = self.client.get(f'/api/v1/analytics/projects/{project_id}/', **auth_header(owner)).json()['data']

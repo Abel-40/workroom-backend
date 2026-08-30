@@ -19,12 +19,17 @@ from notifications_and_activity.services import (
     log_ownership_transferred,
     log_project_completed,
     log_project_created,
+    notify_project_auto_completed,
+    notify_project_deadline_extended,
+    notify_task_approved,
     notify_task_assigned,
-    notify_task_completed,
+    notify_task_deadline_extended,
+    notify_task_rejected,
+    notify_task_submitted_for_approval,
 )
 from users.models import CompanyUserProfile
 
-from .models import Attachment, DefaultTaskType, Project, Task, TaskType
+from .models import Attachment, DefaultTaskType, Project, Task, TaskApproval, TaskType
 
 User = get_user_model()
 
@@ -91,9 +96,32 @@ async def user_can_manage_task(user, task) -> bool:
 
 
 async def user_can_update_task_status(user, task) -> bool:
-    if task.assigned_to_id == user.id:
-        return True
-    return await user_can_manage_task(user, task)
+    """Assignee-only: Done/In Review are no longer reachable through this
+    direct status transition at all (see update_task_status) -- they're
+    only reachable via the approval workflow below (submit_task_for_approval
+    / approve_task / reject_task_approval)."""
+    return task.assigned_to_id == user.id
+
+
+async def user_can_approve_task(user, task) -> bool:
+    """Who may approve/reject a task's submitted evidence: the task's
+    creator, or -- if that creator has since left the company (created_by
+    is NULL after SET_NULL) -- the project's current owner, then the
+    project's own creator."""
+    if task.created_by_id is not None:
+        return task.created_by_id == user.id
+    project = task.project
+    if project.current_owner_id is not None:
+        return project.current_owner_id == user.id
+    return project.created_by_id == user.id
+
+
+async def user_can_extend_deadline(user, project) -> bool:
+    """Deadline extension is narrower than user_can_manage_project: only the
+    project's creator qualifies -- current owner, company owner/manager, and
+    department leader do not. Used for both a project's own deadline and any
+    of its tasks' deadlines (see extend_task_deadline/extend_project_deadline)."""
+    return project.created_by_id == user.id
 
 
 # --------------------------------------------------------------------------
@@ -195,6 +223,16 @@ async def update_project(user, project, updates: dict):
     if not await user_can_manage_project(user, project):
         return None, 'forbidden'
     was_done = project.status == Project.STATUS.DONE
+    if 'status' in updates:
+        new_status = updates['status']
+        if new_status == Project.STATUS.DONE and not was_done:
+            total = await project.tasks.filter(is_deleted=False).acount()
+            if total == 0:
+                return None, 'no_tasks'
+            if await project.tasks.filter(is_deleted=False).exclude(status=Task.STATUS.DONE).aexists():
+                return None, 'tasks_incomplete'
+        if was_done and new_status != Project.STATUS.DONE and user.id != project.created_by_id:
+            return None, 'forbidden_revert'
     if 'department_id' in updates:
         department, error = await _resolve_department(project.company, updates.pop('department_id'))
         if error:
@@ -346,6 +384,8 @@ async def create_task(user, project, *, title, description, priority, deadline, 
     requires management rights via user_can_manage_task."""
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
+    if deadline >= project.deadline:
+        return None, 'invalid_deadline'
     department, error = await _resolve_department(project.company, department_id)
     if error:
         return None, error
@@ -366,6 +406,8 @@ async def create_task(user, project, *, title, description, priority, deadline, 
 async def update_task(user, task, updates: dict):
     if not await user_can_manage_task(user, task):
         return None, 'forbidden'
+    if 'deadline' in updates and updates['deadline'] >= task.project.deadline:
+        return None, 'invalid_deadline'
     if 'department_id' in updates:
         department, error = await _resolve_department(task.project.company, updates.pop('department_id'))
         if error:
@@ -455,15 +497,18 @@ async def assign_task(user, task, assignee_id):
 
 
 async def update_task_status(user, task, status):
+    """Kanban drag-and-drop transitions for To Do/In Progress only. Done and
+    In Review are never reachable here -- they're only reached via the
+    approval workflow (submit_task_for_approval sets In Review; approve_task
+    sets Done) so an evidence trail always exists behind a completed task."""
     if not await user_can_update_task_status(user, task):
         return None, 'forbidden'
     if status not in Task.STATUS.values:
         return None, 'invalid_status'
-    was_done = task.status == Task.STATUS.DONE
+    if status in (Task.STATUS.DONE, Task.STATUS.IN_REVIEW):
+        return None, 'invalid_transition'
     task.status = status
     await task.asave(update_fields=['status', 'updated_at'])
-    if status == Task.STATUS.DONE and not was_done:
-        await sync_to_async(notify_task_completed, thread_sensitive=True)(task)
     return task, None
 
 
@@ -473,6 +518,188 @@ async def archive_task(user, task) -> bool:
     task.is_deleted = True
     await task.asave(update_fields=['is_deleted'])
     return True
+
+
+# --------------------------------------------------------------------------
+# Task approval workflow -- evidence submission, approve/reject, and the
+# deadline-extension actions that are narrower than general project
+# management (see user_can_approve_task/user_can_extend_deadline above).
+# --------------------------------------------------------------------------
+
+def _maybe_auto_complete_project(project):
+    """Flips a project to Done automatically once every one of its own
+    (non-deleted) tasks is Done. Never fires for a zero-task project -- an
+    empty project can never be considered "complete," matching the same
+    rule update_project enforces for a manual Done set. Sync, not async:
+    called via sync_to_async from approve_task, same convention as the rest
+    of this module's notification/activity side-effects."""
+    if project.status == Project.STATUS.DONE:
+        return
+    tasks_qs = Task.objects.filter(project=project, is_deleted=False)
+    if tasks_qs.count() == 0:
+        return
+    if tasks_qs.exclude(status=Task.STATUS.DONE).exists():
+        return
+    project.status = Project.STATUS.DONE
+    project.save(update_fields=['status', 'updated_at'])
+    log_project_completed(project)
+    notify_project_auto_completed(project)
+
+
+async def submit_task_for_approval(user, task, *, files=None, links=None, page_ids=None):
+    """Assignee-only: submits evidence (any mix of uploaded files, external
+    links, and Info Portal pages) for the task's approver to review. Moves
+    the task to In Review. Returns (approval, error) where error is one of
+    'forbidden', 'invalid_status' (task isn't In Progress), 'already_pending'
+    (an unresolved approval already exists), 'deadline_passed', 'no_evidence',
+    'invalid_content_type', 'too_large', 'invalid_page', or None."""
+    if task.assigned_to_id != user.id:
+        return None, 'forbidden'
+    if task.status != Task.STATUS.IN_PROGRESS:
+        return None, 'invalid_status'
+    if await TaskApproval.objects.filter(task=task, status=TaskApproval.STATUS.PENDING).aexists():
+        return None, 'already_pending'
+    if task.deadline < timezone.now():
+        return None, 'deadline_passed'
+
+    files = files or []
+    links = links or []
+    page_ids = page_ids or []
+    if not files and not links and not page_ids:
+        return None, 'no_evidence'
+
+    for uploaded_file in files:
+        if uploaded_file.size > MAX_DOCUMENT_SIZE_BYTES:
+            return None, 'too_large'
+        if (uploaded_file.content_type or '') not in ALLOWED_DOCUMENT_CONTENT_TYPES:
+            return None, 'invalid_content_type'
+
+    pages = []
+    if page_ids:
+        from pages.models import Page  # local import: projects_and_tasks stays independent of pages at module load
+
+        pages = [
+            page async for page in
+            Page.objects.filter(id__in=page_ids, folder__company=task.project.company, is_deleted=False)
+        ]
+        if len(pages) != len(set(page_ids)):
+            return None, 'invalid_page'
+
+    approval = await TaskApproval.objects.acreate(task=task, submitted_by=user)
+    to_create = []
+    for uploaded_file in files:
+        to_create.append(Attachment(
+            project=task.project, task=task, approval=approval, uploaded_by=user,
+            type=Attachment.ATTACHMENT_TYPE.FILE, file=uploaded_file, name=uploaded_file.name[:255],
+            content_type=uploaded_file.content_type or '', size=uploaded_file.size,
+        ))
+    for url in links:
+        to_create.append(Attachment(
+            project=task.project, task=task, approval=approval, uploaded_by=user,
+            type=Attachment.ATTACHMENT_TYPE.LINK, url=url, name=str(url)[:255],
+        ))
+    for page in pages:
+        to_create.append(Attachment(
+            project=task.project, task=task, approval=approval, uploaded_by=user,
+            type=Attachment.ATTACHMENT_TYPE.PAGE, page=page, name=page.title[:255],
+        ))
+    if to_create:
+        await Attachment.objects.abulk_create(to_create)
+
+    task.status = Task.STATUS.IN_REVIEW
+    await task.asave(update_fields=['status', 'updated_at'])
+    await sync_to_async(notify_task_submitted_for_approval, thread_sensitive=True)(approval)
+    return approval, None
+
+
+async def approve_task(user, task):
+    """Approver-only (see user_can_approve_task). Sets the task Done and
+    auto-completes the parent project when eligible. Returns (task, error)
+    where error is 'forbidden', 'no_pending_approval', or None."""
+    if not await user_can_approve_task(user, task):
+        return None, 'forbidden'
+    approval = await TaskApproval.objects.filter(
+        task=task, status=TaskApproval.STATUS.PENDING,
+    ).order_by('-submitted_at').afirst()
+    if approval is None:
+        return None, 'no_pending_approval'
+
+    approval.status = TaskApproval.STATUS.APPROVED
+    approval.decided_by = user
+    approval.decided_at = timezone.now()
+    await approval.asave(update_fields=['status', 'decided_by', 'decided_at'])
+
+    task.status = Task.STATUS.DONE
+    await task.asave(update_fields=['status', 'updated_at'])
+
+    await sync_to_async(notify_task_approved, thread_sensitive=True)(approval)
+    await sync_to_async(_maybe_auto_complete_project, thread_sensitive=True)(task.project)
+    return task, None
+
+
+async def reject_task_approval(user, task, comment: str):
+    """Approver-only. A rejection comment is required and is visible only to
+    the original submitter -- enforced in the API serialization layer (see
+    api.routers.tasks), never returned to anyone else. Sets the task back to
+    In Progress so the assignee can rework and resubmit. Returns
+    (task, error) where error is 'forbidden', 'comment_required',
+    'no_pending_approval', or None."""
+    if not await user_can_approve_task(user, task):
+        return None, 'forbidden'
+    if not comment or not comment.strip():
+        return None, 'comment_required'
+    approval = await TaskApproval.objects.filter(
+        task=task, status=TaskApproval.STATUS.PENDING,
+    ).order_by('-submitted_at').afirst()
+    if approval is None:
+        return None, 'no_pending_approval'
+
+    approval.status = TaskApproval.STATUS.REJECTED
+    approval.decided_by = user
+    approval.decided_at = timezone.now()
+    approval.rejection_comment = comment
+    await approval.asave(update_fields=['status', 'decided_by', 'decided_at', 'rejection_comment'])
+
+    task.status = Task.STATUS.IN_PROGRESS
+    await task.asave(update_fields=['status', 'updated_at'])
+
+    await sync_to_async(notify_task_rejected, thread_sensitive=True)(approval)
+    return task, None
+
+
+async def extend_task_deadline(user, task, new_deadline):
+    """Project-creator-only (narrower than general project management -- see
+    user_can_extend_deadline), extend-only: the new deadline must be later
+    than the task's current one, and must still land strictly before the
+    project's own deadline (the same invariant enforced at task creation).
+    Returns (task, error) where error is 'forbidden', 'not_an_extension',
+    'exceeds_project_deadline', or None."""
+    if not await user_can_extend_deadline(user, task.project):
+        return None, 'forbidden'
+    if new_deadline <= task.deadline:
+        return None, 'not_an_extension'
+    if new_deadline >= task.project.deadline:
+        return None, 'exceeds_project_deadline'
+    old_deadline = task.deadline
+    task.deadline = new_deadline
+    await task.asave(update_fields=['deadline', 'updated_at'])
+    await sync_to_async(notify_task_deadline_extended, thread_sensitive=True)(task, old_deadline, new_deadline)
+    return task, None
+
+
+async def extend_project_deadline(user, project, new_deadline):
+    """Project-creator-only, extend-only -- see extend_task_deadline above
+    for the matching task-level action. Returns (project, error) where
+    error is 'forbidden', 'not_an_extension', or None."""
+    if not await user_can_extend_deadline(user, project):
+        return None, 'forbidden'
+    if new_deadline <= project.deadline:
+        return None, 'not_an_extension'
+    old_deadline = project.deadline
+    project.deadline = new_deadline
+    await project.asave(update_fields=['deadline', 'updated_at'])
+    await sync_to_async(notify_project_deadline_extended, thread_sensitive=True)(project, old_deadline, new_deadline)
+    return project, None
 
 
 # --------------------------------------------------------------------------
@@ -558,7 +785,11 @@ def persist_ai_generated_tasks(generation):
             title=row.title, description=row.description, priority=row.priority, sequence=row.sequence,
             estimated_time=_parse_estimated_effort(row.estimated_effort), assigned_to=assignee,
             created_by=generation.requested_by, source=Task.SOURCE.AI_GENERATED,
-            deadline=project.deadline,
+            # Must be strictly before the project's own deadline (see
+            # create_task/update_task's matching validation for
+            # manually-created tasks) -- an hour's buffer is a safe default
+            # a human can extend later via extend_task_deadline.
+            deadline=project.deadline - timedelta(hours=1),
         ))
 
     with transaction.atomic():

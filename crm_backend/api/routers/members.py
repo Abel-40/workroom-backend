@@ -9,12 +9,15 @@ id) before touching anything, exactly like every other mutation in this API.
 """
 
 import mimetypes
+from datetime import date
 from typing import Literal
 from uuid import UUID
 
 from asgiref.sync import sync_to_async
 from django.http import FileResponse
-from ninja import Router, Schema
+from ninja import File, Router, Schema
+from ninja.files import UploadedFile
+from pydantic import Field
 from users import services
 from utils.api_response import api_response as payload
 
@@ -51,6 +54,16 @@ class NotificationPreferenceIn(Schema):
 
 class TimezonePreferenceIn(Schema):
     timezone: str
+
+
+class MemberProfileUpdateIn(Schema):
+    """All fields optional/partial -- see users.services.update_own_profile."""
+
+    profession: str | None = Field(default=None, max_length=100)
+    address: str | None = Field(default=None, max_length=200)
+    phone_number: str | None = Field(default=None, max_length=20)
+    birthday: date | None = None
+    skype: str | None = Field(default=None, max_length=100)
 
 
 def _member_data(profile) -> dict:
@@ -223,3 +236,62 @@ async def update_timezone(request, data: TimezonePreferenceIn):
             errors={'timezone': ['Must be a valid IANA timezone name']},
         )
     return payload('Timezone updated successfully.', 200, True, {'timezone': user.timezone})
+
+
+def _profile_fields_data(profile) -> dict:
+    return {
+        'profession': profile.profession,
+        'address': profile.address,
+        'phone_number': profile.phone_number,
+        'birthday': profile.birthday.isoformat() if profile.birthday else None,
+        'skype': profile.skype,
+        'has_resume': bool(profile.resume),
+    }
+
+
+@router.patch(
+    '/me/profile/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse},
+)
+async def update_own_profile(request, data: MemberProfileUpdateIn):
+    profile, error = await services.update_own_profile(request.auth, data.model_dump(exclude_unset=True))
+    if error == 'forbidden':
+        return payload('You do not belong to a company.', 400, False)
+    if error == 'no_profile':
+        return payload('The company owner has no profile to update.', 400, False)
+    return payload('Profile updated successfully.', 200, True, {'profile': _profile_fields_data(profile)})
+
+
+@router.post(
+    '/me/profile/resume/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse},
+)
+async def upload_own_resume(request, resume: UploadedFile = File(...)):
+    profile, error = await services.upload_own_resume(request.auth, resume)
+    if error == 'forbidden':
+        return payload('You do not belong to a company.', 400, False)
+    if error == 'no_profile':
+        return payload('The company owner has no profile to attach a resume to.', 400, False)
+    if error == 'too_large':
+        return payload('Resume exceeds the maximum allowed size (5MB).', 400, False)
+    if error == 'invalid_content_type':
+        return payload('Resume must be a PDF or Word document.', 400, False)
+    return payload('Resume uploaded successfully.', 200, True, {'profile': _profile_fields_data(profile)})
+
+
+@router.get(
+    '/me/profile/resume/', auth=auth,
+    response={400: ApiResponse, 404: ApiResponse},
+)
+async def download_own_resume(request):
+    profile, error = await services.get_own_resume(request.auth)
+    if error == 'forbidden':
+        return payload('You do not belong to a company.', 400, False)
+    if error == 'not_found':
+        return payload('No resume has been uploaded.', 404, False)
+    content_type = mimetypes.guess_type(profile.resume.name)[0] or 'application/octet-stream'
+    file_handle = await sync_to_async(profile.resume.open, thread_sensitive=True)('rb')
+    return FileResponse(
+        file_handle, as_attachment=True, filename=profile.resume.name.rsplit('/', 1)[-1],
+        content_type=content_type,
+    )

@@ -18,6 +18,14 @@ TYPE_CATEGORY = {
     Notification.Type.TASK_COMPLETED: Notification.Category.OPTIONAL,
     Notification.Type.INVITATION_ACCEPTED: Notification.Category.OPTIONAL,
     Notification.Type.AI_GENERATION_COMPLETED: Notification.Category.OPTIONAL,
+    # Both put the ball back in someone's court -- an approver has evidence
+    # waiting, an assignee has rework to do -- same actionable/time-sensitive
+    # posture as TASK_ASSIGNED above.
+    Notification.Type.TASK_SUBMITTED_FOR_APPROVAL: Notification.Category.CRITICAL,
+    Notification.Type.TASK_REJECTED: Notification.Category.CRITICAL,
+    Notification.Type.TASK_APPROVED: Notification.Category.OPTIONAL,
+    Notification.Type.DEADLINE_EXTENDED: Notification.Category.OPTIONAL,
+    Notification.Type.PROJECT_AUTO_COMPLETED: Notification.Category.OPTIONAL,
 }
 
 
@@ -102,6 +110,91 @@ def notify_ai_generation_failed(generation):
         f"AI plan failed for '{generation.project.title}'",
         message='We could not create this AI plan right now. Please try again in a few minutes.',
         related_object_type='ai_generation', related_object_id=generation.id,
+    )
+
+
+def notify_task_submitted_for_approval(approval):
+    """Tells the task's approver (see projects_and_tasks.services
+    .user_can_approve_task for who that is) that evidence is waiting for
+    their review."""
+    task = approval.task
+    approver_id = task.created_by_id or task.project.current_owner_id or task.project.created_by_id
+    if approver_id is None:
+        return
+    from users.models import User
+
+    approver = User.objects.filter(id=approver_id).first()
+    _create(
+        approver, Notification.Type.TASK_SUBMITTED_FOR_APPROVAL,
+        f"'{task.title}' was submitted for your approval",
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_task_approved(approval):
+    """Tells the assignee who submitted the evidence that it was approved
+    and the task is now Done."""
+    if approval.submitted_by_id is None:
+        return
+    task = approval.task
+    _create(
+        approval.submitted_by, Notification.Type.TASK_APPROVED,
+        f"Your submission for '{task.title}' was approved",
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_task_rejected(approval):
+    """Tells the assignee who submitted the evidence that it was rejected
+    and the task is back in progress. The rejection comment itself is
+    deliberately NOT included here -- it's returned only via the
+    GET /tasks/{id}/approvals/ endpoint, and only to this same recipient
+    (see api.routers.tasks' redaction rule)."""
+    if approval.submitted_by_id is None:
+        return
+    task = approval.task
+    _create(
+        approval.submitted_by, Notification.Type.TASK_REJECTED,
+        f"Your submission for '{task.title}' needs changes",
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_task_deadline_extended(task, old_deadline, new_deadline):
+    """Tells the assignee their task's deadline moved."""
+    if task.assigned_to_id is None:
+        return
+    _create(
+        task.assigned_to, Notification.Type.DEADLINE_EXTENDED,
+        f"Deadline extended for '{task.title}'",
+        message=f"New deadline: {new_deadline.isoformat()}.",
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_project_deadline_extended(project, old_deadline, new_deadline):
+    """Tells the project's current owner (the person accountable for
+    delivery day-to-day) its deadline moved."""
+    if project.current_owner_id is None:
+        return
+    _create(
+        project.current_owner, Notification.Type.DEADLINE_EXTENDED,
+        f"Deadline extended for '{project.title}'",
+        message=f"New deadline: {new_deadline.isoformat()}.",
+        related_object_type='project', related_object_id=project.id,
+    )
+
+
+def notify_project_auto_completed(project):
+    """Tells the project's current owner that every task landed Done and the
+    project was automatically marked complete."""
+    if project.current_owner_id is None:
+        return
+    _create(
+        project.current_owner, Notification.Type.PROJECT_AUTO_COMPLETED,
+        f"Project '{project.title}' was automatically marked complete",
+        message='Every task in this project is now Done.',
+        related_object_type='project', related_object_id=project.id,
     )
 
 

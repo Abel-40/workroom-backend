@@ -47,6 +47,11 @@ class Notification(UUIDModel):
         INVITATION_ACCEPTED = 'invitation_accepted', 'Invitation Accepted'
         AI_GENERATION_COMPLETED = 'ai_generation_completed', 'AI Generation Completed'
         AI_GENERATION_FAILED = 'ai_generation_failed', 'AI Generation Failed'
+        TASK_SUBMITTED_FOR_APPROVAL = 'task_submitted_for_approval', 'Task Submitted For Approval'
+        TASK_APPROVED = 'task_approved', 'Task Approved'
+        TASK_REJECTED = 'task_rejected', 'Task Rejected'
+        DEADLINE_EXTENDED = 'deadline_extended', 'Deadline Extended'
+        PROJECT_AUTO_COMPLETED = 'project_auto_completed', 'Project Auto-Completed'
 
     class Category(models.TextChoices):
         CRITICAL = 'critical', 'Critical'

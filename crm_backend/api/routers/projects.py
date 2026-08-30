@@ -21,6 +21,7 @@ from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
 from ..auth import JWTBearerAuth
 from ..schemas import ApiResponse
+from .tasks import DeadlineExtendIn
 
 router = Router(tags=['projects'])
 auth = JWTBearerAuth()
@@ -154,6 +155,12 @@ async def update_project(request, project_id: UUID, data: ProjectUpdateIn):
     updated, error = await services.update_project(request.auth, project, data.model_dump(exclude_unset=True))
     if error == 'forbidden':
         return payload('You do not have permission to modify this project.', 403, False)
+    if error == 'forbidden_revert':
+        return payload('Only the project creator can reactivate a completed project.', 403, False)
+    if error == 'no_tasks':
+        return payload('A project with no tasks cannot be marked Done.', 400, False)
+    if error == 'tasks_incomplete':
+        return payload('All tasks must be Done before the project can be marked Done.', 400, False)
     if error in ('invalid_department', 'invalid_team'):
         return payload('Invalid department or team for this company.', 400, False)
     if error == 'invalid_collaborator':
@@ -317,3 +324,23 @@ async def list_eligible_assignees(request, project_id: UUID):
             'open_task_count': open_counts.get(str(user.id), 0),
         })
     return payload('Eligible assignees retrieved successfully.', 200, True, {'results': results})
+
+
+@router.post(
+    '/{project_id}/extend-deadline/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def extend_project_deadline(request, project_id: UUID, data: DeadlineExtendIn):
+    """Project-creator-only, extend-only -- see
+    projects_and_tasks.services.user_can_extend_deadline."""
+    project, error = await services.get_project_for_user(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    updated, error = await services.extend_project_deadline(request.auth, project, data.deadline)
+    if error == 'forbidden':
+        return payload('Only the project creator can extend the deadline.', 403, False)
+    if error == 'not_an_extension':
+        return payload('The new deadline must be later than the current one.', 400, False)
+    return payload('Project deadline extended.', 200, True, {'project': await project_data(updated)})

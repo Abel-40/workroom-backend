@@ -5,9 +5,11 @@ tests do.
 """
 
 import json
+from datetime import timedelta
 from unittest.mock import patch
 
 from api.tests import TwoCompanyTestCase, auth_header
+from django.utils import timezone
 from users.models import CompanyUserProfile, User
 
 from notifications_and_activity.models import CompanyActivity, Notification
@@ -28,13 +30,33 @@ class CompanyActivityTests(TwoCompanyTestCase):
         ).exists())
 
     def test_completing_a_project_logs_an_activity_entry_exactly_once(self):
+        # A zero-task project can never reach Done (see
+        # projects_and_tasks.services.update_project), so this needs one
+        # task taken all the way to Done via the approval workflow first --
+        # which also auto-completes the project and logs PROJECT_COMPLETED
+        # exactly once via _maybe_auto_complete_project.
         project = self.create_project(owner=self.owner_a)
-        patch_body = json.dumps({'status': 'Done'})
-        self.client.patch(
-            f"/api/v1/projects/{project['id']}/", patch_body, content_type='application/json',
-            **auth_header(self.owner_a),
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Only task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
         )
-        # Saving the same Done status again must not log a second completion.
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+
+        # Re-saving the (already-Done) project again must not log a second
+        # completion.
         self.client.patch(
             f"/api/v1/projects/{project['id']}/", json.dumps({'description': 'still done'}),
             content_type='application/json', **auth_header(self.owner_a),
@@ -145,7 +167,7 @@ class NotificationEmailCategoryTests(TwoCompanyTestCase):
     recipient's CompanyUserProfile.email_notifications_enabled preference."""
 
     def create_task(self, project_id, owner=None, **overrides):
-        body = {'title': 'Build login page'}
+        body = {'title': 'Build login page', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}
         body.update(overrides)
         return self.client.post(
             f'/api/v1/projects/{project_id}/tasks/', json.dumps(body), content_type='application/json',
@@ -170,25 +192,36 @@ class NotificationEmailCategoryTests(TwoCompanyTestCase):
 
     @patch('notifications_and_activity.tasks.send_notification_email_task.delay')
     def test_optional_notification_skips_email_when_preference_disabled(self, mock_delay):
-        # member_a creates the task; owner_a is assigned and completes it, so
-        # the (optional) TASK_COMPLETED notification goes to member_a, whose
-        # preference is disabled below.
+        # owner_a creates the task; member_a is assigned, submits evidence,
+        # and owner_a (the creator) approves it, so the (optional)
+        # TASK_APPROVED notification goes to member_a -- the submitter, not
+        # the approver -- whose preference is disabled below.
         profile = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
         profile.email_notifications_enabled = False
         profile.save(update_fields=['email_notifications_enabled'])
 
         project = self.create_project(owner=self.owner_a)
-        task = self.create_task(project['id'], owner=self.member_a)
+        # A second, still-open task keeps the project from auto-completing
+        # when the one under test is approved below -- auto-completion would
+        # fire its own (optional) notification to owner_a and confuse this
+        # test's "zero emails" assertion with an unrelated one.
+        self.create_task(project['id'], owner=self.owner_a, title='Other open task')
+        task = self.create_task(project['id'], owner=self.owner_a)
         self.client.post(
-            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.owner_a.id)}),
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
             content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
         )
         mock_delay.reset_mock()
-        self.client.patch(
-            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}),
-            content_type='application/json', **auth_header(self.owner_a),
-        )
-        notification = Notification.objects.get(recipient=self.member_a, type=Notification.Type.TASK_COMPLETED)
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        notification = Notification.objects.get(recipient=self.member_a, type=Notification.Type.TASK_APPROVED)
         self.assertEqual(notification.category, Notification.Category.OPTIONAL)
         mock_delay.assert_not_called()
 
@@ -196,17 +229,26 @@ class NotificationEmailCategoryTests(TwoCompanyTestCase):
     def test_optional_notification_enqueues_email_when_preference_enabled(self, mock_delay):
         # member_a's preference defaults to enabled (True).
         project = self.create_project(owner=self.owner_a)
-        task = self.create_task(project['id'], owner=self.member_a)
+        # See the matching comment in test_optional_notification_skips_email_
+        # when_preference_disabled above -- keeps the project from
+        # auto-completing and firing an extra, unrelated notification.
+        self.create_task(project['id'], owner=self.owner_a, title='Other open task')
+        task = self.create_task(project['id'], owner=self.owner_a)
         self.client.post(
-            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.owner_a.id)}),
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
             content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
         )
         mock_delay.reset_mock()
-        self.client.patch(
-            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}),
-            content_type='application/json', **auth_header(self.owner_a),
-        )
-        notification = Notification.objects.get(recipient=self.member_a, type=Notification.Type.TASK_COMPLETED)
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        notification = Notification.objects.get(recipient=self.member_a, type=Notification.Type.TASK_APPROVED)
         mock_delay.assert_called_once_with(str(notification.id))
 
 
