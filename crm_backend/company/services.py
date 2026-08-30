@@ -118,6 +118,13 @@ def get_company_role_sync(user, company: Company) -> str | None:
     return profile.role if profile else None
 
 
+def get_member_department_id_sync(user, company: Company):
+    if company.owner_id == user.id:
+        return None
+    profile = CompanyUserProfile.objects.filter(user=user, company=company, is_active=True).first()
+    return profile.department_id if profile else None
+
+
 def is_company_member_sync(user, company: Company) -> bool:
     if company.owner_id == user.id:
         return True

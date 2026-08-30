@@ -13,7 +13,7 @@ from django.utils import timezone
 from ninja import File, Router, Schema
 from ninja.files import UploadedFile
 from projects_and_tasks import services
-from projects_and_tasks.models import Project, Task
+from projects_and_tasks.models import Project, ProjectVisibilityRequest, Task
 from pydantic import Field, HttpUrl
 from users.models import CompanyUserProfile
 from utils.api_response import api_response as payload
@@ -76,6 +76,9 @@ async def project_data(project: Project) -> dict:
     completed_tasks = await project.tasks.filter(is_deleted=False, status=Task.STATUS.DONE).acount()
     collaborator_ids = [str(user_id) async for user_id in project.collaborators.values_list('id', flat=True)]
     has_saved_plan = await AIGeneration.objects.filter(project=project, saved_at__isnull=False).aexists()
+    has_pending_visibility_request = await ProjectVisibilityRequest.objects.filter(
+        project=project, status=ProjectVisibilityRequest.STATUS.PENDING,
+    ).aexists()
     return {
         'id': str(project.id),
         'title': project.title,
@@ -99,6 +102,7 @@ async def project_data(project: Project) -> dict:
         'collaborator_ids': collaborator_ids,
         'image': _project_image_data(project),
         'has_saved_plan': has_saved_plan,
+        'has_pending_visibility_request': has_pending_visibility_request,
     }
 
 
@@ -123,6 +127,21 @@ async def create_project(request, data: ProjectIn):
             'Invalid collaborator for this company.', 400, False,
             errors={'collaborator_ids': ['One or more users are not members of this company']},
         )
+    if error == 'invalid_start_date':
+        return payload(
+            'The start date cannot be in the past.', 400, False,
+            errors={'start_date': ['Must not be in the past']},
+        )
+    if error == 'invalid_deadline':
+        return payload(
+            'The deadline cannot be in the past.', 400, False,
+            errors={'deadline': ['Must not be in the past']},
+        )
+    if error == 'department_locked':
+        return payload(
+            "Your department is fixed to your own -- you can't create a project in another department.", 400, False,
+            errors={'department_id': ['Must be your own department']},
+        )
     return payload('Project created successfully.', 201, True, {'project': await project_data(project)})
 
 
@@ -133,6 +152,20 @@ async def list_projects(request, page: int = 1, page_size: int = DEFAULT_PAGE_SI
     return payload('Projects retrieved successfully.', 200, True, {
         'results': [await project_data(project) for project in items], 'meta': meta,
     })
+
+
+@router.get('/visibility-requests/', auth=auth, response={200: ApiResponse})
+async def list_visibility_requests(request):
+    """Pending requests the caller may review -- see
+    services.list_visibility_requests_for_user for the department-scoping
+    rule. Registered before get_project below: both are GET /projects/<segment>/,
+    and Django's resolver takes the first pattern that matches a segment,
+    so this literal route must come first or "visibility-requests" gets
+    swallowed as if it were a project_id (a 422, not a 404, since Ninja
+    validates the UUID type after routing already matched)."""
+    queryset = await services.list_visibility_requests_for_user(request.auth)
+    requests = [_visibility_request_data(item) async for item in queryset]
+    return payload('Visibility requests retrieved successfully.', 200, True, {'results': requests})
 
 
 @router.get('/{project_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -167,6 +200,16 @@ async def update_project(request, project_id: UUID, data: ProjectUpdateIn):
         return payload(
             'Invalid collaborator for this company.', 400, False,
             errors={'collaborator_ids': ['One or more users are not members of this company']},
+        )
+    if error == 'department_locked':
+        return payload(
+            "Your department is fixed to your own -- you can't move this project to another department.",
+            400, False, errors={'department_id': ['Must be your own department']},
+        )
+    if error == 'visibility_locked':
+        return payload(
+            'Department Members cannot change project visibility directly -- request department visibility '
+            'instead, or ask your Department Leader to raise it.', 403, False,
         )
     return payload('Project updated successfully.', 200, True, {'project': await project_data(updated)})
 
@@ -344,3 +387,86 @@ async def extend_project_deadline(request, project_id: UUID, data: DeadlineExten
     if error == 'not_an_extension':
         return payload('The new deadline must be later than the current one.', 400, False)
     return payload('Project deadline extended.', 200, True, {'project': await project_data(updated)})
+
+
+# --------------------------------------------------------------------------
+# Visibility escalation requests (A7) -- see projects_and_tasks.services'
+# visibility-escalation section for the full authorization model.
+# --------------------------------------------------------------------------
+
+def _visibility_request_data(request) -> dict:
+    return {
+        'id': str(request.id),
+        'project_id': str(request.project_id),
+        'project_title': request.project.title,
+        'requested_by_id': str(request.requested_by_id) if request.requested_by_id else None,
+        'requested_by_name': request.requested_by.username if request.requested_by_id else None,
+        'requested_visibility': request.requested_visibility,
+        'status': request.status,
+        'decided_by_id': str(request.decided_by_id) if request.decided_by_id else None,
+        'decided_at': request.decided_at.isoformat() if request.decided_at else None,
+        'decision_comment': request.decision_comment,
+        'created_at': request.created_at.isoformat(),
+    }
+
+
+class VisibilityRequestIn(Schema):
+    visibility: VisibilityLiteral
+
+
+@router.post(
+    '/{project_id}/visibility-requests/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def create_visibility_request(request, project_id: UUID, data: VisibilityRequestIn):
+    project, error = await services.get_project_for_user(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    created, error = await services.request_visibility_change(request.auth, project, data.visibility)
+    if error == 'forbidden':
+        return payload('Only this project\'s creator may request a visibility change.', 403, False)
+    if error == 'invalid_target':
+        return payload(
+            'You can only request department visibility for your own private project.', 400, False,
+        )
+    if error == 'already_pending':
+        return payload('This project already has a pending visibility request.', 400, False)
+    return payload('Visibility request submitted.', 201, True, {'request': _visibility_request_data(created)})
+
+
+class VisibilityDecisionIn(Schema):
+    comment: str = Field(default='', max_length=1000)
+
+
+@router.post(
+    '/visibility-requests/{request_id}/approve/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def approve_visibility_request(request, request_id: UUID):
+    visibility_request, error = await services.get_visibility_request_for_user(request.auth, request_id)
+    if error == 'not_found':
+        return payload('Visibility request not found.', 404, False)
+    updated, error = await services.approve_visibility_request(request.auth, visibility_request)
+    if error == 'forbidden':
+        return payload('Only this project\'s department leader (or Owner/CM) may review this request.', 403, False)
+    if error == 'not_pending':
+        return payload('This request has already been decided.', 400, False)
+    return payload('Visibility request approved.', 200, True, {'request': _visibility_request_data(updated)})
+
+
+@router.post(
+    '/visibility-requests/{request_id}/deny/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def deny_visibility_request(request, request_id: UUID, data: VisibilityDecisionIn):
+    visibility_request, error = await services.get_visibility_request_for_user(request.auth, request_id)
+    if error == 'not_found':
+        return payload('Visibility request not found.', 404, False)
+    updated, error = await services.deny_visibility_request(request.auth, visibility_request, data.comment)
+    if error == 'forbidden':
+        return payload('Only this project\'s department leader (or Owner/CM) may review this request.', 403, False)
+    if error == 'not_pending':
+        return payload('This request has already been decided.', 400, False)
+    return payload('Visibility request denied.', 200, True, {'request': _visibility_request_data(updated)})

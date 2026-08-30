@@ -71,6 +71,44 @@ class Project(UUIDModel):
         return (completed / total) * 100
 
 
+class ProjectVisibilityRequest(UUIDModel):
+    """A Department Member's request to raise a private project to
+    department visibility -- see projects_and_tasks.services
+    .request_visibility_change/approve_visibility_request/deny_visibility_request.
+    Company-level visibility is deliberately out of a DM's reach through this
+    workflow: only a Department Leader (or Owner/CM) may raise a project to
+    company visibility, done directly via the ordinary project-update
+    endpoint, not through a request/approval cycle."""
+
+    class STATUS(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        DENIED = 'denied', 'Denied'
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='visibility_requests')
+    requested_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='visibility_requests', null=True)
+    requested_visibility = models.CharField(max_length=20, choices=Project.VISIBILITY.choices)
+    status = models.CharField(max_length=10, choices=STATUS.choices, default=STATUS.PENDING)
+    decided_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name='decided_visibility_requests', null=True, blank=True,
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_comment = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project'], condition=models.Q(status='pending'),
+                name='one_pending_visibility_request_per_project',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.project_id} -> {self.requested_visibility} ({self.status})"
+
+
 class Attachment(UUIDModel):
     class ATTACHMENT_TYPE(models.TextChoices):
         FILE = 'file', 'File'

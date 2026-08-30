@@ -9,10 +9,10 @@ import re
 from datetime import timedelta
 
 from asgiref.sync import sync_to_async
-from company.services import get_company_role, get_member_company, is_company_member
+from company.services import get_company_role, get_member_company, get_member_department_id, is_company_member
 from departments_and_teams.models import Department, Team
 from django.contrib.auth import get_user_model
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
 from notifications_and_activity.services import (
@@ -26,10 +26,13 @@ from notifications_and_activity.services import (
     notify_task_deadline_extended,
     notify_task_rejected,
     notify_task_submitted_for_approval,
+    notify_visibility_approved,
+    notify_visibility_denied,
+    notify_visibility_requested,
 )
 from users.models import CompanyUserProfile
 
-from .models import Attachment, DefaultTaskType, Project, Task, TaskApproval, TaskType
+from .models import Attachment, DefaultTaskType, Project, ProjectVisibilityRequest, Task, TaskApproval, TaskType
 
 User = get_user_model()
 
@@ -194,11 +197,36 @@ async def _resolve_collaborators(company, collaborator_ids):
     return users, None
 
 
+DEPARTMENT_SCOPED_ROLES = (CompanyUserProfile.Role.DEPARTMENT_LEADER, CompanyUserProfile.Role.DEPARTMENT_MEMBER)
+
+# A client clock a little ahead, or a start_date left to default to the
+# router's own timezone.now() a moment before this function runs, must not
+# get spuriously rejected as "in the past" -- only a date meaningfully
+# earlier than now counts.
+PAST_DATE_GRACE = timedelta(minutes=1)
+
+
 async def create_project(user, *, title, description, visibility, priority, start_date, deadline,
                           department_id=None, team_id=None, collaborator_ids=None):
     company = await get_member_company(user)
     if company is None:
         return None, 'no_company'
+    now = timezone.now()
+    if start_date < now - PAST_DATE_GRACE:
+        return None, 'invalid_start_date'
+    if deadline < now - PAST_DATE_GRACE:
+        return None, 'invalid_deadline'
+    role = await get_company_role(user, company)
+    if role in DEPARTMENT_SCOPED_ROLES:
+        own_department_id = await get_member_department_id(user, company)
+        if department_id != own_department_id:
+            return None, 'department_locked'
+    if role == CompanyUserProfile.Role.DEPARTMENT_MEMBER:
+        # A DM-created project starts private regardless of what visibility
+        # was requested -- department/company visibility is only reachable
+        # afterward through request_visibility_change (department) or a
+        # Department Leader/Owner/CM raising it directly (company). See A7.
+        visibility = Project.VISIBILITY.PRIVATE
     department, error = await _resolve_department(company, department_id)
     if error:
         return None, error
@@ -222,6 +250,20 @@ async def create_project(user, *, title, description, visibility, priority, star
 async def update_project(user, project, updates: dict):
     if not await user_can_manage_project(user, project):
         return None, 'forbidden'
+    role = await get_company_role(user, project.company)
+    if 'department_id' in updates and role in DEPARTMENT_SCOPED_ROLES:
+        # A DL/DM's own department is fixed at creation (see create_project)
+        # and stays fixed afterward too -- only Owner/CM may move a project
+        # to a different department post-creation.
+        return None, 'department_locked'
+    if (
+        'visibility' in updates and role == CompanyUserProfile.Role.DEPARTMENT_MEMBER
+        and updates['visibility'] != project.visibility
+    ):
+        # A DM can't change visibility directly at all, even downward --
+        # only request_visibility_change (department) or a Department
+        # Leader/Owner/CM acting directly (company) may move it. See A7.
+        return None, 'visibility_locked'
     was_done = project.status == Project.STATUS.DONE
     if 'status' in updates:
         new_status = updates['status']
@@ -257,6 +299,133 @@ async def update_project(user, project, updates: dict):
     if project.status == Project.STATUS.DONE and not was_done:
         await sync_to_async(log_project_completed, thread_sensitive=True)(project)
     return project, None
+
+
+# --------------------------------------------------------------------------
+# Visibility escalation (A7) -- a Department Member's project starts private
+# (see create_project) and can't be raised directly by them (see
+# update_project's visibility_locked check). This is their only path to
+# department visibility; company visibility is reachable only by a
+# Department Leader/Owner/CM acting directly through update_project, never
+# through this request/approval cycle.
+# --------------------------------------------------------------------------
+
+async def _resolve_visibility_reviewer(project):
+    """The department's own leader, or -- if it currently has none -- the
+    company owner, so a request is never left unreviewable by anyone."""
+    if project.department_id:
+        department = await Department.objects.select_related('leader').filter(id=project.department_id).afirst()
+        if department is not None and department.leader_id is not None:
+            return department.leader
+    return await User.objects.filter(id=project.company.owner_id).afirst()
+
+
+async def _can_review_visibility_request(user, project) -> bool:
+    """Same department-scoping as _can_manage_this_department: Owner/CM may
+    review any request, a Department Leader only their own department's."""
+    role = await get_company_role(user, project.company)
+    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
+        return True
+    if role == CompanyUserProfile.Role.DEPARTMENT_LEADER and project.department_id:
+        own_department_id = await get_member_department_id(user, project.company)
+        return own_department_id == project.department_id
+    return False
+
+
+async def request_visibility_change(user, project, target_visibility):
+    """A Department Member requests their own private project be raised to
+    department visibility. Returns (request, error) where error is
+    'forbidden', 'invalid_target', 'already_pending', or None."""
+    if project.created_by_id != user.id:
+        return None, 'forbidden'
+    role = await get_company_role(user, project.company)
+    if role != CompanyUserProfile.Role.DEPARTMENT_MEMBER:
+        return None, 'forbidden'
+    if target_visibility != Project.VISIBILITY.DEPARTMENT:
+        return None, 'invalid_target'
+    if project.visibility != Project.VISIBILITY.PRIVATE or project.department_id is None:
+        return None, 'invalid_target'
+    try:
+        request = await ProjectVisibilityRequest.objects.acreate(
+            project=project, requested_by=user, requested_visibility=target_visibility,
+        )
+    except IntegrityError:
+        return None, 'already_pending'
+    reviewer = await _resolve_visibility_reviewer(project)
+    await sync_to_async(notify_visibility_requested, thread_sensitive=True)(request, reviewer)
+    return request, None
+
+
+async def list_visibility_requests_for_user(user):
+    """Pending visibility requests the caller may review: Owner/CM see every
+    pending request company-wide; a Department Leader sees only their own
+    department's; anyone else sees none."""
+    company = await get_member_company(user)
+    if company is None:
+        return ProjectVisibilityRequest.objects.none()
+    role = await get_company_role(user, company)
+    qs = ProjectVisibilityRequest.objects.filter(
+        project__company=company, project__is_deleted=False, status=ProjectVisibilityRequest.STATUS.PENDING,
+    ).select_related('project', 'requested_by')
+    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
+        return qs.order_by('-created_at')
+    if role == CompanyUserProfile.Role.DEPARTMENT_LEADER:
+        own_department_id = await get_member_department_id(user, company)
+        if own_department_id is None:
+            return ProjectVisibilityRequest.objects.none()
+        return qs.filter(project__department_id=own_department_id).order_by('-created_at')
+    return ProjectVisibilityRequest.objects.none()
+
+
+async def get_visibility_request_for_user(user, request_id):
+    """Returns (request, error) where error is 'not_found' or None. Tenant
+    scoping only here -- review-authority scoping happens in
+    approve/deny_visibility_request so a 403 there is distinguishable from a
+    404 for something outside the caller's company entirely."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'not_found'
+    request = await ProjectVisibilityRequest.objects.select_related(
+        'project', 'project__company', 'project__department', 'requested_by',
+    ).filter(id=request_id, project__company=company).afirst()
+    if request is None:
+        return None, 'not_found'
+    return request, None
+
+
+async def approve_visibility_request(user, request):
+    """Returns (request, error) where error is 'forbidden', 'not_pending', or
+    None. Raises the project straight to department visibility."""
+    if request.status != ProjectVisibilityRequest.STATUS.PENDING:
+        return None, 'not_pending'
+    project = request.project
+    if not await _can_review_visibility_request(user, project):
+        return None, 'forbidden'
+    request.status = ProjectVisibilityRequest.STATUS.APPROVED
+    request.decided_by = user
+    request.decided_at = timezone.now()
+    await request.asave(update_fields=['status', 'decided_by', 'decided_at'])
+    project.visibility = request.requested_visibility
+    await project.asave(update_fields=['visibility'])
+    await sync_to_async(notify_visibility_approved, thread_sensitive=True)(request)
+    return request, None
+
+
+async def deny_visibility_request(user, request, comment=''):
+    """Returns (request, error) where error is 'forbidden', 'not_pending', or
+    None."""
+    if request.status != ProjectVisibilityRequest.STATUS.PENDING:
+        return None, 'not_pending'
+    project = request.project
+    if not await _can_review_visibility_request(user, project):
+        return None, 'forbidden'
+    request.status = ProjectVisibilityRequest.STATUS.DENIED
+    request.decided_by = user
+    request.decided_at = timezone.now()
+    request.decision_comment = comment
+    await request.asave(update_fields=['status', 'decided_by', 'decided_at', 'decision_comment'])
+    await sync_to_async(notify_visibility_denied, thread_sensitive=True)(request)
+    return request, None
 
 
 async def archive_project(user, project) -> bool:
@@ -384,6 +553,8 @@ async def create_task(user, project, *, title, description, priority, deadline, 
     requires management rights via user_can_manage_task."""
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
+    if deadline < timezone.now() - PAST_DATE_GRACE:
+        return None, 'invalid_deadline'
     if deadline >= project.deadline:
         return None, 'invalid_deadline'
     department, error = await _resolve_department(project.company, department_id)

@@ -211,7 +211,7 @@ CSRF_TRUSTED_ORIGINS = env('CSRF_TRUSTED_ORIGINS')
 # (api/api.py, users/tasks.py, users/services.py). Was previously read via
 # getattr(settings, 'FRONTEND_URL', ...) with no assignment here, so it was
 # silently always the hardcoded fallback regardless of .env -- fixed.
-FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:3000')
+FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:5173')
 
 # Stripe settings
 STRIPE_PUBLISHABLE_KEY = env('STRIPE_PUBLISHABLE_KEY')

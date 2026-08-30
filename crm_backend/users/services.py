@@ -8,7 +8,13 @@ from zoneinfo import available_timezones
 
 from analytics.services import get_member_workload
 from asgiref.sync import sync_to_async
-from company.services import get_company_role_sync, get_managed_company_sync, get_member_company, is_company_member_sync
+from company.services import (
+    get_company_role_sync,
+    get_managed_company_sync,
+    get_member_company,
+    get_member_department_id_sync,
+    is_company_member_sync,
+)
 from departments_and_teams.models import Department, Team
 from django.conf import settings
 from django.db import transaction
@@ -154,6 +160,18 @@ def _demote_leader_if_unneeded(company, user_id):
     ).update(role=CompanyUserProfile.Role.DEPARTMENT_MEMBER)
 
 
+def _can_manage_this_department_sync(requester, company, department) -> bool:
+    """Sync mirror of departments_and_teams.services._can_manage_this_department
+    -- a Department Leader's 'departments:manage' grant is company-wide at the
+    flat-permission level, so leadership changes must be additionally scoped
+    to the requester's own department here."""
+    requester_role = get_company_role_sync(requester, company)
+    if requester_role != CompanyUserProfile.Role.DEPARTMENT_LEADER:
+        return True
+    member_department_id = get_member_department_id_sync(requester, company)
+    return member_department_id is not None and member_department_id == department.id
+
+
 def set_department_leader(requester, department, new_leader_user_id):
     """Assign a company member as a department's leader. Returns
     (department, error) where error is 'forbidden', 'invalid_leader', or None.
@@ -171,6 +189,8 @@ def set_department_leader(requester, department, new_leader_user_id):
             return None, 'forbidden'
         requester_role = get_company_role_sync(requester, company)
         if not has_permission(requester_role, 'departments:manage'):
+            return None, 'forbidden'
+        if not _can_manage_this_department_sync(requester, company, department):
             return None, 'forbidden'
 
         new_leader = User.objects.filter(id=new_leader_user_id).first()
@@ -201,6 +221,8 @@ def revoke_department_leader(requester, department):
             return None, 'forbidden'
         requester_role = get_company_role_sync(requester, company)
         if not has_permission(requester_role, 'departments:manage'):
+            return None, 'forbidden'
+        if not _can_manage_this_department_sync(requester, company, department):
             return None, 'forbidden'
 
         previous_leader_id = department.leader_id

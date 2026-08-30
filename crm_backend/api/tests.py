@@ -300,6 +300,32 @@ class InvitationTokenSecurityTests(TestCase):
         self.assertEqual(profile.department_id, department.id)
         self.assertEqual(profile.role, CompanyUserProfile.Role.DEPARTMENT_LEADER)
 
+    def test_accepting_a_dl_invite_sets_the_department_leader_when_unset(self):
+        """A12: a department invited-as-DL should show as the department's
+        leader afterward, not 'no leader assigned'."""
+        department = Department.objects.create(name='Design', company=self.company)
+        raw_token = self.send_invite_and_get_raw_token(
+            email='leader@example.com', department=str(department.id), role='DL',
+        )
+        self.client.post('/api/v1/emp/accept_invite/', self.accept_payload(raw_token))
+        department.refresh_from_db()
+        self.assertEqual(department.leader.email, 'leader@example.com')
+
+    def test_accepting_a_dl_invite_does_not_override_an_existing_leader(self):
+        department = Department.objects.create(name='Design', company=self.company)
+        existing_leader = User.objects.create_user(
+            email='existing-leader@example.com', username='existing-leader', password='Kx9#mQ2vLp8Z',
+        )
+        department.leader = existing_leader
+        department.save(update_fields=['leader'])
+
+        raw_token = self.send_invite_and_get_raw_token(
+            email='leader@example.com', department=str(department.id), role='DL',
+        )
+        self.client.post('/api/v1/emp/accept_invite/', self.accept_payload(raw_token))
+        department.refresh_from_db()
+        self.assertEqual(department.leader_id, existing_leader.id)
+
     def test_expired_invite_is_deleted_before_a_new_invite_is_issued(self):
         self.send_invite_and_get_raw_token()
         expired = PendingInvite.objects.get(email='invitee@example.com')

@@ -162,6 +162,13 @@ def accept_invite_in_transaction(
             address=address.strip() or 'Not provided',
             profile_picture=profile_picture,
         )
+        if (
+            invite.role == CompanyUserProfile.Role.DEPARTMENT_LEADER
+            and invite.department_id is not None
+            and invite.department.leader_id is None
+        ):
+            invite.department.leader = user
+            invite.department.save(update_fields=['leader'])
         company = invite.company
         invite.delete()
         notify_invitation_accepted(user, company)
@@ -436,7 +443,7 @@ async def start_checkout(request, data: CheckoutIn):
             customer = await sync_to_async(stripe.Customer.retrieve, thread_sensitive=False)(
                 subscription.stripe_customer_id,
             )
-        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:3000').rstrip('/')
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
         session = await sync_to_async(stripe.checkout.Session.create, thread_sensitive=False)(
             customer=customer.id, payment_method_types=['card'],
             line_items=[{'price': plan.stripe_price_id, 'quantity': 1}], mode='subscription',

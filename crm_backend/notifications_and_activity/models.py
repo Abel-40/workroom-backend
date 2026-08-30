@@ -52,6 +52,9 @@ class Notification(UUIDModel):
         TASK_REJECTED = 'task_rejected', 'Task Rejected'
         DEADLINE_EXTENDED = 'deadline_extended', 'Deadline Extended'
         PROJECT_AUTO_COMPLETED = 'project_auto_completed', 'Project Auto-Completed'
+        VISIBILITY_REQUESTED = 'visibility_requested', 'Visibility Request'
+        VISIBILITY_APPROVED = 'visibility_approved', 'Visibility Request Approved'
+        VISIBILITY_DENIED = 'visibility_denied', 'Visibility Request Denied'
 
     class Category(models.TextChoices):
         CRITICAL = 'critical', 'Critical'

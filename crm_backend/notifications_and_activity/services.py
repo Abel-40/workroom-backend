@@ -26,6 +26,11 @@ TYPE_CATEGORY = {
     Notification.Type.TASK_APPROVED: Notification.Category.OPTIONAL,
     Notification.Type.DEADLINE_EXTENDED: Notification.Category.OPTIONAL,
     Notification.Type.PROJECT_AUTO_COMPLETED: Notification.Category.OPTIONAL,
+    # A pending request blocking someone else's work is actionable/time-sensitive;
+    # the requester learning the outcome is not.
+    Notification.Type.VISIBILITY_REQUESTED: Notification.Category.CRITICAL,
+    Notification.Type.VISIBILITY_APPROVED: Notification.Category.OPTIONAL,
+    Notification.Type.VISIBILITY_DENIED: Notification.Category.OPTIONAL,
 }
 
 
@@ -195,6 +200,47 @@ def notify_project_auto_completed(project):
         f"Project '{project.title}' was automatically marked complete",
         message='Every task in this project is now Done.',
         related_object_type='project', related_object_id=project.id,
+    )
+
+
+def notify_visibility_requested(request, reviewer):
+    """Tells the resolved reviewer (the department's leader, or -- if it has
+    none -- the company owner; see projects_and_tasks.services
+    .request_visibility_change) a Department Member is waiting on a
+    department-visibility decision. No stable FK for "who should review
+    this" exists on the request itself, since the department's leader can
+    change after the request is filed -- the caller resolves it fresh."""
+    if reviewer is None:
+        return
+    project = request.project
+    _create(
+        reviewer, Notification.Type.VISIBILITY_REQUESTED,
+        f"'{project.title}' requests department visibility",
+        message=f'Requested by {_actor_name(request.requested_by)}.',
+        related_object_type='project', related_object_id=project.id,
+    )
+
+
+def notify_visibility_approved(request):
+    """Tells the requester their department-visibility request was approved."""
+    if request.requested_by_id is None:
+        return
+    _create(
+        request.requested_by, Notification.Type.VISIBILITY_APPROVED,
+        f"'{request.project.title}' is now visible to your department",
+        related_object_type='project', related_object_id=request.project_id,
+    )
+
+
+def notify_visibility_denied(request):
+    """Tells the requester their department-visibility request was denied."""
+    if request.requested_by_id is None:
+        return
+    _create(
+        request.requested_by, Notification.Type.VISIBILITY_DENIED,
+        f"Your visibility request for '{request.project.title}' was denied",
+        message=request.decision_comment or '',
+        related_object_type='project', related_object_id=request.project_id,
     )
 
 
