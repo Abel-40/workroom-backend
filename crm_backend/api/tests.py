@@ -1600,3 +1600,87 @@ class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
             content_type='application/json', **auth_header(self.owner_b),
         )
         self.assertEqual(response.status_code, 403)
+
+
+class SelfServiceProfileTests(TwoCompanyTestCase):
+    """GET/PATCH /company/members/me/profile/ and the resume upload/download
+    pair -- self-service only, never another member's row."""
+
+    def test_get_own_profile_returns_fields(self):
+        response = self.client.get('/api/v1/company/members/me/profile/', **auth_header(self.member_a))
+        self.assertEqual(response.status_code, 200)
+        profile = response.json()['data']['profile']
+        self.assertIn('profession', profile)
+        self.assertIn('has_resume', profile)
+        self.assertFalse(profile['has_resume'])
+
+    def test_update_own_profile_partial_update(self):
+        response = self.client.patch(
+            '/api/v1/company/members/me/profile/', json.dumps({'profession': 'Backend Engineer', 'skype': 'me.skype'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        profile = response.json()['data']['profile']
+        self.assertEqual(profile['profession'], 'Backend Engineer')
+        self.assertEqual(profile['skype'], 'me.skype')
+        # Untouched field survives the partial update.
+        db_profile = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
+        self.assertEqual(db_profile.phone_number, 'Not provided')
+
+    def test_owner_with_no_profile_row_gets_no_profile_error(self):
+        response = self.client.get('/api/v1/company/members/me/profile/', **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['message'], 'The company owner has no profile.')
+
+    def test_upload_resume_accepts_pdf(self):
+        resume = SimpleUploadedFile('cv.pdf', b'%PDF-1.4 fake', content_type='application/pdf')
+        response = self.client.post(
+            '/api/v1/company/members/me/profile/resume/', {'resume': resume}, **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['data']['profile']['has_resume'])
+
+    def test_upload_resume_rejects_wrong_content_type(self):
+        resume = SimpleUploadedFile('cv.png', b'not-a-resume', content_type='image/png')
+        response = self.client.post(
+            '/api/v1/company/members/me/profile/resume/', {'resume': resume}, **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_upload_resume_rejects_oversized_file(self):
+        resume = SimpleUploadedFile('cv.pdf', b'x' * (5 * 1024 * 1024 + 1), content_type='application/pdf')
+        response = self.client.post(
+            '/api/v1/company/members/me/profile/resume/', {'resume': resume}, **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_download_resume_requires_a_resume_to_exist(self):
+        response = self.client.get('/api/v1/company/members/me/profile/resume/', **auth_header(self.member_a))
+        self.assertEqual(response.status_code, 404)
+
+    def test_download_resume_after_upload(self):
+        resume = SimpleUploadedFile('cv.pdf', b'%PDF-1.4 fake', content_type='application/pdf')
+        self.client.post('/api/v1/company/members/me/profile/resume/', {'resume': resume}, **auth_header(self.member_a))
+        response = self.client.get('/api/v1/company/members/me/profile/resume/', **auth_header(self.member_a))
+        self.assertEqual(response.status_code, 200)
+
+    def test_profile_update_is_scoped_to_the_caller_own_row(self):
+        """A second member's PATCH must never touch member_a's row -- there's
+        no target-user parameter at all, so this proves it's truly
+        self-only, not just permission-checked against some target."""
+        other_member = User.objects.create_user(
+            email='other-member-a@example.com', username='other-member-a', password='Kx9#mQ2vLp8Z',
+        )
+        CompanyUserProfile.objects.create(
+            user=other_member, company=self.company_a, role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+        self.client.patch(
+            '/api/v1/company/members/me/profile/', json.dumps({'profession': 'Hacked'}),
+            content_type='application/json', **auth_header(other_member),
+        )
+        untouched = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
+        self.assertNotEqual(untouched.profession, 'Hacked')
+
+    def test_requires_authentication(self):
+        response = self.client.get('/api/v1/company/members/me/profile/')
+        self.assertEqual(response.status_code, 401)

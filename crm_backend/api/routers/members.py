@@ -249,6 +249,19 @@ def _profile_fields_data(profile) -> dict:
     }
 
 
+@router.get(
+    '/me/profile/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse},
+)
+async def get_own_profile(request):
+    profile, error = await services.get_own_profile(request.auth)
+    if error == 'forbidden':
+        return payload('You do not belong to a company.', 400, False)
+    if error == 'no_profile':
+        return payload('The company owner has no profile.', 400, False)
+    return payload('Profile retrieved successfully.', 200, True, {'profile': _profile_fields_data(profile)})
+
+
 @router.patch(
     '/me/profile/', auth=auth,
     response={200: ApiResponse, 400: ApiResponse},

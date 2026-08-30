@@ -488,6 +488,20 @@ ALLOWED_RESUME_CONTENT_TYPES = {
 }
 
 
+async def get_own_profile(user):
+    """Self-service: fetch the caller's own CompanyUserProfile fields, e.g.
+    to hydrate a profile-edit form. Returns (profile, error) where error is
+    'forbidden' (no company) or 'no_profile' (the company owner has no
+    profile row), or None."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'forbidden'
+    profile = await CompanyUserProfile.objects.filter(user=user, company=company).afirst()
+    if profile is None:
+        return None, 'no_profile'
+    return profile, None
+
+
 async def update_own_profile(user, updates: dict):
     """Self-service: a member updates their own CompanyUserProfile fields.
     Returns (profile, error) where error is 'forbidden' (no company) or
