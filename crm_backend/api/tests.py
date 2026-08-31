@@ -19,7 +19,7 @@ from django.test import TestCase
 from django.utils import timezone
 from notifications_and_activity.models import Notification
 from pages.models import Page, PageFolder
-from projects_and_tasks.models import Task
+from projects_and_tasks.models import Project, Task
 from rest_framework_simplejwt.tokens import RefreshToken
 from users.models import CompanyUserProfile, PendingInvite, User
 
@@ -981,6 +981,70 @@ class ProjectDoneRulesTests(TwoCompanyTestCase):
         CompanyUserProfile.objects.create(user=manager, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER)
         revert = self.set_status(project['id'], 'Active', user=manager)
         self.assertEqual(revert.status_code, 403)
+
+    def test_cannot_add_a_task_to_a_completed_project(self):
+        """B5: a new (not-Done) task would silently break the "all tasks
+        Done" invariant Done represents, and would also let anyone who can
+        merely add tasks bypass the creator-only revert-from-Done rule
+        tested above."""
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Only task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        self.set_status(project['id'], 'Done')
+
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Sneaked in', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Project.objects.get(id=project['id']).tasks.filter(is_deleted=False).count(), 1)
+
+    def test_can_add_a_task_again_after_reopening(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Only task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        self.set_status(project['id'], 'Done')
+        self.set_status(project['id'], 'Active')
+
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Back in business', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 201)
 
 
 class DocumentSecurityTests(TwoCompanyTestCase):

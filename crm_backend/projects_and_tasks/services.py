@@ -556,6 +556,13 @@ async def create_task(user, project, *, title, description, priority, deadline, 
     requires management rights via user_can_manage_task."""
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
+    if project.status == Project.STATUS.DONE:
+        # A new (necessarily not-Done) task would silently break the "all
+        # tasks Done" invariant Done itself represents, and letting anyone
+        # who can merely view the project add one would be a backdoor around
+        # update_project's creator-only revert-from-Done restriction (B5).
+        # Reopening has to stay that explicit, creator-only action.
+        return None, 'project_completed'
     if deadline < timezone.now() - PAST_DATE_GRACE:
         return None, 'invalid_deadline'
     if deadline >= project.deadline:

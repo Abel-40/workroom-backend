@@ -110,6 +110,10 @@ async def create_task(request, project_id: UUID, data: TaskIn):
             "The task deadline must be before the project's deadline.", 400, False,
             errors={'deadline': ['Must be earlier than the project deadline']},
         )
+    if error == 'project_completed':
+        return payload(
+            'This project is marked Done -- reopen it before adding new tasks.', 400, False,
+        )
     if error:
         return payload('Invalid department, task type, or assignee for this company.', 400, False, errors={error: ['Invalid value']})
     return payload('Task created successfully.', 201, True, {'task': task_data(task)})
