@@ -31,6 +31,9 @@ TYPE_CATEGORY = {
     Notification.Type.VISIBILITY_REQUESTED: Notification.Category.CRITICAL,
     Notification.Type.VISIBILITY_APPROVED: Notification.Category.OPTIONAL,
     Notification.Type.VISIBILITY_DENIED: Notification.Category.OPTIONAL,
+    Notification.Type.PROJECT_COMPLETED: Notification.Category.OPTIONAL,
+    Notification.Type.PROJECT_REOPENED: Notification.Category.OPTIONAL,
+    Notification.Type.PROJECT_OWNERSHIP_TRANSFERRED: Notification.Category.OPTIONAL,
 }
 
 
@@ -244,6 +247,44 @@ def notify_visibility_denied(request):
     )
 
 
+def notify_project_completed(project, actor):
+    """Tells the project's current owner it was manually marked complete --
+    skipped when the actor IS the current owner (A10: no self-notification).
+    Distinct from notify_project_auto_completed's wording since this is a
+    deliberate action, not every-task-landed-Done automation."""
+    if project.current_owner_id is None or project.current_owner_id == actor.id:
+        return
+    _create(
+        project.current_owner, Notification.Type.PROJECT_COMPLETED,
+        f"Project '{project.title}' was marked complete",
+        related_object_type='project', related_object_id=project.id,
+    )
+
+
+def notify_project_reopened(project, actor):
+    """Tells the project's current owner it was reopened -- skipped when the
+    actor IS the current owner (A10)."""
+    if project.current_owner_id is None or project.current_owner_id == actor.id:
+        return
+    _create(
+        project.current_owner, Notification.Type.PROJECT_REOPENED,
+        f"Project '{project.title}' was reopened",
+        related_object_type='project', related_object_id=project.id,
+    )
+
+
+def notify_project_ownership_transferred(project, new_owner, actor):
+    """Tells the new owner they now own this project -- skipped when the
+    actor transferred it to themself (A10)."""
+    if new_owner.id == actor.id:
+        return
+    _create(
+        new_owner, Notification.Type.PROJECT_OWNERSHIP_TRANSFERRED,
+        f"You are now the owner of '{project.title}'",
+        related_object_type='project', related_object_id=project.id,
+    )
+
+
 # --------------------------------------------------------------------------
 # Company activity feed -- a curated, company-wide event log. Deliberately
 # not one entry per minor field edit; only the ActivityType values below are
@@ -271,10 +312,23 @@ def log_project_created(project):
     )
 
 
-def log_project_completed(project):
+def log_project_completed(project, actor=None):
+    """actor defaults to current_owner for the auto-complete path (see
+    _maybe_auto_complete_project), where no real human actor performed the
+    triggering action -- the manual-completion path passes the real actor
+    explicitly instead of misattributing it to whoever the current owner
+    happens to be (B8)."""
     log_activity(
-        project.company, project.current_owner, CompanyActivity.ActivityType.PROJECT_COMPLETED,
+        project.company, actor or project.current_owner, CompanyActivity.ActivityType.PROJECT_COMPLETED,
         f"Project '{project.title}' was completed",
+        related_object_type='project', related_object_id=project.id,
+    )
+
+
+def log_project_reopened(project, actor):
+    log_activity(
+        project.company, actor, CompanyActivity.ActivityType.PROJECT_REOPENED,
+        f"{_actor_name(actor)} reopened project '{project.title}'",
         related_object_type='project', related_object_id=project.id,
     )
 

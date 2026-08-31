@@ -14,6 +14,7 @@ from users.models import CompanyUserProfile, User
 
 from notifications_and_activity.models import CompanyActivity, Notification
 from notifications_and_activity.tasks import send_notification_email_task
+from projects_and_tasks.models import Project
 
 
 class CompanyActivityTests(TwoCompanyTestCase):
@@ -318,3 +319,100 @@ class NotificationFilterTests(TwoCompanyTestCase):
         results = response.json()['data']['results']
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]['title'], 'A')
+
+
+class ProjectLifecycleNotificationTests(TwoCompanyTestCase):
+    """B8: notification/activity coverage for project ownership transfer and
+    reopening, which previously had none at all -- and confirms the A10
+    self-notification rule holds for both (the acting owner never gets
+    notified of their own action)."""
+
+    def notifications_for(self, user):
+        return self.client.get('/api/v1/notifications/', **auth_header(user)).json()['data']['results']
+
+    def test_new_owner_is_notified_of_ownership_transfer(self):
+        project = self.create_project(owner=self.owner_a)
+        self.client.patch(
+            f"/api/v1/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        titles = [n['title'] for n in self.notifications_for(self.member_a)]
+        self.assertTrue(any('owner' in t.lower() for t in titles))
+
+    def test_transferring_to_self_is_a_noop_and_sends_no_notification(self):
+        project = self.create_project(owner=self.owner_a)
+        self.client.patch(
+            f"/api/v1/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.owner_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(Notification.objects.filter(recipient=self.owner_a).count(), 0)
+
+    def _complete_only_task(self, project, actor):
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Only task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(actor),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(actor.id)}),
+            content_type='application/json', **auth_header(actor),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(actor),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(actor),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(actor))
+
+    def test_reopening_notifies_a_different_current_owner_and_logs_activity(self):
+        project = self.create_project(owner=self.owner_a)
+        self._complete_only_task(project, self.owner_a)
+        # project auto-completed the instant the last task was approved
+        self.assertEqual(Project.objects.get(id=project['id']).status, Project.STATUS.DONE)
+        self.client.patch(
+            f"/api/v1/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        Notification.objects.all().delete()  # clear the transfer notification, isolate the reopen one
+
+        response = self.client.patch(
+            f"/api/v1/projects/{project['id']}/", json.dumps({'status': 'Active'}),
+            content_type='application/json', **auth_header(self.owner_a),  # creator, not current_owner anymore
+        )
+        self.assertEqual(response.status_code, 200)
+        titles = [n['title'] for n in self.notifications_for(self.member_a)]
+        self.assertTrue(any('reopen' in t.lower() for t in titles))
+        self.assertTrue(
+            CompanyActivity.objects.filter(
+                company=self.company_a, type=CompanyActivity.ActivityType.PROJECT_REOPENED,
+            ).exists()
+        )
+
+    def test_reopening_your_own_project_sends_no_self_notification(self):
+        project = self.create_project(owner=self.owner_a)
+        self._complete_only_task(project, self.owner_a)
+        self.client.patch(
+            f"/api/v1/projects/{project['id']}/", json.dumps({'status': 'Active'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        reopen_notifs = [
+            n for n in self.notifications_for(self.owner_a)
+            if n['type'] == Notification.Type.PROJECT_REOPENED
+        ]
+        self.assertEqual(reopen_notifs, [])
+
+    def test_creating_a_task_with_an_assignee_notifies_them(self):
+        project = self.create_project(owner=self.owner_a)
+        self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({
+                'title': 'Pre-assigned', 'deadline': (timezone.now() + timedelta(days=30)).isoformat(),
+                'assigned_to_id': str(self.member_a.id),
+            }),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        titles = [n['title'] for n in self.notifications_for(self.member_a)]
+        self.assertTrue(any('assigned' in t.lower() for t in titles))

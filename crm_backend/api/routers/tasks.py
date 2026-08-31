@@ -114,6 +114,11 @@ async def create_task(request, project_id: UUID, data: TaskIn):
         return payload(
             'This project is marked Done -- reopen it before adding new tasks.', 400, False,
         )
+    if error == 'ineligible_assignee':
+        return payload(
+            "That person isn't eligible for this project (outside its department/team).", 400, False,
+            errors={'assigned_to_id': ['Not eligible for this project']},
+        )
     if error:
         return payload('Invalid department, task type, or assignee for this company.', 400, False, errors={error: ['Invalid value']})
     return payload('Task created successfully.', 201, True, {'task': task_data(task)})

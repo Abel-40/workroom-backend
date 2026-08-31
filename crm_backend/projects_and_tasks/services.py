@@ -19,8 +19,12 @@ from notifications_and_activity.services import (
     log_ownership_transferred,
     log_project_completed,
     log_project_created,
+    log_project_reopened,
     notify_project_auto_completed,
+    notify_project_completed,
     notify_project_deadline_extended,
+    notify_project_ownership_transferred,
+    notify_project_reopened,
     notify_task_approved,
     notify_task_assigned,
     notify_task_deadline_extended,
@@ -297,7 +301,13 @@ async def update_project(user, project, updates: dict):
     if collaborators is not None:
         await sync_to_async(project.collaborators.set, thread_sensitive=True)(collaborators)
     if project.status == Project.STATUS.DONE and not was_done:
-        await sync_to_async(log_project_completed, thread_sensitive=True)(project)
+        await sync_to_async(log_project_completed, thread_sensitive=True)(project, user)
+        await sync_to_async(notify_project_completed, thread_sensitive=True)(project, user)
+    elif was_done and project.status != Project.STATUS.DONE:
+        # B8: reopening (creator-only, see forbidden_revert above) had no
+        # activity/notification trail at all -- asymmetric with completion.
+        await sync_to_async(log_project_reopened, thread_sensitive=True)(project, user)
+        await sync_to_async(notify_project_reopened, thread_sensitive=True)(project, user)
     return project, None
 
 
@@ -452,6 +462,7 @@ async def transfer_project_ownership(user, project, new_owner_id):
     project.current_owner = new_owner
     await project.asave(update_fields=['current_owner'])
     await sync_to_async(log_ownership_transferred, thread_sensitive=True)(project, user, previous_owner, new_owner)
+    await sync_to_async(notify_project_ownership_transferred, thread_sensitive=True)(project, new_owner, user)
     return project, None
 
 
@@ -576,11 +587,23 @@ async def create_task(user, project, *, title, description, priority, deadline, 
     assignee, error = await _resolve_assignee(project.company, assigned_to_id)
     if error:
         return None, error
+    if assignee is not None:
+        # Same eligibility scoping as assign_task (B4) -- otherwise a DL/DM
+        # could bypass it by setting the assignee at creation instead of
+        # through the separate assign endpoint.
+        role = await get_company_role(user, project.company)
+        if role in DEPARTMENT_SCOPED_ROLES and not await is_eligible_assignee(user, project, assignee):
+            return None, 'ineligible_assignee'
     task = await Task.objects.acreate(
         project=project, department=department, task_type=task_type, assigned_to=assignee,
         title=title, description=description, priority=priority, deadline=deadline,
         estimated_time=estimated_time, created_by=user, source=Task.SOURCE.MANUAL,
     )
+    if assignee is not None:
+        # B8: create_task previously never notified an assignee set at
+        # creation time, unlike assign_task's separate reassignment path --
+        # inconsistent for what's the same outcome (you were assigned to X).
+        await sync_to_async(notify_task_assigned, thread_sensitive=True)(task)
     return task, None
 
 

@@ -19,6 +19,7 @@ class CompanyActivity(UUIDModel):
         MEMBER_REMOVED = 'member_removed', 'Member Removed'
         DEPARTMENT_CREATED = 'department_created', 'Department Created'
         TEAM_CREATED = 'team_created', 'Team Created'
+        PROJECT_REOPENED = 'project_reopened', 'Project Reopened'
 
     company = models.ForeignKey('company.Company', on_delete=models.CASCADE, related_name='activities')
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='+')
@@ -55,6 +56,9 @@ class Notification(UUIDModel):
         VISIBILITY_REQUESTED = 'visibility_requested', 'Visibility Request'
         VISIBILITY_APPROVED = 'visibility_approved', 'Visibility Request Approved'
         VISIBILITY_DENIED = 'visibility_denied', 'Visibility Request Denied'
+        PROJECT_COMPLETED = 'project_completed', 'Project Completed'
+        PROJECT_REOPENED = 'project_reopened', 'Project Reopened'
+        PROJECT_OWNERSHIP_TRANSFERRED = 'project_ownership_transferred', 'Project Ownership Transferred'
 
     class Category(models.TextChoices):
         CRITICAL = 'critical', 'Critical'
