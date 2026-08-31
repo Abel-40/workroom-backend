@@ -44,7 +44,7 @@ async def get_company_stats(company) -> dict:
     active_projects = await projects.filter(status=Project.STATUS.ACTIVE).acount()
     completed_projects = await projects.filter(status=Project.STATUS.DONE).acount()
 
-    tasks = Task.objects.filter(project__company=company, is_deleted=False)
+    tasks = Task.objects.filter(project__company=company, project__is_deleted=False, is_deleted=False)
     task_count = await tasks.acount()
     completed_tasks = await tasks.filter(status=Task.STATUS.DONE).acount()
 
@@ -78,7 +78,7 @@ async def get_company_workload(company) -> list[dict]:
     than one query per member."""
     counts_by_user: dict[str, dict[str, int]] = {}
     counts_qs = (
-        Task.objects.filter(project__company=company, is_deleted=False)
+        Task.objects.filter(project__company=company, project__is_deleted=False, is_deleted=False)
         .exclude(status=Task.STATUS.DONE)
         .exclude(assigned_to__isnull=True)
         .values('assigned_to', 'status')
@@ -156,7 +156,7 @@ async def get_department_stats(company) -> list[dict]:
     departments = Department.objects.filter(company=company).order_by('name')
     async for department in departments:
         project_count = await Project.objects.filter(department=department, is_deleted=False).acount()
-        tasks = Task.objects.filter(department=department, is_deleted=False)
+        tasks = Task.objects.filter(department=department, is_deleted=False, project__is_deleted=False)
         task_count = await tasks.acount()
         completed_task_count = await tasks.filter(status=Task.STATUS.DONE).acount()
         member_count = await CompanyUserProfile.objects.filter(department=department).acount()
@@ -177,7 +177,7 @@ async def get_member_workload(company, user) -> dict:
     counts recomputed just to show one person's."""
     counts_by_status: dict[str, int] = {}
     counts_qs = (
-        Task.objects.filter(project__company=company, is_deleted=False, assigned_to=user)
+        Task.objects.filter(project__company=company, project__is_deleted=False, is_deleted=False, assigned_to=user)
         .exclude(status=Task.STATUS.DONE)
         .values('status')
         .annotate(count=Count('id'))

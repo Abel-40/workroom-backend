@@ -518,8 +518,11 @@ async def get_viewable_project(user, project_id):
 
 
 async def get_task_for_user(user, task_id):
+    # project__is_deleted=False: an archived project's tasks are otherwise
+    # still individually reachable (and mutable) by a direct task id, since
+    # archive_project never cascades is_deleted onto its tasks -- see B2.
     task = await Task.objects.select_related('project', 'project__company', 'department', 'assigned_to').filter(
-        id=task_id, is_deleted=False,
+        id=task_id, is_deleted=False, project__is_deleted=False,
     ).afirst()
     if task is None:
         return None, 'not_found'
@@ -1035,8 +1038,10 @@ async def upload_document(user, project, uploaded_file, *, label='', task_id=Non
 
 
 async def get_document_for_user(user, document_id):
+    # project__is_deleted=False: see get_task_for_user's comment -- the same
+    # gap applies to documents (B2).
     document = await Attachment.objects.select_related('project', 'project__company').filter(
-        id=document_id, is_deleted=False,
+        id=document_id, is_deleted=False, project__is_deleted=False,
     ).afirst()
     if document is None:
         return None, 'not_found'

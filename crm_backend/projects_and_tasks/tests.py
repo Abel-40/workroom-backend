@@ -593,3 +593,61 @@ class VisibilityEscalationTests(TwoCompanyTestCase):
         response = self.client.get('/api/v1/projects/visibility-requests/', **auth_header(self.dl))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.json()['data']['results']), 1)
+
+
+class ProjectDeletionCascadeTests(TwoCompanyTestCase):
+    """B2: archiving a project (Project.is_deleted=True) must not leave its
+    tasks/documents individually reachable (or mutable) by direct id, and
+    must not leave them counted in company/workload/department stats --
+    archive_project never cascades is_deleted onto children, so every
+    by-id/aggregate lookup has to filter project__is_deleted itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.create_project()
+        self.task = self.client.post(
+            f"/api/v1/projects/{self.project['id']}/tasks/",
+            json.dumps({'title': 'Doomed task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.document = self.client.post(
+            f"/api/v1/projects/{self.project['id']}/documents/",
+            {'file': SimpleUploadedFile('spec.txt', b'doomed doc', content_type='text/plain'), 'label': 'Spec'},
+            **auth_header(self.owner_a),
+        ).json()['data']['document']
+        # Assign before deletion so the workload-aggregate test below can
+        # verify the count drops to 0 once the project is archived, not just
+        # that assignment itself 404s afterward.
+        self.client.post(
+            f"/api/v1/tasks/{self.task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.delete(f"/api/v1/projects/{self.project['id']}/", **auth_header(self.owner_a))
+
+    def test_task_is_unreachable_by_direct_id_after_project_deletion(self):
+        response = self.client.get(f"/api/v1/tasks/{self.task['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 404)
+
+    def test_task_cannot_be_mutated_by_direct_id_after_project_deletion(self):
+        response = self.client.patch(
+            f"/api/v1/tasks/{self.task['id']}/", json.dumps({'title': 'still editable?'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_document_is_unreachable_by_direct_id_after_project_deletion(self):
+        response = self.client.get(f"/api/v1/documents/{self.document['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 404)
+
+    def test_document_download_is_unreachable_after_project_deletion(self):
+        response = self.client.get(f"/api/v1/documents/{self.document['id']}/download/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 404)
+
+    def test_company_stats_excludes_deleted_projects_tasks(self):
+        response = self.client.get('/api/v1/analytics/company/', **auth_header(self.owner_a))
+        self.assertEqual(response.json()['data']['task_count'], 0)
+
+    def test_company_workload_excludes_deleted_projects_tasks(self):
+        response = self.client.get('/api/v1/analytics/company/members/', **auth_header(self.owner_a))
+        member_row = next(m for m in response.json()['data']['members'] if m['id'] == str(self.member_a.id))
+        self.assertEqual(member_row['active_task_count'], 0)
