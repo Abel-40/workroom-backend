@@ -560,7 +560,15 @@ class VisibilityEscalationTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_department_leader_can_raise_to_company_directly(self):
+        """A still-private project is outside a DL's general view/manage
+        reach (user_can_view_project's private branch is collaborators-only)
+        -- the DL's oversight is scoped through the request/approve path
+        below, which doesn't require it. Only once the DL has approved it to
+        department visibility can they manage it directly like any other
+        department-visible project, including raising it further."""
         project = self._dm_project()
+        req = self._request_department_visibility(project)
+        self.client.post(f'/api/v1/projects/visibility-requests/{req.id}/approve/', **auth_header(self.dl))
         response = self.client.patch(
             f"/api/v1/projects/{project['id']}/", json.dumps({'visibility': 'company'}),
             content_type='application/json', **auth_header(self.dl),
