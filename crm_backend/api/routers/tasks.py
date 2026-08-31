@@ -200,6 +200,11 @@ async def assign_task(request, task_id: UUID, data: TaskAssignIn):
         return payload('You do not have permission to assign this task.', 403, False)
     if error == 'invalid_assignee':
         return payload('The selected user is not a member of this company.', 400, False, errors={'assigned_to_id': ['Not eligible']})
+    if error == 'ineligible_assignee':
+        return payload(
+            "That person isn't eligible for this project (outside its department/team).", 400, False,
+            errors={'assigned_to_id': ['Not eligible for this project']},
+        )
     return payload('Task assigned successfully.', 200, True, {'task': task_data(updated)})
 
 

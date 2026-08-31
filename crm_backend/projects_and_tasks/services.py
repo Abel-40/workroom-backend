@@ -663,6 +663,15 @@ async def assign_task(user, task, assignee_id):
     assignee, error = await _resolve_assignee(task.project.company, assignee_id)
     if error:
         return None, error
+    if assignee is not None:
+        # list_eligible_assignees' department/team branches are a curated
+        # subset (they don't include the Owner/CM unless literally a member
+        # of that department), not a security boundary for a manage_any
+        # role -- so only DL/DM assignment is actually restricted to it,
+        # matching every other department-scoped check this session (B4).
+        role = await get_company_role(user, task.project.company)
+        if role in DEPARTMENT_SCOPED_ROLES and not await is_eligible_assignee(user, task.project, assignee):
+            return None, 'ineligible_assignee'
     task.assigned_to = assignee
     await task.asave(update_fields=['assigned_to', 'updated_at'])
     if assignee is not None:

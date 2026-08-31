@@ -651,3 +651,54 @@ class ProjectDeletionCascadeTests(TwoCompanyTestCase):
         response = self.client.get('/api/v1/analytics/company/members/', **auth_header(self.owner_a))
         member_row = next(m for m in response.json()['data']['members'] if m['id'] == str(self.member_a.id))
         self.assertEqual(member_row['active_task_count'], 0)
+
+
+class TaskAssignmentEligibilityTests(TwoCompanyTestCase):
+    """B4: list_eligible_assignees' department/team scoping is a curated
+    subset that doesn't include Owner/CM unless they happen to be a member
+    of that department -- so it's only actually enforced for a DL/DM
+    assigner (a manage_any role stays unrestricted, same as every other
+    department-scoped check this session)."""
+
+    def setUp(self):
+        super().setUp()
+        self.marketing = Department.objects.create(name='Marketing', company=self.company_a)
+        self.dl = User.objects.create_user(email='dl@example.com', username='dl', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=self.dl, company=self.company_a, department=self.department_a,
+            role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        )
+        self.outside_member = User.objects.create_user(
+            email='outside@example.com', username='outside', password='Kx9#mQ2vLp8Z',
+        )
+        CompanyUserProfile.objects.create(
+            user=self.outside_member, company=self.company_a, department=self.marketing,
+            role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+        self.project = self.create_project(department_id=str(self.department_a.id))
+        self.task = self.client.post(
+            f"/api/v1/projects/{self.project['id']}/tasks/",
+            json.dumps({'title': 'Scoped task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+
+    def test_dl_cannot_assign_to_a_member_outside_the_projects_department(self):
+        response = self.client.post(
+            f"/api/v1/tasks/{self.task['id']}/assign/", json.dumps({'assigned_to_id': str(self.outside_member.id)}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_dl_can_assign_within_the_projects_department(self):
+        response = self.client.post(
+            f"/api/v1/tasks/{self.task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_owner_can_assign_to_a_member_outside_the_projects_department(self):
+        response = self.client.post(
+            f"/api/v1/tasks/{self.task['id']}/assign/", json.dumps({'assigned_to_id': str(self.outside_member.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
