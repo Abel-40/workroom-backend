@@ -1,20 +1,48 @@
-"""Folder/Page ("wiki") system -- company-scoped, backend-enforced.
+"""Folder/Page ("wiki") system -- company-scoped AND creator-scoped.
 
-Access is company-membership-only, matching the Info Portal's existing
-all-member positioning -- no per-folder ACL layer is built here
-(ShareFolderModal.vue's per-member sharing stays a decorative frontend mock;
-it was never load-bearing and isn't required for the AI Assistant to work).
+Company membership is the outer tenant check (never trust a client-supplied
+folder/page id without it). Within a company, a folder defaults to visible
+only to the member who created it; :class:`~pages.models.FolderShare` is the
+explicit exception -- share a folder with specific teammates to grant them
+the same view/edit access the creator has (delete and re-sharing stay
+creator-only). Every access point below re-derives this from the DB rather
+than trusting a caller who already checked once, matching the rest of this
+app's service layer.
 """
 
-from company.services import is_company_member
+from django.db.models import Q
 
-from .models import Page, PageFolder
+from company.services import is_company_member
+from users.models import CompanyUserProfile
+
+from .models import FolderShare, Page, PageFolder
+
+
+def _folder_access_q(user, *, prefix: str = '') -> Q:
+    """Q object for "created by this user OR shared with this user",
+    filtered at the DB level rather than fetched-then-checked in Python.
+    ``prefix`` lets the same Q reach through a FK, e.g. ``folder__`` when
+    filtering Page instead of PageFolder directly."""
+    return Q(**{f'{prefix}created_by': user}) | Q(**{f'{prefix}shares__user': user})
+
+
+async def _can_access_folder(user, folder: PageFolder) -> bool:
+    """Creator or explicitly shared-with. Assumes company membership has
+    already been checked by the caller."""
+    if folder.created_by_id == user.id:
+        return True
+    return await FolderShare.objects.filter(folder=folder, user=user).aexists()
 
 
 async def list_folders(user, company):
     if not await is_company_member(user, company):
         return None, 'forbidden'
-    folders = [f async for f in PageFolder.objects.filter(company=company, is_deleted=False).order_by('name')]
+    folders = [
+        f async for f in PageFolder.objects.filter(company=company, is_deleted=False)
+        .filter(_folder_access_q(user))
+        .distinct()
+        .order_by('name')
+    ]
     return folders, None
 
 
@@ -33,14 +61,48 @@ async def get_folder_for_user(user, folder_id):
         return None, 'not_found'
     if not await is_company_member(user, folder.company):
         return None, 'forbidden'
+    if not await _can_access_folder(user, folder):
+        return None, 'forbidden'
     return folder, None
 
 
 async def get_or_create_folder_by_name(user, company, name: str):
-    folder = await PageFolder.objects.filter(company=company, name=name, is_deleted=False).afirst()
+    """Only matches a folder ``user`` already has access to -- folders are
+    creator-scoped now, so blindly matching any company folder with this
+    name (even one belonging to someone else) would silently write into a
+    folder the caller can't see, which is worse than just creating a new
+    one."""
+    folder = await PageFolder.objects.filter(
+        company=company, name=name, is_deleted=False, created_by=user,
+    ).afirst()
     if folder is not None:
         return folder, None
     return await create_folder(user, company, name=name)
+
+
+async def share_folder(user, folder, target_user_ids: list) -> tuple[list | None, str | None]:
+    """Only the folder's creator may share it, and only with active members
+    of the same company -- a client-supplied user id is never trusted
+    without that membership check."""
+    if folder.created_by_id != user.id:
+        return None, 'forbidden'
+    if not target_user_ids:
+        return [], None
+    valid_ids = set()
+    async for profile in CompanyUserProfile.objects.filter(
+        company=folder.company, user_id__in=target_user_ids, is_active=True,
+    ):
+        valid_ids.add(profile.user_id)
+    if folder.company.owner_id in target_user_ids:
+        valid_ids.add(folder.company.owner_id)
+    invalid_ids = [str(uid) for uid in target_user_ids if uid not in valid_ids]
+    if invalid_ids:
+        return None, 'invalid_members'
+    shares = []
+    for user_id in valid_ids:
+        share, _ = await FolderShare.objects.aget_or_create(folder=folder, user_id=user_id)
+        shares.append(share)
+    return shares, None
 
 
 async def list_pages(user, folder):
@@ -48,6 +110,8 @@ async def list_pages(user, folder):
     caller can paginate it -- matches the pattern used for other
     potentially-unbounded collections (e.g. api/routers/documents.py)."""
     if not await is_company_member(user, folder.company):
+        return None, 'forbidden'
+    if not await _can_access_folder(user, folder):
         return None, 'forbidden'
     return folder.pages.filter(is_deleted=False).order_by('-updated_at'), None
 
@@ -58,6 +122,8 @@ def _blocks_to_dicts(blocks) -> list:
 
 async def create_page(user, folder, *, title: str, blocks=None, project=None):
     if not await is_company_member(user, folder.company):
+        return None, 'forbidden'
+    if not await _can_access_folder(user, folder):
         return None, 'forbidden'
     if project is not None and project.company_id != folder.company_id:
         return None, 'invalid_project'
@@ -73,11 +139,15 @@ async def get_page_for_user(user, page_id):
         return None, 'not_found'
     if not await is_company_member(user, page.folder.company):
         return None, 'forbidden'
+    if not await _can_access_folder(user, page.folder):
+        return None, 'forbidden'
     return page, None
 
 
 async def update_page(user, page, *, title=None, blocks=None):
     if not await is_company_member(user, page.folder.company):
+        return None, 'forbidden'
+    if not await _can_access_folder(user, page.folder):
         return None, 'forbidden'
     update_fields = ['updated_at']
     if title is not None:
@@ -93,6 +163,8 @@ async def update_page(user, page, *, title=None, blocks=None):
 async def delete_page(user, page) -> bool:
     if not await is_company_member(user, page.folder.company):
         return False
+    if not await _can_access_folder(user, page.folder):
+        return False
     page.is_deleted = True
     await page.asave(update_fields=['is_deleted'])
     return True
@@ -104,8 +176,14 @@ async def delete_folder(user, folder) -> bool:
     keeps every existing Page query correct without also having to filter on
     folder__is_deleted everywhere -- e.g. list_pages_for_company and
     get_pages_by_ids_for_company (the cross-folder picker / AI Assistant
-    page-context lookup) only ever check the page's own is_deleted."""
+    page-context lookup) only ever check the page's own is_deleted.
+
+    Delete stays creator-only (unlike view/edit) -- a shared collaborator
+    can work in a folder without being able to remove it out from under its
+    owner."""
     if not await is_company_member(user, folder.company):
+        return False
+    if folder.created_by_id != user.id:
         return False
     folder.is_deleted = True
     await folder.asave(update_fields=['is_deleted'])
@@ -116,27 +194,33 @@ async def delete_folder(user, folder) -> bool:
 async def list_pages_for_company(user, company, *, search: str = ''):
     """Flat, cross-folder page listing for the picker modal -- includes each
     page's folder via select_related so the picker can show/group by folder
-    without N+1 lookups. Returns an unevaluated queryset for pagination, same
-    as list_pages above."""
+    without N+1 lookups. Scoped to folders ``user`` can access (creator or
+    shared), same as list_folders. Returns an unevaluated queryset for
+    pagination, same as list_pages above."""
     if not await is_company_member(user, company):
         return None, 'forbidden'
     queryset = Page.objects.select_related('folder').filter(
         folder__company=company, is_deleted=False,
-    ).order_by('-updated_at')
+    ).filter(_folder_access_q(user, prefix='folder__')).distinct().order_by('-updated_at')
     if search:
         queryset = queryset.filter(title__icontains=search)
     return queryset, None
 
 
-async def get_pages_by_ids_for_company(company, page_ids: list) -> list:
+async def get_pages_by_ids_for_company(user, company, page_ids: list) -> list:
     """Returns only the pages among ``page_ids`` that actually belong to
-    ``company`` and aren't deleted. Callers must fail closed (reject the
-    whole request) if the returned list is shorter than ``page_ids`` --
-    silently dropping an invalid/cross-tenant reference would look like it
-    succeeded when it didn't (Rule 4)."""
+    ``company``, aren't deleted, AND that ``user`` can access (creator or
+    shared) -- callers must fail closed (reject the whole request) if the
+    returned list is shorter than ``page_ids``: silently dropping an
+    invalid/cross-tenant/no-access reference would look like it succeeded
+    when it didn't (Rule 4)."""
     if not page_ids:
         return []
-    return [p async for p in Page.objects.filter(id__in=page_ids, folder__company=company, is_deleted=False)]
+    return [
+        p async for p in Page.objects.filter(
+            id__in=page_ids, folder__company=company, is_deleted=False,
+        ).filter(_folder_access_q(user, prefix='folder__')).distinct()
+    ]
 
 
 def blocks_to_text(blocks: list, *, max_chars: int = 3000) -> str:

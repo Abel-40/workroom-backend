@@ -1,7 +1,8 @@
-"""Folder/Page ("wiki") API. Company-scoped: any active company member can
-list/create/edit -- see pages/services.py for why no per-folder ACL layer
-exists. Used by both the Info Portal UI and the AI Assistant's page-context/
-save-as-page features (one system, not two)."""
+"""Folder/Page ("wiki") API. Company membership is the outer tenant check;
+within a company a folder defaults to creator-only visibility, with
+FolderShare as the explicit exception -- see pages/services.py. Used by both
+the Info Portal UI and the AI Assistant's page-context/save-as-page features
+(one system, not two)."""
 
 from uuid import UUID
 
@@ -14,7 +15,7 @@ from utils.api_response import api_response as payload
 from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
 from ..auth import JWTBearerAuth
-from ..schemas import ApiResponse, PageCreateIn, PageFolderCreateIn, PageUpdateIn
+from ..schemas import ApiResponse, PageCreateIn, PageFolderCreateIn, PageFolderShareIn, PageUpdateIn
 
 router = Router(tags=['pages'])
 auth = JWTBearerAuth()
@@ -23,6 +24,7 @@ auth = JWTBearerAuth()
 def folder_data(folder: PageFolder) -> dict:
     return {
         'id': str(folder.id), 'name': folder.name, 'color': folder.color,
+        'created_by': str(folder.created_by_id) if folder.created_by_id else None,
         'created_at': folder.created_at.isoformat(),
     }
 
@@ -70,6 +72,23 @@ async def delete_folder(request, folder_id: UUID):
     if not await services.delete_folder(request.auth, folder):
         return payload('You do not have permission to delete this folder.', 403, False)
     return payload('Folder deleted successfully.', 200, True)
+
+
+@router.post('/page-folders/{folder_id}/share/', auth=auth, response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse})
+async def share_folder(request, folder_id: UUID, data: PageFolderShareIn):
+    # get_folder_for_user already enforces creator-or-shared access; sharing
+    # itself is further restricted to the creator inside services.share_folder.
+    folder, error = await services.get_folder_for_user(request.auth, folder_id)
+    if error == 'not_found':
+        return payload('Folder not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to share this folder.', 403, False)
+    shares, error = await services.share_folder(request.auth, folder, data.user_ids)
+    if error == 'forbidden':
+        return payload('Only the folder creator can share it.', 403, False)
+    if error == 'invalid_members':
+        return payload('One or more selected people are not active members of your company.', 400, False)
+    return payload('Folder shared.', 200, True, {'shared_with': [str(s.user_id) for s in shares]})
 
 
 @router.get('/page-folders/{folder_id}/pages/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
