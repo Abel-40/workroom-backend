@@ -13,7 +13,7 @@ from company.services import get_company_role, get_member_company, get_member_de
 from departments_and_teams.models import Department, Team
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.utils import timezone
 from notifications_and_activity.services import (
     log_ownership_transferred,
@@ -36,12 +36,14 @@ from notifications_and_activity.services import (
 )
 from users.models import CompanyUserProfile
 
-from .models import Attachment, DefaultTaskType, Project, ProjectVisibilityRequest, Task, TaskApproval, TaskType
+from .models import (
+    Attachment, DefaultTaskType, Project, ProjectVisibilityRequest, Task, TaskApproval, TaskTimeLog, TaskType,
+)
 
 User = get_user_model()
 
 PROJECT_UPDATABLE_FIELDS = {'title', 'description', 'visibility', 'priority', 'start_date', 'deadline', 'status'}
-TASK_UPDATABLE_FIELDS = {'title', 'description', 'priority', 'deadline', 'estimated_time', 'spent_time'}
+TASK_UPDATABLE_FIELDS = {'title', 'description', 'priority', 'deadline', 'estimated_time'}
 
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 ALLOWED_DOCUMENT_CONTENT_TYPES = {
@@ -108,6 +110,22 @@ async def user_can_update_task_status(user, task) -> bool:
     only reachable via the approval workflow below (submit_task_for_approval
     / approve_task / reject_task_approval)."""
     return task.assigned_to_id == user.id
+
+
+async def user_can_log_time(user, task) -> bool:
+    """Logging time is closer to 'doing the work' than the Kanban status
+    transitions above (assignee-only, no manager fallback -- see
+    user_can_update_task_status) -- a task's creator/project-manager may also
+    log time on it, same as editing the task itself (user_can_manage_task)."""
+    if task.assigned_to_id == user.id:
+        return True
+    return await user_can_manage_task(user, task)
+
+
+async def user_can_delete_time_log(user, log) -> bool:
+    if log.user_id == user.id:
+        return True
+    return await user_can_manage_task(user, log.task)
 
 
 async def user_can_approve_task(user, task) -> bool:
@@ -731,6 +749,48 @@ async def archive_task(user, task) -> bool:
     task.is_deleted = True
     await task.asave(update_fields=['is_deleted'])
     return True
+
+
+# --------------------------------------------------------------------------
+# Time logs -- one real, attributable entry per unit of work, replacing the
+# old single overwritable Task.spent_time field (see TaskTimeLog).
+# --------------------------------------------------------------------------
+
+MAX_TIME_LOG_HOURS = 24
+
+
+async def create_time_log(user, task, *, hours: float, work_date=None, description=''):
+    """Returns (log, error) where error is 'forbidden', 'invalid_hours', or None."""
+    if not await user_can_log_time(user, task):
+        return None, 'forbidden'
+    if hours is None or hours <= 0 or hours > MAX_TIME_LOG_HOURS:
+        return None, 'invalid_hours'
+    log = await TaskTimeLog.objects.acreate(
+        task=task, user=user, duration=timedelta(hours=hours),
+        work_date=work_date or timezone.now().date(), description=(description or '')[:2000],
+    )
+    return log, None
+
+
+async def delete_time_log(user, task, log_id):
+    """Returns (True, None) / (False, 'not_found') / (False, 'forbidden')."""
+    log = await TaskTimeLog.objects.filter(id=log_id, task=task, is_deleted=False).afirst()
+    if log is None:
+        return False, 'not_found'
+    if not await user_can_delete_time_log(user, log):
+        return False, 'forbidden'
+    log.is_deleted = True
+    await log.asave(update_fields=['is_deleted'])
+    return True, None
+
+
+async def task_spent_hours(task) -> float | None:
+    """Live sum of a task's (non-deleted) time-log entries, in hours -- the
+    replacement for the old cached Task.spent_time column. None (not 0) when
+    nothing has been logged yet, matching the old field's semantics."""
+    result = await TaskTimeLog.objects.filter(task=task, is_deleted=False).aaggregate(total=Sum('duration'))
+    total = result['total']
+    return round(total.total_seconds() / 3600, 2) if total else None
 
 
 # --------------------------------------------------------------------------

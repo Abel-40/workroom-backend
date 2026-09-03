@@ -239,7 +239,6 @@ class Task(UUIDModel):
     updated_at = models.DateTimeField(auto_now=True)
     priority = models.CharField(max_length=20, choices=PRIORITY.choices, default=PRIORITY.MEDIUM)
     estimated_time = models.DurationField(blank=True, null=True)
-    spent_time = models.DurationField(blank=True, null=True)
     # Logical ordering only (e.g. AI-suggested sequence); not a dependency
     # graph -- V1 doesn't model task-to-task dependencies.
     sequence = models.PositiveIntegerField(default=0)
@@ -247,3 +246,22 @@ class Task(UUIDModel):
 
     def __str__(self):
         return f"{self.title} - {self.project.title if self.project else 'No Project'} - {self.assigned_to.email if self.assigned_to else 'Unassigned'}"
+
+
+class TaskTimeLog(UUIDModel):
+    """One real, attributable entry of work logged against a task -- replaces
+    the old Task.spent_time single overwritable field, which had no history,
+    no per-user attribution, and silently discarded the date/description a
+    user entered (see TimeTrackingModal.vue). A task's total spent time is
+    the live sum of its (non-deleted) entries -- see services.task_spent_hours
+    -- rather than a cached column, so there's nothing to keep in sync."""
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name='time_logs')
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='task_time_logs')
+    duration = models.DurationField()
+    work_date = models.DateField(default=timezone.now)
+    description = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_deleted = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.duration} on {self.task.title} by {self.user.email if self.user else 'Unknown'}"

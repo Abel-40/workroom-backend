@@ -265,7 +265,7 @@ async def save_generated_plan(request, generation_id: UUID):
         return payload(str(exc), 400, False)
 
     return payload('Plan saved to the project backlog.', 200, True, {
-        'tasks': [task_data(task) for task in created_tasks],
+        'tasks': [await task_data(task) for task in created_tasks],
         'invalid_assignee_temp_ids': invalid_assignee_temp_ids,
     })
 
@@ -294,11 +294,11 @@ async def regenerate_task_ai_content(request, task_id: UUID, data: AITaskRegener
         )
         return payload('The task content regeneration job could not be queued.', 500, False)
     return payload('Task content regeneration requested.', 202, True, {
-        'task_regeneration': task_regeneration_data(regeneration),
+        'task_regeneration': await task_regeneration_data(regeneration),
     })
 
 
-def task_regeneration_data(regeneration: AITaskContentRegeneration) -> dict:
+async def task_regeneration_data(regeneration: AITaskContentRegeneration) -> dict:
     return {
         'id': str(regeneration.id),
         'task_id': str(regeneration.task_id),
@@ -311,7 +311,7 @@ def task_regeneration_data(regeneration: AITaskContentRegeneration) -> dict:
         'error_message': regeneration.error_message,
         # Included once COMPLETED so the frontend can patch its task state
         # straight from this poll response -- no extra fetch needed.
-        'task': task_data(regeneration.task) if regeneration.status == AITaskContentRegeneration.STATUS.COMPLETED else None,
+        'task': await task_data(regeneration.task) if regeneration.status == AITaskContentRegeneration.STATUS.COMPLETED else None,
     }
 
 
@@ -323,7 +323,7 @@ async def get_task_regeneration(request, regeneration_id: UUID):
     task, error = await get_task_for_user(request.auth, regeneration.task_id)
     if error:
         return payload('You do not have permission to view this task.', 403, False)
-    return payload('Task regeneration retrieved successfully.', 200, True, {'task_regeneration': task_regeneration_data(regeneration)})
+    return payload('Task regeneration retrieved successfully.', 200, True, {'task_regeneration': await task_regeneration_data(regeneration)})
 
 
 async def assistant_query_data(query: AIAssistantQuery) -> dict:

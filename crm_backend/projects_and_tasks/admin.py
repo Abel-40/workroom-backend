@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Project, Task, TaskType, DefaultTaskType, Attachment
+from .models import Project, Task, TaskType, DefaultTaskType, Attachment, TaskTimeLog
 
 @admin.register(Project)
 class ProjectAdmin(admin.ModelAdmin):
@@ -35,3 +35,10 @@ class AttachmentAdmin(admin.ModelAdmin):
     list_filter = ('type',)
     search_fields = ('name', 'label')
     raw_id_fields = ('task',)
+
+@admin.register(TaskTimeLog)
+class TaskTimeLogAdmin(admin.ModelAdmin):
+    list_display = ('id', 'task', 'user', 'duration', 'work_date', 'created_at')
+    list_filter = ('work_date', 'created_at')
+    search_fields = ('description',)
+    raw_id_fields = ('task', 'user')

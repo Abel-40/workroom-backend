@@ -125,12 +125,27 @@ class CompanyRegistrationSecurityTests(TestCase):
         self.assertTrue(profile.is_active)
 
     def test_user_cannot_register_a_second_company(self):
-        Company.objects.create(name='First', owner=self.user, sector=self.sector)
+        first = Company.objects.create(name='First', owner=self.user, sector=self.sector)
+        CompanyUserProfile.objects.create(user=self.user, company=first, role=CompanyUserProfile.Role.Owner)
         response = self.client.post(
             '/api/v1/company/register/', {'name': 'Second', 'sector': self.sector.id},
             content_type='application/json', **auth_header(self.user),
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_register_company_finishes_a_partially_failed_prior_attempt(self):
+        """A Company row can exist with no owner CompanyUserProfile if an
+        earlier registration attempt died between the two writes (see
+        register_company_in_transaction) -- retrying must finish that
+        member row instead of only ever reporting 'already has a company'."""
+        stuck = Company.objects.create(name='Stuck Co', owner=self.user, sector=self.sector)
+        response = self.client.post(
+            '/api/v1/company/register/', {'name': 'Ignored', 'sector': self.sector.id},
+            content_type='application/json', **auth_header(self.user),
+        )
+        self.assertEqual(response.status_code, 201)
+        profile = CompanyUserProfile.objects.get(company=stuck, user=self.user)
+        self.assertEqual(profile.role, CompanyUserProfile.Role.Owner)
 
 
 class SignInCompanyContextTests(TestCase):
@@ -604,6 +619,106 @@ class TaskSecurityTests(TwoCompanyTestCase):
                 content_type='application/json', **auth_header(self.member_a),
             )
             self.assertEqual(response.status_code, 400, target)
+
+
+class TaskTimeLogSecurityTests(TwoCompanyTestCase):
+    """TaskTimeLog replaces the old single-field Task.spent_time (no history,
+    no attribution -- see TimeTrackingModal.vue) with a real per-entry log.
+    Independent of the approval workflow (TaskApprovalWorkflowTests below):
+    logging time tracks effort spent, not task completion."""
+
+    def create_task(self, project_id, owner=None, **overrides):
+        # Comfortably before create_project's default 365-day-out deadline.
+        body = {'title': 'Build login page', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}
+        body.update(overrides)
+        response = self.client.post(
+            f'/api/v1/projects/{project_id}/tasks/', json.dumps(body), content_type='application/json',
+            **auth_header(owner or self.owner_a),
+        )
+        return response.json()['data']['task']
+
+    def log_time(self, task_id, actor, hours=2, **overrides):
+        body = {'hours': hours}
+        body.update(overrides)
+        return self.client.post(
+            f'/api/v1/tasks/{task_id}/time-logs/', json.dumps(body), content_type='application/json',
+            **auth_header(actor),
+        )
+
+    def test_assignee_can_log_time_but_cross_company_outsider_cannot(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        ok = self.log_time(task['id'], self.member_a, hours=3)
+        self.assertEqual(ok.status_code, 201)
+        self.assertEqual(ok.json()['data']['spent_time_hours'], 3)
+
+        forbidden = self.log_time(task['id'], self.owner_b)
+        self.assertEqual(forbidden.status_code, 403)
+
+    def test_same_company_non_assignee_non_manager_cannot_log_time(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])  # unassigned, created by owner_a
+        response = self.log_time(task['id'], self.member_a)
+        self.assertEqual(response.status_code, 403)
+
+    def test_hours_out_of_range_rejected(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        too_low = self.log_time(task['id'], self.owner_a, hours=0)
+        self.assertEqual(too_low.status_code, 422)
+        too_high = self.log_time(task['id'], self.owner_a, hours=30)
+        self.assertEqual(too_high.status_code, 422)
+
+    def test_entries_accumulate_and_list_reflects_them(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.log_time(task['id'], self.owner_a, hours=2, description='Initial pass')
+        second = self.log_time(task['id'], self.owner_a, hours=1.5, description='Review fixes')
+        self.assertEqual(second.json()['data']['spent_time_hours'], 3.5)
+
+        listing = self.client.get(f"/api/v1/tasks/{task['id']}/time-logs/", **auth_header(self.owner_a))
+        self.assertEqual(listing.status_code, 200)
+        entries = listing.json()['data']['results']
+        self.assertEqual(len(entries), 2)
+        self.assertEqual({e['description'] for e in entries}, {'Initial pass', 'Review fixes'})
+
+        get_task = self.client.get(f"/api/v1/tasks/{task['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(get_task.json()['data']['task']['spent_time_hours'], 3.5)
+
+    def test_delete_time_log_author_can_but_non_author_non_manager_cannot(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        entry = self.log_time(task['id'], self.member_a, hours=2).json()['data']['time_log']
+
+        forbidden = self.client.delete(f"/api/v1/tasks/{task['id']}/time-logs/{entry['id']}/", **auth_header(self.owner_b))
+        self.assertEqual(forbidden.status_code, 403)
+
+        ok = self.client.delete(f"/api/v1/tasks/{task['id']}/time-logs/{entry['id']}/", **auth_header(self.member_a))
+        self.assertEqual(ok.status_code, 200)
+        self.assertIsNone(ok.json()['data']['spent_time_hours'])
+
+    def test_my_time_logs_includes_project_and_task_context(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.log_time(task['id'], self.owner_a, hours=4, description='Design review')
+
+        mine = self.client.get('/api/v1/time-logs/mine/', **auth_header(self.owner_a))
+        self.assertEqual(mine.status_code, 200)
+        entries = mine.json()['data']['results']
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['project_title'], project['title'])
+        self.assertEqual(entries[0]['task_title'], task['title'])
+
+        others = self.client.get('/api/v1/time-logs/mine/', **auth_header(self.owner_b))
+        self.assertEqual(others.json()['data']['results'], [])
 
 
 class TaskApprovalWorkflowTests(TwoCompanyTestCase):
