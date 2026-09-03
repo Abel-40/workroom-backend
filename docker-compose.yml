@@ -56,7 +56,11 @@ services:
     environment:
       <<: *django-network-env
     healthcheck:
-      test: ["CMD-SHELL", "celery -A crm_backend inspect ping -d simple-worker@workroom --timeout 5 | grep -q OK"]
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A crm_backend inspect ping -d simple-worker@workroom --timeout 5 | grep -q OK",
+        ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -77,7 +81,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD-SHELL", "celery -A crm_backend inspect ping -d heavy-worker@workroom --timeout 5 | grep -q OK"]
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A crm_backend inspect ping -d heavy-worker@workroom --timeout 5 | grep -q OK",
+        ]
       interval: 30s
       timeout: 10s
       retries: 5
