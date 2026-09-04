@@ -53,6 +53,15 @@ class TodoItem(UUIDModel):
     is_done = models.BooleanField(default=False)
     completed_at = models.DateTimeField(null=True, blank=True)
     source = models.CharField(max_length=20, choices=SOURCE.choices, default=SOURCE.MANUAL)
+    # The batch this row came from, when source=AI_GENERATED. Lets the owner
+    # dismiss a whole unhelpful generation in one action instead of deleting
+    # items one at a time. SET_NULL, not CASCADE: discarding the audit record
+    # must never silently delete todos the owner has since started working
+    # from. String reference to avoid an import cycle -- ai_agent imports
+    # todos.services, not the other way round.
+    ai_generation = models.ForeignKey(
+        'ai_agent.AITodoGeneration', on_delete=models.SET_NULL, null=True, blank=True, related_name='todos',
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

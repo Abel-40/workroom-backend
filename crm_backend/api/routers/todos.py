@@ -7,8 +7,12 @@ only to stamp the row's tenant, never to widen who can read it.
 """
 
 from datetime import date
+from typing import Literal
 from uuid import UUID
 
+from ai_agent.models import AITodoGeneration
+from ai_agent.tasks_todos import process_todo_generation
+from asgiref.sync import sync_to_async
 from company.services import get_member_company
 from ninja import Router, Schema
 from pydantic import Field
@@ -16,6 +20,7 @@ from todos import services
 from todos.models import TodoItem
 from utils.api_response import api_response as payload
 from utils.pagination import DEFAULT_PAGE_SIZE, paginate
+from utils.rate_limit import rate_limit
 
 from ..auth import JWTBearerAuth
 from ..schemas import ApiResponse
@@ -125,6 +130,117 @@ async def create_todo(request, data: TodoIn):
         return payload(DUE_DATE_ERRORS.get(error, 'Validation error'), 400, False)
     return payload('Todo created successfully.', 201, True, {'todo': todo_data(todo, viewer=request.auth)})
 
+
+# --------------------------------------------------------------------------
+# AI generation
+# --------------------------------------------------------------------------
+# Generate -> Validate -> Persist. This endpoint only ever resolves which of
+# the CALLER'S OWN assigned tasks may be used and enqueues the job; the
+# worker (ai_agent/tasks_todos.py) re-validates everything the AI service
+# returns against real rows before a todo exists.
+
+class TodoGenerateIn(Schema):
+    mode: Literal['today', 'task'] = 'today'
+    # Required when mode='task'; ignored otherwise.
+    task_id: UUID | None = None
+    # How many days to spread a single task's checklist over. Ignored for
+    # mode='today', which is one day by definition.
+    days: int = Field(default=7, ge=1, le=14)
+    instructions: str = Field(default='', max_length=2000)
+    max_todos: int = Field(default=10, ge=1, le=30)
+
+
+def generation_data(generation) -> dict:
+    return {
+        'id': str(generation.id),
+        'mode': generation.mode,
+        'status': generation.status,
+        'task_id': str(generation.task_id) if generation.task_id else None,
+        'window_start': generation.window_start.isoformat(),
+        'window_end': generation.window_end.isoformat(),
+        'todo_count': generation.todo_count,
+        'requested_at': generation.requested_at.isoformat(),
+        'completed_at': generation.completed_at.isoformat() if generation.completed_at else None,
+        # Failure text is written by Django itself (never a raw provider
+        # body -- see ai_agent/tasks_todos.py), so it is safe to surface.
+        'error_message': generation.error_message,
+    }
+
+
+@router.post(
+    '/generate/', auth=auth,
+    response={202: ApiResponse, 400: ApiResponse, 404: ApiResponse, 409: ApiResponse},
+)
+@rate_limit('todo_generate', limit=20, window_seconds=3600, key_func=lambda r: str(r.auth.id))
+async def generate_todos(request, data: TodoGenerateIn):
+    company = await get_member_company(request.auth)
+    if company is None:
+        return payload('You do not belong to a company.', 404, False)
+
+    in_flight = await services.find_in_flight_generation(request.auth)
+    if in_flight is not None:
+        return payload("You already have a to-do generation running.", 409, False, {
+            'generation': generation_data(in_flight),
+        })
+
+    task = None
+    if data.mode == 'task':
+        if data.task_id is None:
+            return payload('Choose a task to build to-dos from.', 400, False)
+        task, error = await services.get_assignable_task(request.auth, data.task_id)
+        if error:
+            return payload('That task is not assigned to you.', 404, False)
+
+    tasks, error = await services.resolve_generation_sources(
+        request.auth, company, mode=data.mode, task=task,
+    )
+    if error == 'no_assigned_tasks':
+        return payload('You have no open tasks assigned to you right now.', 400, False)
+
+    window_start, window_end = await services.resolve_generation_window(
+        request.auth, mode=data.mode, task=task, days=data.days,
+    )
+    generation = await AITodoGeneration.objects.acreate(
+        user=request.auth, company=company, mode=data.mode, task=task,
+        source_task_ids=[str(t.id) for t in tasks],
+        window_start=window_start, window_end=window_end,
+        instructions=data.instructions.strip(), max_todos=data.max_todos,
+    )
+    # thread_sensitive=True: under CELERY_TASK_ALWAYS_EAGER (tests) .delay()
+    # runs the task body inline, and its queries must stay on this request's
+    # connection so they can see the row just created above.
+    await sync_to_async(process_todo_generation.delay, thread_sensitive=True)(str(generation.id))
+    return payload('Generating your to-dos.', 202, True, {'generation': generation_data(generation)})
+
+
+@router.get('/generations/{generation_id}/', auth=auth, response={200: ApiResponse, 404: ApiResponse})
+async def get_todo_generation(request, generation_id: UUID):
+    generation, error = await services.get_generation_for_user(request.auth, generation_id)
+    if error == 'not_found':
+        return payload('Generation not found.', 404, False)
+    return payload('Generation retrieved successfully.', 200, True, {
+        'generation': generation_data(generation),
+    })
+
+
+@router.post('/generations/{generation_id}/dismiss/', auth=auth, response={200: ApiResponse, 404: ApiResponse})
+async def dismiss_todo_generation(request, generation_id: UUID):
+    """Bulk undo for a generation the owner didn't find useful. Leaves
+    anything they already completed alone (todos/services.py)."""
+    generation, error = await services.get_generation_for_user(request.auth, generation_id)
+    if error == 'not_found':
+        return payload('Generation not found.', 404, False)
+    dismissed = await services.dismiss_generation(request.auth, generation)
+    return payload('Generated to-dos dismissed.', 200, True, {'dismissed': dismissed})
+
+
+# --------------------------------------------------------------------------
+# Parameterised routes last
+# --------------------------------------------------------------------------
+# Ninja matches routes in declaration order and a typed path parameter
+# accepts any non-slash segment, so '/{todo_id}/' declared above would
+# swallow every literal sibling below it -- '/generate/' would resolve to
+# the todo detail route and 405. Keep these at the bottom of the file.
 
 @router.patch('/{todo_id}/', auth=auth, response={200: ApiResponse, 400: ApiResponse, 404: ApiResponse})
 async def update_todo(request, todo_id: UUID, data: TodoUpdateIn):

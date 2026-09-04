@@ -60,6 +60,8 @@ class Notification(UUIDModel):
         PROJECT_REOPENED = 'project_reopened', 'Project Reopened'
         PROJECT_OWNERSHIP_TRANSFERRED = 'project_ownership_transferred', 'Project Ownership Transferred'
         FOLDER_SHARED = 'folder_shared', 'Folder Shared'
+        TODOS_GENERATED = 'todos_generated', 'Todos Generated'
+        TODOS_GENERATION_FAILED = 'todos_generation_failed', 'Todos Generation Failed'
 
     class Category(models.TextChoices):
         CRITICAL = 'critical', 'Critical'

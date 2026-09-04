@@ -238,3 +238,78 @@ class AIProjectHealthSummary(UUIDModel):
 
     def __str__(self):
         return f"{self.project_id} - {self.status}"
+
+
+class AITodoGeneration(UUIDModel):
+    """Lifecycle record for turning a person's assigned work into their own
+    private to-do list.
+
+    Unlike every other record in this module, this one is owned by a *user*
+    rather than a project: the todos it produces are private to the requester
+    (todos/models.py), so `user` -- not a project's company scope -- is the
+    access boundary for reading this row and everything it created.
+
+    The AI service never picks which tasks are eligible. Django resolves the
+    requester's own assigned tasks, stores their ids here, and re-checks the
+    assignment again at persist time (see ai_agent/tasks_todos.py) -- a task
+    can be reassigned while the generation is in flight.
+    """
+
+    class STATUS(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        PROCESSING = 'processing', 'Processing'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    class MODE(models.TextChoices):
+        # Everything the requester is on the hook for, planned onto today.
+        TODAY = 'today', 'Today'
+        # One specific task they are assigned to, planned across a window.
+        TASK = 'task', 'Task'
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='ai_todo_generations',
+    )
+    company = models.ForeignKey('company.Company', on_delete=models.CASCADE, related_name='ai_todo_generations')
+    mode = models.CharField(max_length=10, choices=MODE.choices, default=MODE.TODAY)
+    # Set only when mode=TASK, for traceability back to what was asked for.
+    task = models.ForeignKey(
+        'projects_and_tasks.Task', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='ai_todo_generations',
+    )
+    # The exact task ids sent to the AI service. Stored here (not just passed
+    # as Celery arguments) so the worker, which only receives a generation id,
+    # can re-read them -- same reason AIGeneration stores requested_assignee_ids.
+    source_task_ids = models.JSONField(default=list, blank=True)
+
+    # Resolved in the requester's own timezone at request time, never by the
+    # worker (which runs in UTC) and never by the AI service (which has no
+    # clock). Every generated due date must land inside this range.
+    window_start = models.DateField()
+    window_end = models.DateField()
+
+    instructions = models.TextField(blank=True, default='')
+    max_todos = models.PositiveIntegerField(default=10)
+
+    provider = models.CharField(max_length=50, blank=True, default='')
+    model = models.CharField(max_length=100, blank=True, default='')
+    status = models.CharField(max_length=20, choices=STATUS.choices, default=STATUS.PENDING)
+
+    requested_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    todo_count = models.PositiveIntegerField(default=0)
+    error_message = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['-requested_at']
+        indexes = [
+            # "Does this person already have one in flight?" -- checked on
+            # every generate request to keep a double-click from burning two
+            # provider calls.
+            models.Index(fields=['user', 'status'], name='ai_todo_gen_user_status_idx'),
+        ]
+
+    def __str__(self):
+        return f'{self.user_id} - {self.mode} - {self.status}'

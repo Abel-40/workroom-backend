@@ -38,6 +38,10 @@ TYPE_CATEGORY = {
     # nothing is blocked on the recipient acting -- optional, like the
     # other 'something now exists for you' notifications above.
     Notification.Type.FOLDER_SHARED: Notification.Category.OPTIONAL,
+    # The requester is usually watching the screen, but a generation
+    # that failed leaves them waiting on nothing -- tell them either way.
+    Notification.Type.TODOS_GENERATED: Notification.Category.OPTIONAL,
+    Notification.Type.TODOS_GENERATION_FAILED: Notification.Category.OPTIONAL,
 }
 
 
@@ -138,6 +142,27 @@ def notify_folder_shared(folder, recipient, actor):
         recipient, Notification.Type.FOLDER_SHARED,
         f"{who} shared the folder '{folder.name}' with you",
         related_object_type='page_folder', related_object_id=folder.id,
+    )
+
+
+def notify_todos_generated(generation):
+    """Only ever to the requester -- these todos are private to them
+    (todos/models.py), so there is nobody else to tell."""
+    _create(
+        generation.user, Notification.Type.TODOS_GENERATED,
+        f'{generation.todo_count} to-dos are ready for you',
+        related_object_type='ai_todo_generation', related_object_id=generation.id,
+    )
+
+
+def notify_todos_generation_failed(generation):
+    # Same posture as notify_ai_generation_failed: provider/infrastructure
+    # detail stays in the record and the worker logs, never in the message.
+    _create(
+        generation.user, Notification.Type.TODOS_GENERATION_FAILED,
+        'We could not build your to-do list',
+        message='Please try again in a few minutes.',
+        related_object_type='ai_todo_generation', related_object_id=generation.id,
     )
 
 

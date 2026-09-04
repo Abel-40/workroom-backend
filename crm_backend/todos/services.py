@@ -237,3 +237,82 @@ async def delete_todo(user, todo) -> bool:
     todo.is_deleted = True
     await todo.asave(update_fields=['is_deleted', 'updated_at'])
     return True
+
+
+# --------------------------------------------------------------------------
+# AI generation (request side)
+# --------------------------------------------------------------------------
+
+# How far past today a single task's checklist may be spread. Also clamped to
+# the task's own deadline -- planning work for after it is due is never right.
+MAX_TASK_WINDOW_DAYS = 14
+MAX_SOURCE_TASKS = 25
+
+
+async def resolve_generation_window(user, *, mode, task=None, days: int = 7):
+    """The date range generated todos must land in, always computed from the
+    requester's own today (never the server's, never the AI service's).
+
+    'today' mode collapses to a single day by definition. 'task' mode spreads
+    across a window, shortened so it never runs past the task's deadline.
+    """
+    today = user_today(user)
+    if mode == 'today':
+        return today, today
+    end = today + timedelta(days=min(max(days, 1), MAX_TASK_WINDOW_DAYS) - 1)
+    if task is not None and task.deadline:
+        deadline_day = task.deadline.date()
+        # A deadline already in the past can't shorten the window below a
+        # single day -- the work still has to be planned somewhere.
+        end = max(today, min(end, deadline_day))
+    return today, end
+
+
+async def resolve_generation_sources(user, company, *, mode, task=None):
+    """Which tasks a generation may draw on.
+
+    'task' mode: exactly the one task, already assignment-checked by the
+    caller. 'today' mode: the requester's own open assigned tasks, capped --
+    the AI service refuses more than MAX_SOURCE_TASKS, and a list that long
+    would produce an unusable checklist anyway.
+
+    Returns (tasks, error) with error 'no_assigned_tasks'.
+    """
+    if mode == 'task':
+        return [task], None
+    queryset = list_assigned_tasks(user, company, open_only=True)
+    tasks = [t async for t in queryset[:MAX_SOURCE_TASKS]]
+    if not tasks:
+        return None, 'no_assigned_tasks'
+    return tasks, None
+
+
+async def get_generation_for_user(user, generation_id):
+    """Same posture as get_todo_for_user: someone else's generation is not a
+    thing the caller may learn exists."""
+    from ai_agent.models import AITodoGeneration
+
+    generation = await AITodoGeneration.objects.filter(id=generation_id, user=user).afirst()
+    if generation is None:
+        return None, 'not_found'
+    return generation, None
+
+
+async def find_in_flight_generation(user):
+    """A generation already running for this user. Checked before starting a
+    new one so a double-click cannot burn two provider calls."""
+    from ai_agent.models import AITodoGeneration
+
+    return await AITodoGeneration.objects.filter(
+        user=user, status__in=[AITodoGeneration.STATUS.PENDING, AITodoGeneration.STATUS.PROCESSING],
+    ).afirst()
+
+
+async def dismiss_generation(user, generation) -> int:
+    """The bulk undo for an unhelpful generation: soft-deletes every todo it
+    created that the owner has not already completed. Completed ones are left
+    alone -- the owner did that work, and removing the record of it would be
+    destroying their history, not cleaning up ours."""
+    return await TodoItem.objects.filter(
+        ai_generation=generation, user=user, is_done=False, is_deleted=False,
+    ).aupdate(is_deleted=True)
