@@ -21,11 +21,25 @@ router = Router(tags=['pages'])
 auth = JWTBearerAuth()
 
 
-def folder_data(folder: PageFolder) -> dict:
-    return {
+def folder_data(folder: PageFolder, *, viewer=None) -> dict:
+    data = {
         'id': str(folder.id), 'name': folder.name, 'color': folder.color,
         'created_by': str(folder.created_by_id) if folder.created_by_id else None,
         'created_at': folder.created_at.isoformat(),
+    }
+    if viewer is not None:
+        # Sharing and deleting are creator-only (pages/services.py); the UI
+        # needs this to know which controls to offer, rather than guessing.
+        data['is_owner'] = folder.created_by_id == viewer.id
+    return data
+
+
+def share_data(share) -> dict:
+    return {
+        'user_id': str(share.user_id),
+        'email': share.user.email,
+        'name': share.user.get_username(),
+        'shared_at': share.created_at.isoformat(),
     }
 
 
@@ -48,7 +62,9 @@ async def list_folders(request):
     if company is None:
         return payload('You do not belong to a company.', 404, False)
     folders, _ = await services.list_folders(request.auth, company)
-    return payload('Folders retrieved successfully.', 200, True, {'results': [folder_data(f) for f in folders]})
+    return payload('Folders retrieved successfully.', 200, True, {
+        'results': [folder_data(f, viewer=request.auth) for f in folders],
+    })
 
 
 @router.post('/page-folders/', auth=auth, response={201: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -59,7 +75,9 @@ async def create_folder(request, data: PageFolderCreateIn):
     folder, error = await services.create_folder(request.auth, company, name=data.name, color=data.color)
     if error == 'forbidden':
         return payload('You do not have permission to create folders.', 403, False)
-    return payload('Folder created successfully.', 201, True, {'folder': folder_data(folder)})
+    return payload('Folder created successfully.', 201, True, {
+        'folder': folder_data(folder, viewer=request.auth),
+    })
 
 
 @router.delete('/page-folders/{folder_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -89,6 +107,43 @@ async def share_folder(request, folder_id: UUID, data: PageFolderShareIn):
     if error == 'invalid_members':
         return payload('One or more selected people are not active members of your company.', 400, False)
     return payload('Folder shared.', 200, True, {'shared_with': [str(s.user_id) for s in shares]})
+
+
+@router.get(
+    '/page-folders/{folder_id}/shares/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def list_folder_shares(request, folder_id: UUID):
+    folder, error = await services.get_folder_for_user(request.auth, folder_id)
+    if error == 'not_found':
+        return payload('Folder not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this folder.', 403, False)
+    shares, error = await services.list_folder_shares(request.auth, folder)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this folder.', 403, False)
+    return payload('Folder shares retrieved successfully.', 200, True, {
+        'owner_id': str(folder.created_by_id) if folder.created_by_id else None,
+        'results': [share_data(s) for s in shares],
+    })
+
+
+@router.delete(
+    '/page-folders/{folder_id}/shares/{user_id}/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def revoke_folder_share(request, folder_id: UUID, user_id: UUID):
+    folder, error = await services.get_folder_for_user(request.auth, folder_id)
+    if error == 'not_found':
+        return payload('Folder not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to manage this folder.', 403, False)
+    revoked, error = await services.revoke_folder_share(request.auth, folder, user_id)
+    if error == 'forbidden':
+        return payload("Only the folder creator can remove someone else's access.", 403, False)
+    if error == 'not_found':
+        return payload('That person does not have access to this folder.', 404, False)
+    return payload('Access removed successfully.', 200, True)
 
 
 @router.get('/page-folders/{folder_id}/pages/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})

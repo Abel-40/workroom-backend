@@ -34,6 +34,10 @@ TYPE_CATEGORY = {
     Notification.Type.PROJECT_COMPLETED: Notification.Category.OPTIONAL,
     Notification.Type.PROJECT_REOPENED: Notification.Category.OPTIONAL,
     Notification.Type.PROJECT_OWNERSHIP_TRANSFERRED: Notification.Category.OPTIONAL,
+    # Being given access to a private folder is useful to know about, but
+    # nothing is blocked on the recipient acting -- optional, like the
+    # other 'something now exists for you' notifications above.
+    Notification.Type.FOLDER_SHARED: Notification.Category.OPTIONAL,
 }
 
 
@@ -118,6 +122,22 @@ def notify_ai_generation_failed(generation):
         f"AI plan failed for '{generation.project.title}'",
         message='We could not create this AI plan right now. Please try again in a few minutes.',
         related_object_type='ai_generation', related_object_id=generation.id,
+    )
+
+
+def notify_folder_shared(folder, recipient, actor):
+    """Tells ``recipient`` that ``actor`` gave them access to a private
+    folder. Without this the grant is invisible: a folder they can now see
+    simply appears in their Info Portal with nothing explaining where it
+    came from. Never notifies someone about their own action (a creator
+    re-sharing to themselves is a no-op share anyway)."""
+    if recipient is None or actor is not None and recipient.id == actor.id:
+        return
+    who = (actor.first_name or actor.get_username()) if actor else 'A teammate'
+    _create(
+        recipient, Notification.Type.FOLDER_SHARED,
+        f"{who} shared the folder '{folder.name}' with you",
+        related_object_type='page_folder', related_object_id=folder.id,
     )
 
 

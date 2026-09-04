@@ -10,12 +10,17 @@ than trusting a caller who already checked once, matching the rest of this
 app's service layer.
 """
 
+from asgiref.sync import sync_to_async
+from django.contrib.auth import get_user_model
 from django.db.models import Q
 
 from company.services import is_company_member
+from notifications_and_activity.services import notify_folder_shared
 from users.models import CompanyUserProfile
 
 from .models import FolderShare, Page, PageFolder
+
+User = get_user_model()
 
 
 def _folder_access_q(user, *, prefix: str = '') -> Q:
@@ -100,9 +105,43 @@ async def share_folder(user, folder, target_user_ids: list) -> tuple[list | None
         return None, 'invalid_members'
     shares = []
     for user_id in valid_ids:
-        share, _ = await FolderShare.objects.aget_or_create(folder=folder, user_id=user_id)
+        share, created = await FolderShare.objects.aget_or_create(folder=folder, user_id=user_id)
         shares.append(share)
+        # Only on a genuinely new grant -- re-sharing with someone who
+        # already has access must not re-notify them (Rule 8: repeating the
+        # request produces no extra side effects).
+        if created:
+            recipient = await User.objects.filter(id=user_id).afirst()
+            await sync_to_async(notify_folder_shared, thread_sensitive=True)(folder, recipient, user)
     return shares, None
+
+
+async def list_folder_shares(user, folder):
+    """Who currently has access to this folder. Readable by anyone who can
+    already open the folder (creator or shared) -- they can see its contents,
+    so who else can is not a further disclosure -- but only the creator may
+    change the list (see share_folder/revoke_folder_share)."""
+    if not await _can_access_folder(user, folder):
+        return None, 'forbidden'
+    shares = [
+        s async for s in FolderShare.objects.filter(folder=folder)
+        .select_related('user').order_by('created_at')
+    ]
+    return shares, None
+
+
+async def revoke_folder_share(user, folder, target_user_id) -> tuple[bool, str | None]:
+    """Removes one person's access. The creator may revoke anyone; a shared
+    collaborator may revoke only themselves (leaving a folder they were
+    added to). Revoking access nobody has is reported as 'not_found' rather
+    than silently succeeding, so the caller can tell the two apart."""
+    is_creator = folder.created_by_id == user.id
+    if not is_creator and str(target_user_id) != str(user.id):
+        return False, 'forbidden'
+    deleted, _ = await FolderShare.objects.filter(folder=folder, user_id=target_user_id).adelete()
+    if not deleted:
+        return False, 'not_found'
+    return True, None
 
 
 async def list_pages(user, folder):

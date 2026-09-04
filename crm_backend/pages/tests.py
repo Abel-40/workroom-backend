@@ -6,6 +6,8 @@ other endpoint's tests check tenant isolation (DEVELOPMENT_RULES Rule 12).
 import json
 
 from api.tests import TwoCompanyTestCase, auth_header
+from notifications_and_activity.models import Notification
+from users.models import CompanyUserProfile, User
 
 from pages.markdown import markdown_to_blocks
 from pages.models import FolderShare, Page, PageFolder
@@ -237,3 +239,116 @@ class FolderPrivacyTests(TwoCompanyTestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertFalse(FolderShare.objects.filter(folder=self.folder).exists())
+
+
+class FolderShareManagementTests(TwoCompanyTestCase):
+    """Sharing is only half a Google-Docs-style flow without the other half:
+    seeing who currently has access, taking it back, and telling the person
+    they were given it in the first place."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = PageFolder.objects.create(name='Founder notes', company=self.company_a, created_by=self.owner_a)
+        # A second ordinary member of company_a -- the shared fixture only
+        # provides one, and "a collaborator may not revoke someone else"
+        # needs two distinct non-owners.
+        self.other_member_a = User.objects.create_user(
+            email='other-member-a@example.com', username='other-member-a', password='Kx9#mQ2vLp8Z',
+        )
+        CompanyUserProfile.objects.create(
+            user=self.other_member_a, company=self.company_a, department=self.department_a,
+            role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+
+    def _share_with(self, user):
+        return self.client.post(
+            f'/api/v1/page-folders/{self.folder.id}/share/', json.dumps({'user_ids': [str(user.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+
+    def test_sharing_notifies_the_recipient_exactly_once(self):
+        self.assertEqual(self._share_with(self.member_a).status_code, 200)
+        notifications = Notification.objects.filter(
+            recipient=self.member_a, type=Notification.Type.FOLDER_SHARED,
+        )
+        self.assertEqual(notifications.count(), 1)
+        self.assertEqual(notifications.first().related_object_id, self.folder.id)
+
+        # Re-sharing with someone who already has access is a no-op, not a
+        # second notification (retry-safety, Rule 8).
+        self.assertEqual(self._share_with(self.member_a).status_code, 200)
+        self.assertEqual(notifications.count(), 1)
+
+    def test_owner_and_shared_member_can_both_see_the_access_list(self):
+        self._share_with(self.member_a)
+        for caller in (self.owner_a, self.member_a):
+            response = self.client.get(
+                f'/api/v1/page-folders/{self.folder.id}/shares/', **auth_header(caller),
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()['data']
+            self.assertEqual(data['owner_id'], str(self.owner_a.id))
+            self.assertEqual([s['user_id'] for s in data['results']], [str(self.member_a.id)])
+
+    def test_a_member_with_no_access_cannot_see_the_access_list(self):
+        response = self.client.get(
+            f'/api/v1/page-folders/{self.folder.id}/shares/', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_another_company_cannot_see_the_access_list(self):
+        response = self.client.get(
+            f'/api/v1/page-folders/{self.folder.id}/shares/', **auth_header(self.owner_b),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_creator_can_revoke_access_and_the_folder_disappears_again(self):
+        self._share_with(self.member_a)
+        response = self.client.delete(
+            f'/api/v1/page-folders/{self.folder.id}/shares/{self.member_a.id}/', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(FolderShare.objects.filter(folder=self.folder, user=self.member_a).exists())
+
+        listing = self.client.get('/api/v1/page-folders/', **auth_header(self.member_a))
+        self.assertNotIn(str(self.folder.id), [f['id'] for f in listing.json()['data']['results']])
+
+    def test_a_shared_member_can_remove_themselves_but_not_anyone_else(self):
+        self._share_with(self.member_a)
+        self._share_with(self.owner_a)  # no-op: creator already has access
+
+        other = self.other_member_a
+        self.client.post(
+            f'/api/v1/page-folders/{self.folder.id}/share/', json.dumps({'user_ids': [str(other.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+
+        # member_a may not revoke someone else's access...
+        forbidden = self.client.delete(
+            f'/api/v1/page-folders/{self.folder.id}/shares/{other.id}/', **auth_header(self.member_a),
+        )
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertTrue(FolderShare.objects.filter(folder=self.folder, user=other).exists())
+
+        # ...but may leave the folder themselves.
+        allowed = self.client.delete(
+            f'/api/v1/page-folders/{self.folder.id}/shares/{self.member_a.id}/', **auth_header(self.member_a),
+        )
+        self.assertEqual(allowed.status_code, 200)
+        self.assertFalse(FolderShare.objects.filter(folder=self.folder, user=self.member_a).exists())
+
+    def test_revoking_access_nobody_has_is_reported_not_silently_accepted(self):
+        response = self.client.delete(
+            f'/api/v1/page-folders/{self.folder.id}/shares/{self.member_a.id}/', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_listing_marks_which_folders_the_caller_owns(self):
+        self._share_with(self.member_a)
+        response = self.client.get('/api/v1/page-folders/', **auth_header(self.member_a))
+        folder = next(f for f in response.json()['data']['results'] if f['id'] == str(self.folder.id))
+        self.assertFalse(folder['is_owner'])
+
+        response = self.client.get('/api/v1/page-folders/', **auth_header(self.owner_a))
+        folder = next(f for f in response.json()['data']['results'] if f['id'] == str(self.folder.id))
+        self.assertTrue(folder['is_owner'])
