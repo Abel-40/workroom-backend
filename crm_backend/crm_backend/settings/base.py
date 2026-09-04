@@ -84,6 +84,7 @@ INSTALLED_APPS = [
     'ai_agent',
     'connected_apps',
     'pages',
+    'todos',
 ]
 
 MIDDLEWARE = [

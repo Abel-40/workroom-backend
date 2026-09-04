@@ -50,6 +50,7 @@ from .routers.projects import router as projects_router
 from .routers.task_types import router as task_types_router
 from .routers.tasks import router as tasks_router
 from .routers.teams import router as teams_router
+from .routers.todos import router as todos_router
 from .schemas import (
     ApiResponse,
     CheckoutIn,
@@ -77,6 +78,7 @@ api.add_router('', tasks_router)
 api.add_router('', documents_router)
 api.add_router('', ai_router)
 api.add_router('', pages_router)
+api.add_router('/todos', todos_router)
 api.add_router('/notifications', notifications_router)
 api.add_router('/analytics', analytics_router)
 api.add_router('/departments', departments_router)

@@ -4,11 +4,13 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 from uuid import UUID
 
+from company.services import get_member_company
 from ninja import File, Form, Router, Schema
 from ninja.files import UploadedFile
 from projects_and_tasks import services
 from projects_and_tasks.models import Attachment, Task, TaskApproval, TaskTimeLog
 from pydantic import Field
+from todos import services as todo_services
 from utils.api_response import api_response as payload
 from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
@@ -166,6 +168,33 @@ async def list_tasks(request, project_id: UUID, status: StatusLiteral | None = N
     return payload('Tasks retrieved successfully.', 200, True, {
         'results': [await task_data(task) for task in items], 'meta': meta,
     })
+
+
+@router.get('/tasks/assigned-to-me/', auth=auth, response={200: ApiResponse, 404: ApiResponse})
+async def list_tasks_assigned_to_me(
+    request, open_only: bool = True, page: int = 1, page_size: int = DEFAULT_PAGE_SIZE,
+):
+    """The caller's own assigned work, across every project, nearest deadline
+    first. Scoped by assignment rather than by view permission: this is the
+    "what am I actually on the hook for" list that the personal to-do screen
+    and its AI generation build from, so it must never include work the
+    caller merely has permission to look at.
+
+    Declared here rather than under /tasks/{task_id}/ below because Ninja
+    matches routes in declaration order -- a literal path registered after a
+    parameterised sibling would be swallowed by it.
+    """
+    company = await get_member_company(request.auth)
+    if company is None:
+        return payload('You do not belong to a company.', 404, False)
+    queryset = todo_services.list_assigned_tasks(request.auth, company, open_only=open_only)
+    items, meta = await paginate(queryset, page, page_size)
+    results = []
+    for task in items:
+        data = await task_data(task)
+        data['project_title'] = task.project.title if task.project_id else None
+        results.append(data)
+    return payload('Assigned tasks retrieved successfully.', 200, True, {'results': results, 'meta': meta})
 
 
 @router.get('/tasks/{task_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
