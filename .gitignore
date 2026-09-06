@@ -54,3 +54,5 @@ DEVELOPMENT_RULES.md
 IMPLEMENTATION_PLAN.md
 V1_SCOPE.md
 AI_SERVICE_SPEC.md
+# Local-only compose overrides (host port remaps for side-by-side stacks)
+docker-compose.override.yml
