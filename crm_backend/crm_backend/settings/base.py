@@ -202,16 +202,25 @@ SIMPLE_JWT = {
     # 'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
 }
 
-# CORS settings
-CORS_ALLOWED_ORIGINS = env('CORS_ALLOWED_ORIGINS')
-CORS_ALLOW_CREDENTIALS = True
-CSRF_TRUSTED_ORIGINS = env('CSRF_TRUSTED_ORIGINS')
+# The frontend's public origin -- the single knob for where users are sent.
+# Every user-facing link is built from this: invite-accept links
+# (users/tasks.py, users/services.py), the {{ frontend_url }} CTA in every
+# templates/emails/*.html, and Stripe Checkout success/cancel (api/api.py).
+# Change the port here (or in .env) and all of them follow.
+#
+# Trailing slash is stripped once, here, so call sites can just concatenate
+# instead of each repeating .rstrip('/'). Call sites read settings.FRONTEND_URL
+# directly -- never getattr() with their own fallback, which previously let a
+# divergent 'http://your-frontend.com' literal sit in the invite path.
+FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:5173').rstrip('/')
 
-# Used to build invite-accept and Stripe Checkout success/cancel links
-# (api/api.py, users/tasks.py, users/services.py). Was previously read via
-# getattr(settings, 'FRONTEND_URL', ...) with no assignment here, so it was
-# silently always the hardcoded fallback regardless of .env -- fixed.
-FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:3000')
+# CORS settings. The frontend origin is folded in rather than duplicated in
+# .env: a frontend that receives these links must also be allowed to call the
+# API and post forms, so deriving both from FRONTEND_URL keeps a port change
+# from silently breaking CORS. dict.fromkeys dedupes while preserving order.
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys([*env('CORS_ALLOWED_ORIGINS'), FRONTEND_URL]))
+CORS_ALLOW_CREDENTIALS = True
+CSRF_TRUSTED_ORIGINS = list(dict.fromkeys([*env('CSRF_TRUSTED_ORIGINS'), FRONTEND_URL]))
 
 # Stripe settings
 STRIPE_PUBLISHABLE_KEY = env('STRIPE_PUBLISHABLE_KEY')
@@ -262,6 +271,10 @@ EMAIL_HOST_USER = env('COMPANY_EMAIL')
 EMAIL_HOST_PASSWORD = env('EMAIL_PASSWORD')
 EMAIL_PORT = env('EMAIL_PORT')
 EMAIL_USE_TLS = True
+# Previously unset -- silently fell back to Django's built-in
+# 'webmaster@localhost'. Every outgoing email (invites, notifications,
+# welcome) should visibly come from Workroom.
+DEFAULT_FROM_EMAIL = f'Workroom <{EMAIL_HOST_USER}>'
 
 # Structured logging (Phase 11). request_id comes from utils/middleware.py
 # via utils/logging.py's filter; '-' outside a request (e.g. management
