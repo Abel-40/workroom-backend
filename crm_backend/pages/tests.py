@@ -6,9 +6,11 @@ other endpoint's tests check tenant isolation (DEVELOPMENT_RULES Rule 12).
 import json
 
 from api.tests import TwoCompanyTestCase, auth_header
+from notifications_and_activity.models import Notification
+from users.models import CompanyUserProfile, User
 
 from pages.markdown import markdown_to_blocks
-from pages.models import Page, PageFolder
+from pages.models import FolderShare, Page, PageFolder
 from pages.services import blocks_to_text
 
 
@@ -160,3 +162,193 @@ class PageSecurityTests(TwoCompanyTestCase):
         response = self.client.get('/api/v1/pages/', **auth_header(self.owner_a))
         titles = {p['title'] for p in response.json()['data']['results']}
         self.assertEqual(titles, {'Company A page'})
+
+
+class FolderPrivacyTests(TwoCompanyTestCase):
+    """A folder defaults to creator-only visibility within its own company;
+    FolderShare is the only way another member gets access. member_a is a
+    real second user of company_a (not its owner), so it's the right
+    fixture for "same company, not the creator, not shared" -- the actual
+    new rule under test, as distinct from the pre-existing cross-company
+    checks above."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = PageFolder.objects.create(name='Founder notes', company=self.company_a, created_by=self.owner_a)
+        self.page = Page.objects.create(folder=self.folder, title='Runway plan', created_by=self.owner_a)
+
+    def test_creator_can_list_view_and_edit_their_own_folder(self):
+        listing = self.client.get('/api/v1/page-folders/', **auth_header(self.owner_a))
+        self.assertIn(str(self.folder.id), [f['id'] for f in listing.json()['data']['results']])
+
+        get_response = self.client.get(f'/api/v1/pages/{self.page.id}/', **auth_header(self.owner_a))
+        self.assertEqual(get_response.status_code, 200)
+
+        patch_response = self.client.patch(
+            f'/api/v1/pages/{self.page.id}/', json.dumps({'title': 'Updated plan'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(patch_response.status_code, 200)
+
+    def test_same_company_non_shared_member_cannot_see_or_open_the_folder(self):
+        listing = self.client.get('/api/v1/page-folders/', **auth_header(self.member_a))
+        self.assertNotIn(str(self.folder.id), [f['id'] for f in listing.json()['data']['results']])
+
+        pages_response = self.client.get(f'/api/v1/page-folders/{self.folder.id}/pages/', **auth_header(self.member_a))
+        self.assertEqual(pages_response.status_code, 403)
+
+        page_response = self.client.get(f'/api/v1/pages/{self.page.id}/', **auth_header(self.member_a))
+        self.assertEqual(page_response.status_code, 403)
+
+    def test_sharing_grants_view_and_edit_but_not_delete(self):
+        share_response = self.client.post(
+            f'/api/v1/page-folders/{self.folder.id}/share/', json.dumps({'user_ids': [str(self.member_a.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(share_response.status_code, 200)
+        self.assertTrue(FolderShare.objects.filter(folder=self.folder, user=self.member_a).exists())
+
+        listing = self.client.get('/api/v1/page-folders/', **auth_header(self.member_a))
+        self.assertIn(str(self.folder.id), [f['id'] for f in listing.json()['data']['results']])
+
+        patch_response = self.client.patch(
+            f'/api/v1/pages/{self.page.id}/', json.dumps({'title': 'Edited by shared member'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(patch_response.status_code, 200)
+
+        # Shared access is not ownership: no delete, no re-sharing.
+        delete_response = self.client.delete(f'/api/v1/page-folders/{self.folder.id}/', **auth_header(self.member_a))
+        self.assertEqual(delete_response.status_code, 403)
+
+    def test_only_the_creator_can_share_the_folder(self):
+        response = self.client.post(
+            f'/api/v1/page-folders/{self.folder.id}/share/', json.dumps({'user_ids': [str(self.member_a.id)]}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        # member_a has no access at all yet, so this 403s before even
+        # reaching the "only the creator may share" check -- get_folder_for_user
+        # runs first, matching every other folder endpoint.
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(FolderShare.objects.filter(folder=self.folder).exists())
+
+    def test_cannot_share_with_someone_outside_the_company(self):
+        response = self.client.post(
+            f'/api/v1/page-folders/{self.folder.id}/share/', json.dumps({'user_ids': [str(self.owner_b.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(FolderShare.objects.filter(folder=self.folder).exists())
+
+
+class FolderShareManagementTests(TwoCompanyTestCase):
+    """Sharing is only half a Google-Docs-style flow without the other half:
+    seeing who currently has access, taking it back, and telling the person
+    they were given it in the first place."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = PageFolder.objects.create(name='Founder notes', company=self.company_a, created_by=self.owner_a)
+        # A second ordinary member of company_a -- the shared fixture only
+        # provides one, and "a collaborator may not revoke someone else"
+        # needs two distinct non-owners.
+        self.other_member_a = User.objects.create_user(
+            email='other-member-a@example.com', username='other-member-a', password='Kx9#mQ2vLp8Z',
+        )
+        CompanyUserProfile.objects.create(
+            user=self.other_member_a, company=self.company_a, department=self.department_a,
+            role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+
+    def _share_with(self, user):
+        return self.client.post(
+            f'/api/v1/page-folders/{self.folder.id}/share/', json.dumps({'user_ids': [str(user.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+
+    def test_sharing_notifies_the_recipient_exactly_once(self):
+        self.assertEqual(self._share_with(self.member_a).status_code, 200)
+        notifications = Notification.objects.filter(
+            recipient=self.member_a, type=Notification.Type.FOLDER_SHARED,
+        )
+        self.assertEqual(notifications.count(), 1)
+        self.assertEqual(notifications.first().related_object_id, self.folder.id)
+
+        # Re-sharing with someone who already has access is a no-op, not a
+        # second notification (retry-safety, Rule 8).
+        self.assertEqual(self._share_with(self.member_a).status_code, 200)
+        self.assertEqual(notifications.count(), 1)
+
+    def test_owner_and_shared_member_can_both_see_the_access_list(self):
+        self._share_with(self.member_a)
+        for caller in (self.owner_a, self.member_a):
+            response = self.client.get(
+                f'/api/v1/page-folders/{self.folder.id}/shares/', **auth_header(caller),
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()['data']
+            self.assertEqual(data['owner_id'], str(self.owner_a.id))
+            self.assertEqual([s['user_id'] for s in data['results']], [str(self.member_a.id)])
+
+    def test_a_member_with_no_access_cannot_see_the_access_list(self):
+        response = self.client.get(
+            f'/api/v1/page-folders/{self.folder.id}/shares/', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_another_company_cannot_see_the_access_list(self):
+        response = self.client.get(
+            f'/api/v1/page-folders/{self.folder.id}/shares/', **auth_header(self.owner_b),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_creator_can_revoke_access_and_the_folder_disappears_again(self):
+        self._share_with(self.member_a)
+        response = self.client.delete(
+            f'/api/v1/page-folders/{self.folder.id}/shares/{self.member_a.id}/', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(FolderShare.objects.filter(folder=self.folder, user=self.member_a).exists())
+
+        listing = self.client.get('/api/v1/page-folders/', **auth_header(self.member_a))
+        self.assertNotIn(str(self.folder.id), [f['id'] for f in listing.json()['data']['results']])
+
+    def test_a_shared_member_can_remove_themselves_but_not_anyone_else(self):
+        self._share_with(self.member_a)
+        self._share_with(self.owner_a)  # no-op: creator already has access
+
+        other = self.other_member_a
+        self.client.post(
+            f'/api/v1/page-folders/{self.folder.id}/share/', json.dumps({'user_ids': [str(other.id)]}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+
+        # member_a may not revoke someone else's access...
+        forbidden = self.client.delete(
+            f'/api/v1/page-folders/{self.folder.id}/shares/{other.id}/', **auth_header(self.member_a),
+        )
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertTrue(FolderShare.objects.filter(folder=self.folder, user=other).exists())
+
+        # ...but may leave the folder themselves.
+        allowed = self.client.delete(
+            f'/api/v1/page-folders/{self.folder.id}/shares/{self.member_a.id}/', **auth_header(self.member_a),
+        )
+        self.assertEqual(allowed.status_code, 200)
+        self.assertFalse(FolderShare.objects.filter(folder=self.folder, user=self.member_a).exists())
+
+    def test_revoking_access_nobody_has_is_reported_not_silently_accepted(self):
+        response = self.client.delete(
+            f'/api/v1/page-folders/{self.folder.id}/shares/{self.member_a.id}/', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_listing_marks_which_folders_the_caller_owns(self):
+        self._share_with(self.member_a)
+        response = self.client.get('/api/v1/page-folders/', **auth_header(self.member_a))
+        folder = next(f for f in response.json()['data']['results'] if f['id'] == str(self.folder.id))
+        self.assertFalse(folder['is_owner'])
+
+        response = self.client.get('/api/v1/page-folders/', **auth_header(self.owner_a))
+        folder = next(f for f in response.json()['data']['results'] if f['id'] == str(self.folder.id))
+        self.assertTrue(folder['is_owner'])

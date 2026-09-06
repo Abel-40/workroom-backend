@@ -282,8 +282,6 @@ async def regenerate_task_ai_content(request, task_id: UUID, data: AITaskRegener
         return payload('You do not have permission to view this task.', 403, False)
     if not await user_can_manage_task(request.auth, task):
         return payload('You do not have permission to modify this task.', 403, False)
-    if task.source != task.SOURCE.AI_GENERATED:
-        return payload('Only AI-generated tasks can have their AI content regenerated.', 400, False)
 
     regeneration = await AITaskContentRegeneration.objects.acreate(
         task=task, requested_by=request.auth, instructions=data.instructions,

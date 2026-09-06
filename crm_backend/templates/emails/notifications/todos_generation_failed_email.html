@@ -1,0 +1,24 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-amber{% endblock %}
+{% block eyebrow %}Your to-dos{% endblock %}
+{% block heading %}We could not build your list{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-amber"><span>&#9888;&#65039;</span></div>
+
+    <div class="wr-highlight wr-highlight-amber">{{ title }}</div>
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-amber">Try Again</a>
+    </div>
+
+    <p class="wr-muted" style="margin-top: 24px;">
+        You can turn off optional notifications like this one from Settings &rarr; Account.
+    </p>
+{% endblock %}

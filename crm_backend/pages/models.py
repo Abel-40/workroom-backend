@@ -36,6 +36,24 @@ class PageFolder(UUIDModel):
         return f"{self.name} ({self.company_id})"
 
 
+class FolderShare(UUIDModel):
+    """Grants one company member view/edit access to a folder they didn't
+    create. Default visibility is creator-only (see pages/services.py) --
+    this is the explicit exception, one row per (folder, user)."""
+
+    folder = models.ForeignKey(PageFolder, on_delete=models.CASCADE, related_name='shares')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='shared_folders')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['folder', 'user'], name='unique_folder_share_per_user'),
+        ]
+
+    def __str__(self):
+        return f"{self.folder_id} shared with {self.user_id}"
+
+
 class Page(UUIDModel):
     """A rich-text page inside a PageFolder. ``blocks`` mirrors the
     frontend's existing InfoPageBlock shape exactly

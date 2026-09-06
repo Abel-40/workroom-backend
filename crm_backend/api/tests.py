@@ -8,7 +8,7 @@ focused on cross-tenant rejection over raw endpoint coverage.
 
 import hashlib
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from ai_agent.models import AIAssistantQuery, AIGeneratedTask, AIGeneration, AIProjectHealthSummary
@@ -19,7 +19,7 @@ from django.test import TestCase
 from django.utils import timezone
 from notifications_and_activity.models import Notification
 from pages.models import Page, PageFolder
-from projects_and_tasks.models import Task
+from projects_and_tasks.models import Project, Task
 from rest_framework_simplejwt.tokens import RefreshToken
 from users.models import CompanyUserProfile, PendingInvite, User
 
@@ -54,7 +54,14 @@ class TwoCompanyTestCase(TestCase):
         self.company_b = Company.objects.create(name='Company B', owner=self.owner_b, sector=sector)
 
     def create_project(self, owner=None, **overrides):
-        body = {'title': 'Website Revamp', 'visibility': 'company'}
+        # Deadline defaults far in the future so any reasonably-future task
+        # deadline a test supplies (see TaskSecurityTests.create_task) safely
+        # satisfies the "task deadline strictly before project deadline"
+        # rule without every test having to compute one relative to `now`.
+        body = {
+            'title': 'Website Revamp', 'visibility': 'company',
+            'deadline': (timezone.now() + timedelta(days=365)).isoformat(),
+        }
         body.update(overrides)
         response = self.client.post(
             '/api/v1/projects/', json.dumps(body), content_type='application/json',
@@ -322,6 +329,32 @@ class InvitationTokenSecurityTests(TestCase):
         self.assertEqual(profile.department_id, department.id)
         self.assertEqual(profile.role, CompanyUserProfile.Role.DEPARTMENT_LEADER)
 
+    def test_accepting_a_dl_invite_sets_the_department_leader_when_unset(self):
+        """A12: a department invited-as-DL should show as the department's
+        leader afterward, not 'no leader assigned'."""
+        department = Department.objects.create(name='Design', company=self.company)
+        raw_token = self.send_invite_and_get_raw_token(
+            email='leader@example.com', department=str(department.id), role='DL',
+        )
+        self.client.post('/api/v1/emp/accept_invite/', self.accept_payload(raw_token))
+        department.refresh_from_db()
+        self.assertEqual(department.leader.email, 'leader@example.com')
+
+    def test_accepting_a_dl_invite_does_not_override_an_existing_leader(self):
+        department = Department.objects.create(name='Design', company=self.company)
+        existing_leader = User.objects.create_user(
+            email='existing-leader@example.com', username='existing-leader', password='Kx9#mQ2vLp8Z',
+        )
+        department.leader = existing_leader
+        department.save(update_fields=['leader'])
+
+        raw_token = self.send_invite_and_get_raw_token(
+            email='leader@example.com', department=str(department.id), role='DL',
+        )
+        self.client.post('/api/v1/emp/accept_invite/', self.accept_payload(raw_token))
+        department.refresh_from_db()
+        self.assertEqual(department.leader_id, existing_leader.id)
+
     def test_expired_invite_is_deleted_before_a_new_invite_is_issued(self):
         self.send_invite_and_get_raw_token()
         expired = PendingInvite.objects.get(email='invitee@example.com')
@@ -527,7 +560,8 @@ class ProjectSecurityTests(TwoCompanyTestCase):
 
 class TaskSecurityTests(TwoCompanyTestCase):
     def create_task(self, project_id, owner=None, **overrides):
-        body = {'title': 'Build login page'}
+        # Comfortably before create_project's default 365-day-out deadline.
+        body = {'title': 'Build login page', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}
         body.update(overrides)
         response = self.client.post(
             f'/api/v1/projects/{project_id}/tasks/', json.dumps(body), content_type='application/json',
@@ -588,13 +622,601 @@ class TaskSecurityTests(TwoCompanyTestCase):
         )
         self.assertEqual(response.status_code, 422)
 
+    def test_status_update_is_now_assignee_only_even_for_the_creator(self):
+        """Regression test: user_can_update_task_status used to fall back to
+        user_can_manage_task (creator/manager), which is why the task's own
+        creator -- who is not the assignee here -- must now be rejected."""
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id']).json()['data']['task']  # created_by=owner_a
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/",
+            json.dumps({'assigned_to_id': str(self.member_a.id)}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        response = self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_status_endpoint_rejects_done_and_in_review_as_direct_targets(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id']).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/",
+            json.dumps({'assigned_to_id': str(self.member_a.id)}), content_type='application/json',
+            **auth_header(self.owner_a),
+        )
+        for target in ('Done', 'In Review'):
+            response = self.client.patch(
+                f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': target}),
+                content_type='application/json', **auth_header(self.member_a),
+            )
+            self.assertEqual(response.status_code, 400, target)
+
+
+class TaskTimeLogSecurityTests(TwoCompanyTestCase):
+    """TaskTimeLog replaces the old single-field Task.spent_time (no history,
+    no attribution -- see TimeTrackingModal.vue) with a real per-entry log.
+    Independent of the approval workflow (TaskApprovalWorkflowTests below):
+    logging time tracks effort spent, not task completion."""
+
+    def create_task(self, project_id, owner=None, **overrides):
+        # Comfortably before create_project's default 365-day-out deadline.
+        body = {'title': 'Build login page', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}
+        body.update(overrides)
+        response = self.client.post(
+            f'/api/v1/projects/{project_id}/tasks/', json.dumps(body), content_type='application/json',
+            **auth_header(owner or self.owner_a),
+        )
+        return response.json()['data']['task']
+
+    def log_time(self, task_id, actor, hours=2, **overrides):
+        body = {'hours': hours}
+        body.update(overrides)
+        return self.client.post(
+            f'/api/v1/tasks/{task_id}/time-logs/', json.dumps(body), content_type='application/json',
+            **auth_header(actor),
+        )
+
+    def test_assignee_can_log_time_but_cross_company_outsider_cannot(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        ok = self.log_time(task['id'], self.member_a, hours=3)
+        self.assertEqual(ok.status_code, 201)
+        self.assertEqual(ok.json()['data']['spent_time_hours'], 3)
+
+        forbidden = self.log_time(task['id'], self.owner_b)
+        self.assertEqual(forbidden.status_code, 403)
+
+    def test_same_company_non_assignee_non_manager_cannot_log_time(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])  # unassigned, created by owner_a
+        response = self.log_time(task['id'], self.member_a)
+        self.assertEqual(response.status_code, 403)
+
+    def test_hours_out_of_range_rejected(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        too_low = self.log_time(task['id'], self.owner_a, hours=0)
+        self.assertEqual(too_low.status_code, 422)
+        too_high = self.log_time(task['id'], self.owner_a, hours=30)
+        self.assertEqual(too_high.status_code, 422)
+
+    def test_entries_accumulate_and_list_reflects_them(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.log_time(task['id'], self.owner_a, hours=2, description='Initial pass')
+        second = self.log_time(task['id'], self.owner_a, hours=1.5, description='Review fixes')
+        self.assertEqual(second.json()['data']['spent_time_hours'], 3.5)
+
+        listing = self.client.get(f"/api/v1/tasks/{task['id']}/time-logs/", **auth_header(self.owner_a))
+        self.assertEqual(listing.status_code, 200)
+        entries = listing.json()['data']['results']
+        self.assertEqual(len(entries), 2)
+        self.assertEqual({e['description'] for e in entries}, {'Initial pass', 'Review fixes'})
+
+        get_task = self.client.get(f"/api/v1/tasks/{task['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(get_task.json()['data']['task']['spent_time_hours'], 3.5)
+
+    def test_delete_time_log_author_can_but_non_author_non_manager_cannot(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        entry = self.log_time(task['id'], self.member_a, hours=2).json()['data']['time_log']
+
+        forbidden = self.client.delete(f"/api/v1/tasks/{task['id']}/time-logs/{entry['id']}/", **auth_header(self.owner_b))
+        self.assertEqual(forbidden.status_code, 403)
+
+        ok = self.client.delete(f"/api/v1/tasks/{task['id']}/time-logs/{entry['id']}/", **auth_header(self.member_a))
+        self.assertEqual(ok.status_code, 200)
+        self.assertIsNone(ok.json()['data']['spent_time_hours'])
+
+    def test_my_time_logs_includes_project_and_task_context(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.create_task(project['id'])
+        self.log_time(task['id'], self.owner_a, hours=4, description='Design review')
+
+        mine = self.client.get('/api/v1/time-logs/mine/', **auth_header(self.owner_a))
+        self.assertEqual(mine.status_code, 200)
+        entries = mine.json()['data']['results']
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['project_title'], project['title'])
+        self.assertEqual(entries[0]['task_title'], task['title'])
+
+        others = self.client.get('/api/v1/time-logs/mine/', **auth_header(self.owner_b))
+        self.assertEqual(others.json()['data']['results'], [])
+
+
+class TaskApprovalWorkflowTests(TwoCompanyTestCase):
+    """Submit-for-approval / approve / reject, project auto-completion,
+    rejection-comment redaction, and deadline extension. See
+    projects_and_tasks.services for the business rules under test."""
+
+    def _project_and_assigned_task(self, deadline=None, **task_overrides):
+        project = self.create_project(owner=self.owner_a)
+        body = {
+            'title': 'Ship the thing',
+            'deadline': (deadline or (timezone.now() + timedelta(days=30))).isoformat(),
+        }
+        body.update(task_overrides)
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/", json.dumps(body),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        return project, task
+
+    def submit(self, task_id, user=None, **fields):
+        body = {'links': ['https://example.com/evidence']}
+        body.update(fields)
+        return self.client.post(
+            f'/api/v1/tasks/{task_id}/submit-for-approval/', body, **auth_header(user or self.member_a),
+        )
+
+    # -- submit-for-approval --------------------------------------------
+
+    def test_assignee_can_submit_evidence_and_task_moves_to_in_review(self):
+        project, task = self._project_and_assigned_task()
+        response = self.submit(task['id'])
+        self.assertEqual(response.status_code, 202)
+        data = response.json()['data']['approval']
+        self.assertEqual(data['status'], 'pending')
+        self.assertEqual(len(data['evidence']), 1)
+        detail = self.client.get(f"/api/v1/tasks/{task['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(detail.json()['data']['task']['status'], 'In Review')
+
+    def test_submit_accepts_a_file_and_a_page_as_evidence(self):
+        project, task = self._project_and_assigned_task()
+        folder = PageFolder.objects.create(company=self.company_a, name='Docs', created_by=self.owner_a)
+        page = Page.objects.create(folder=folder, title='Runbook')
+        upload = SimpleUploadedFile('proof.png', b'\x89PNG\r\n\x1a\n', content_type='image/png')
+        response = self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'files': [upload], 'page_ids': [str(page.id)]}, **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 202)
+        types = {row['type'] for row in response.json()['data']['approval']['evidence']}
+        self.assertEqual(types, {'file', 'page'})
+
+    def test_non_assignee_cannot_submit(self):
+        project, task = self._project_and_assigned_task()
+        response = self.submit(task['id'], user=self.owner_a)
+        self.assertEqual(response.status_code, 403)
+
+    def test_submit_rejected_when_task_not_in_progress(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Still To Do', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        response = self.submit(task['id'])
+        self.assertEqual(response.status_code, 400)
+
+    def test_submit_rejected_once_deadline_has_passed(self):
+        project, task = self._project_and_assigned_task()
+        # Bypasses create/update_task's deadline-vs-project validation --
+        # deliberately simulating a task whose deadline has simply elapsed
+        # since creation, not testing creation-time validation here.
+        Task.objects.filter(id=task['id']).update(deadline=timezone.now() - timedelta(minutes=1))
+        response = self.submit(task['id'])
+        self.assertEqual(response.status_code, 400)
+
+    def test_submit_rejected_with_no_evidence(self):
+        project, task = self._project_and_assigned_task()
+        response = self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/", {}, **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_submit_rejected_when_already_pending(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        response = self.submit(task['id'])
+        self.assertEqual(response.status_code, 400)
+
+    def test_submit_is_scoped_to_the_callers_own_company(self):
+        project, task = self._project_and_assigned_task()
+        response = self.submit(task['id'], user=self.owner_b)
+        self.assertEqual(response.status_code, 403)
+
+    # -- approve ----------------------------------------------------------
+
+    def test_creator_can_approve_and_task_becomes_done(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        response = self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['task']['status'], 'Done')
+
+    def test_approve_auto_completes_a_single_task_project(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        detail = self.client.get(f"/api/v1/projects/{project['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(detail.json()['data']['project']['status'], 'Done')
+
+    def test_approve_does_not_complete_project_while_a_task_remains_incomplete(self):
+        project, task = self._project_and_assigned_task()
+        self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Second task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.submit(task['id'])
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        detail = self.client.get(f"/api/v1/projects/{project['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(detail.json()['data']['project']['status'], 'Active')
+
+    def test_non_creator_cannot_approve(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        response = self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.member_a))
+        self.assertEqual(response.status_code, 403)
+
+    def test_approve_rejected_with_no_pending_approval(self):
+        project, task = self._project_and_assigned_task()
+        response = self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 400)
+
+    def test_approve_is_scoped_to_the_callers_own_company(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        response = self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 403)
+
+    # -- reject -------------------------------------------------------------
+
+    def reject(self, task_id, comment='Please add more detail.', user=None):
+        return self.client.post(
+            f'/api/v1/tasks/{task_id}/reject/', json.dumps({'comment': comment}),
+            content_type='application/json', **auth_header(user or self.owner_a),
+        )
+
+    def test_creator_can_reject_and_task_returns_to_in_progress(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        response = self.reject(task['id'])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['task']['status'], 'In Progress')
+
+    def test_reject_requires_a_comment(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        response = self.client.post(
+            f"/api/v1/tasks/{task['id']}/reject/", json.dumps({'comment': '   '}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_non_creator_cannot_reject(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        response = self.reject(task['id'], user=self.member_a)
+        self.assertEqual(response.status_code, 403)
+
+    def test_reject_rejected_with_no_pending_approval(self):
+        project, task = self._project_and_assigned_task()
+        response = self.reject(task['id'])
+        self.assertEqual(response.status_code, 400)
+
+    def test_reject_is_scoped_to_the_callers_own_company(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        response = self.reject(task['id'], user=self.owner_b)
+        self.assertEqual(response.status_code, 403)
+
+    def test_assignee_can_resubmit_after_rejection(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        self.reject(task['id'])
+        response = self.submit(task['id'])
+        self.assertEqual(response.status_code, 202)
+
+    # -- rejection-comment redaction -----------------------------------
+
+    def test_rejection_comment_visible_only_to_the_submitter(self):
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        self.reject(task['id'], comment='Not enough detail, please redo section 2.')
+
+        as_submitter = self.client.get(f"/api/v1/tasks/{task['id']}/approvals/", **auth_header(self.member_a))
+        self.assertEqual(as_submitter.json()['data']['results'][0]['rejection_comment'], 'Not enough detail, please redo section 2.')
+
+        # The approver who WROTE the comment does not get it echoed back
+        # either -- only submitted_by does.
+        as_approver = self.client.get(f"/api/v1/tasks/{task['id']}/approvals/", **auth_header(self.owner_a))
+        self.assertIsNone(as_approver.json()['data']['results'][0]['rejection_comment'])
+
+    def test_rejection_comment_hidden_from_a_different_company_member(self):
+        """A second member of the SAME company who can view the task (e.g.
+        via company-visibility) must still not see another user's private
+        rejection comment."""
+        project, task = self._project_and_assigned_task()
+        self.submit(task['id'])
+        self.reject(task['id'], comment='Private feedback for the assignee only.')
+
+        other_member = User.objects.create_user(
+            email='other-member-a@example.com', username='other-member-a', password='Kx9#mQ2vLp8Z',
+        )
+        CompanyUserProfile.objects.create(
+            user=other_member, company=self.company_a, role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+        response = self.client.get(f"/api/v1/tasks/{task['id']}/approvals/", **auth_header(other_member))
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()['data']['results'][0]['rejection_comment'])
+
+    # -- deadline extension -----------------------------------------------
+
+    def test_creator_can_extend_task_deadline(self):
+        project, task = self._project_and_assigned_task()
+        new_deadline = timezone.now() + timedelta(days=60)
+        response = self.client.post(
+            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_current_owner_cannot_extend_deadline_if_not_creator(self):
+        project, task = self._project_and_assigned_task()
+        self.client.patch(
+            f"/api/v1/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        new_deadline = timezone.now() + timedelta(days=60)
+        response = self.client.post(
+            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_extend_task_deadline_rejects_a_non_later_deadline(self):
+        project, task = self._project_and_assigned_task()
+        earlier = timezone.now() + timedelta(days=1)
+        response = self.client.post(
+            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': earlier.isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_extend_task_deadline_rejects_a_deadline_at_or_past_the_project_deadline(self):
+        project, task = self._project_and_assigned_task()
+        past_project_deadline = datetime.fromisoformat(project['deadline'])
+        response = self.client.post(
+            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': past_project_deadline.isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_creator_can_extend_project_deadline(self):
+        project = self.create_project(owner=self.owner_a)
+        new_deadline = timezone.now() + timedelta(days=1000)
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_extend_project_deadline_rejects_a_non_later_deadline(self):
+        project = self.create_project(owner=self.owner_a)
+        earlier = timezone.now()
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': earlier.isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_company_manager_cannot_extend_project_deadline(self):
+        """Deadline extension is narrower than general project management --
+        a Company Manager qualifies for user_can_manage_project but not for
+        user_can_extend_deadline."""
+        manager = User.objects.create_user(email='manager-a2@example.com', username='manager-a2', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(user=manager, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER)
+        project = self.create_project(owner=self.owner_a)
+        new_deadline = timezone.now() + timedelta(days=1000)
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
+            content_type='application/json', **auth_header(manager),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_extend_deadline_is_scoped_to_the_callers_own_company(self):
+        project, task = self._project_and_assigned_task()
+        response = self.client.post(
+            f"/api/v1/tasks/{task['id']}/extend-deadline/",
+            json.dumps({'deadline': (timezone.now() + timedelta(days=60)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_b),
+        )
+        self.assertEqual(response.status_code, 403)
+
+
+class ProjectDoneRulesTests(TwoCompanyTestCase):
+    """update_project's Done-completion and Done->Active-revert rules --
+    see projects_and_tasks.services.update_project."""
+
+    def set_status(self, project_id, status, user=None):
+        return self.client.patch(
+            f'/api/v1/projects/{project_id}/', json.dumps({'status': status}),
+            content_type='application/json', **auth_header(user or self.owner_a),
+        )
+
+    def test_cannot_manually_mark_an_empty_project_done(self):
+        project = self.create_project(owner=self.owner_a)
+        response = self.set_status(project['id'], 'Done')
+        self.assertEqual(response.status_code, 400)
+
+    def test_cannot_manually_mark_done_while_a_task_is_incomplete(self):
+        project = self.create_project(owner=self.owner_a)
+        self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Pending task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        response = self.set_status(project['id'], 'Done')
+        self.assertEqual(response.status_code, 400)
+
+    def test_creator_can_revert_a_done_project_to_active(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Only task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+
+        revert = self.set_status(project['id'], 'Active', user=self.owner_a)
+        self.assertEqual(revert.status_code, 200)
+        self.assertEqual(revert.json()['data']['project']['status'], 'Active')
+
+    def test_non_creator_cannot_revert_a_done_project(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Only task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+
+        manager = User.objects.create_user(email='manager-a3@example.com', username='manager-a3', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(user=manager, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER)
+        revert = self.set_status(project['id'], 'Active', user=manager)
+        self.assertEqual(revert.status_code, 403)
+
+    def test_cannot_add_a_task_to_a_completed_project(self):
+        """B5: a new (not-Done) task would silently break the "all tasks
+        Done" invariant Done represents, and would also let anyone who can
+        merely add tasks bypass the creator-only revert-from-Done rule
+        tested above."""
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Only task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        self.set_status(project['id'], 'Done')
+
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Sneaked in', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Project.objects.get(id=project['id']).tasks.filter(is_deleted=False).count(), 1)
+
+    def test_can_add_a_task_again_after_reopening(self):
+        project = self.create_project(owner=self.owner_a)
+        task = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Only task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.patch(
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
+        self.set_status(project['id'], 'Done')
+        self.set_status(project['id'], 'Active')
+
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Back in business', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 201)
+
 
 class TaskTimeLogSecurityTests(TwoCompanyTestCase):
     """TaskTimeLog replaces the old single-field Task.spent_time (no history,
     no attribution -- see TimeTrackingModal.vue) with a real per-entry log."""
 
     def create_task(self, project_id, owner=None, **overrides):
-        body = {'title': 'Build login page'}
+        # Comfortably before create_project's default 365-day-out deadline.
+        body = {'title': 'Build login page', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}
         body.update(overrides)
         response = self.client.post(
             f'/api/v1/projects/{project_id}/tasks/', json.dumps(body), content_type='application/json',
@@ -1012,7 +1634,8 @@ class NotificationTests(TwoCompanyTestCase):
     def test_task_assignment_notifies_the_assignee(self):
         project = self.create_project(owner=self.owner_a)
         task = self.client.post(
-            f"/api/v1/projects/{project['id']}/tasks/", json.dumps({'title': 'Build login page'}),
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Build login page', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
             content_type='application/json', **auth_header(self.owner_a),
         ).json()['data']['task']
         self.client.post(
@@ -1023,10 +1646,16 @@ class NotificationTests(TwoCompanyTestCase):
             recipient=self.member_a, type=Notification.Type.TASK_ASSIGNED,
         ).exists())
 
-    def test_task_completion_notifies_the_creator_but_not_the_assignee_completing_it(self):
+    def test_task_approval_notifies_the_submitter_but_not_the_approver(self):
+        """Regression coverage for the approval-workflow rewrite: Done is now
+        only reachable via approve_task (see TaskApprovalWorkflowTests for
+        the full flow), and the recipient inverts from the old direct-status
+        behavior -- the submitting assignee is notified, not the creator who
+        approved their own review request."""
         project = self.create_project(owner=self.owner_a)
         task = self.client.post(
-            f"/api/v1/projects/{project['id']}/tasks/", json.dumps({'title': 'Build login page'}),
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Build login page', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
             content_type='application/json', **auth_header(self.owner_a),
         ).json()['data']['task']
         self.client.post(
@@ -1034,14 +1663,19 @@ class NotificationTests(TwoCompanyTestCase):
             content_type='application/json', **auth_header(self.owner_a),
         )
         self.client.patch(
-            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'Done'}),
+            f"/api/v1/tasks/{task['id']}/status/", json.dumps({'status': 'In Progress'}),
             content_type='application/json', **auth_header(self.member_a),
         )
+        self.client.post(
+            f"/api/v1/tasks/{task['id']}/submit-for-approval/",
+            {'links': ['https://example.com/evidence']}, **auth_header(self.member_a),
+        )
+        self.client.post(f"/api/v1/tasks/{task['id']}/approve/", **auth_header(self.owner_a))
         self.assertTrue(Notification.objects.filter(
-            recipient=self.owner_a, type=Notification.Type.TASK_COMPLETED,
+            recipient=self.member_a, type=Notification.Type.TASK_APPROVED,
         ).exists())
         self.assertFalse(Notification.objects.filter(
-            recipient=self.member_a, type=Notification.Type.TASK_COMPLETED,
+            recipient=self.owner_a, type=Notification.Type.TASK_APPROVED,
         ).exists())
 
 
@@ -1276,7 +1910,8 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
 class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
     def _create_ai_generated_task(self, project_id, owner):
         task = self.client.post(
-            f'/api/v1/projects/{project_id}/tasks/', json.dumps({'title': 'Define requirements'}),
+            f'/api/v1/projects/{project_id}/tasks/',
+            json.dumps({'title': 'Define requirements', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
             content_type='application/json', **auth_header(owner),
         ).json()['data']['task']
         Task.objects.filter(id=task['id']).update(source=Task.SOURCE.AI_GENERATED)
@@ -1293,17 +1928,20 @@ class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 202)
         mock_delay.assert_called_once()
 
-    def test_regenerate_ai_content_rejects_a_manual_task(self):
+    @patch('api.routers.ai.process_task_content_regeneration.delay')
+    def test_regenerate_ai_content_accepts_a_manual_task(self, mock_delay):
         project = self.create_project(owner=self.owner_a)
         task = self.client.post(
-            f"/api/v1/projects/{project['id']}/tasks/", json.dumps({'title': 'Manual task'}),
+            f"/api/v1/projects/{project['id']}/tasks/",
+            json.dumps({'title': 'Manual task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
             content_type='application/json', **auth_header(self.owner_a),
         ).json()['data']['task']
         response = self.client.post(
             f"/api/v1/tasks/{task['id']}/regenerate-ai-content/", json.dumps({}),
             content_type='application/json', **auth_header(self.owner_a),
         )
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 202)
+        mock_delay.assert_called_once()
 
     def test_regenerate_ai_content_hidden_from_other_company(self):
         project = self.create_project(owner=self.owner_a)
@@ -1313,3 +1951,87 @@ class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
             content_type='application/json', **auth_header(self.owner_b),
         )
         self.assertEqual(response.status_code, 403)
+
+
+class SelfServiceProfileTests(TwoCompanyTestCase):
+    """GET/PATCH /company/members/me/profile/ and the resume upload/download
+    pair -- self-service only, never another member's row."""
+
+    def test_get_own_profile_returns_fields(self):
+        response = self.client.get('/api/v1/company/members/me/profile/', **auth_header(self.member_a))
+        self.assertEqual(response.status_code, 200)
+        profile = response.json()['data']['profile']
+        self.assertIn('profession', profile)
+        self.assertIn('has_resume', profile)
+        self.assertFalse(profile['has_resume'])
+
+    def test_update_own_profile_partial_update(self):
+        response = self.client.patch(
+            '/api/v1/company/members/me/profile/', json.dumps({'profession': 'Backend Engineer', 'skype': 'me.skype'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        profile = response.json()['data']['profile']
+        self.assertEqual(profile['profession'], 'Backend Engineer')
+        self.assertEqual(profile['skype'], 'me.skype')
+        # Untouched field survives the partial update.
+        db_profile = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
+        self.assertEqual(db_profile.phone_number, 'Not provided')
+
+    def test_owner_with_no_profile_row_gets_no_profile_error(self):
+        response = self.client.get('/api/v1/company/members/me/profile/', **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['message'], 'The company owner has no profile.')
+
+    def test_upload_resume_accepts_pdf(self):
+        resume = SimpleUploadedFile('cv.pdf', b'%PDF-1.4 fake', content_type='application/pdf')
+        response = self.client.post(
+            '/api/v1/company/members/me/profile/resume/', {'resume': resume}, **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['data']['profile']['has_resume'])
+
+    def test_upload_resume_rejects_wrong_content_type(self):
+        resume = SimpleUploadedFile('cv.png', b'not-a-resume', content_type='image/png')
+        response = self.client.post(
+            '/api/v1/company/members/me/profile/resume/', {'resume': resume}, **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_upload_resume_rejects_oversized_file(self):
+        resume = SimpleUploadedFile('cv.pdf', b'x' * (5 * 1024 * 1024 + 1), content_type='application/pdf')
+        response = self.client.post(
+            '/api/v1/company/members/me/profile/resume/', {'resume': resume}, **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_download_resume_requires_a_resume_to_exist(self):
+        response = self.client.get('/api/v1/company/members/me/profile/resume/', **auth_header(self.member_a))
+        self.assertEqual(response.status_code, 404)
+
+    def test_download_resume_after_upload(self):
+        resume = SimpleUploadedFile('cv.pdf', b'%PDF-1.4 fake', content_type='application/pdf')
+        self.client.post('/api/v1/company/members/me/profile/resume/', {'resume': resume}, **auth_header(self.member_a))
+        response = self.client.get('/api/v1/company/members/me/profile/resume/', **auth_header(self.member_a))
+        self.assertEqual(response.status_code, 200)
+
+    def test_profile_update_is_scoped_to_the_caller_own_row(self):
+        """A second member's PATCH must never touch member_a's row -- there's
+        no target-user parameter at all, so this proves it's truly
+        self-only, not just permission-checked against some target."""
+        other_member = User.objects.create_user(
+            email='other-member-a@example.com', username='other-member-a', password='Kx9#mQ2vLp8Z',
+        )
+        CompanyUserProfile.objects.create(
+            user=other_member, company=self.company_a, role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+        self.client.patch(
+            '/api/v1/company/members/me/profile/', json.dumps({'profession': 'Hacked'}),
+            content_type='application/json', **auth_header(other_member),
+        )
+        untouched = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
+        self.assertNotEqual(untouched.profession, 'Hacked')
+
+    def test_requires_authentication(self):
+        response = self.client.get('/api/v1/company/members/me/profile/')
+        self.assertEqual(response.status_code, 401)

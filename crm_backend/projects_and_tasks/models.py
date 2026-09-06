@@ -71,10 +71,49 @@ class Project(UUIDModel):
         return (completed / total) * 100
 
 
+class ProjectVisibilityRequest(UUIDModel):
+    """A Department Member's request to raise a private project to
+    department visibility -- see projects_and_tasks.services
+    .request_visibility_change/approve_visibility_request/deny_visibility_request.
+    Company-level visibility is deliberately out of a DM's reach through this
+    workflow: only a Department Leader (or Owner/CM) may raise a project to
+    company visibility, done directly via the ordinary project-update
+    endpoint, not through a request/approval cycle."""
+
+    class STATUS(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        DENIED = 'denied', 'Denied'
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='visibility_requests')
+    requested_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='visibility_requests', null=True)
+    requested_visibility = models.CharField(max_length=20, choices=Project.VISIBILITY.choices)
+    status = models.CharField(max_length=10, choices=STATUS.choices, default=STATUS.PENDING)
+    decided_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name='decided_visibility_requests', null=True, blank=True,
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_comment = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project'], condition=models.Q(status='pending'),
+                name='one_pending_visibility_request_per_project',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.project_id} -> {self.requested_visibility} ({self.status})"
+
+
 class Attachment(UUIDModel):
     class ATTACHMENT_TYPE(models.TextChoices):
         FILE = 'file', 'File'
         LINK = 'link', 'Link'
+        PAGE = 'page', 'Info Portal Page'
 
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='attachments')
     task = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='attachments', null=True, blank=True)
@@ -82,6 +121,17 @@ class Attachment(UUIDModel):
     type = models.CharField(max_length=10, choices=ATTACHMENT_TYPE.choices, default=ATTACHMENT_TYPE.FILE)
     file = models.FileField(upload_to='project_documents/', blank=True, null=True)
     url = models.URLField(blank=True, null=True, default='')
+    # Info-Portal-page evidence (ATTACHMENT_TYPE.PAGE): references the page
+    # directly instead of copying its content, so it always reflects the
+    # page's current state at review time.
+    page = models.ForeignKey('pages.Page', on_delete=models.SET_NULL, related_name='attachments', null=True, blank=True)
+    # Scopes this attachment to one task-approval submission cycle -- null
+    # for ordinary project/task documents, set only for evidence uploaded via
+    # submit_task_for_approval. CASCADE: evidence has no purpose once its
+    # approval cycle is deleted.
+    approval = models.ForeignKey(
+        'TaskApproval', on_delete=models.CASCADE, related_name='evidence', null=True, blank=True,
+    )
     name = models.CharField(max_length=255, default='Untitled Attachment')
     label = models.CharField(max_length=255, blank=True, null=True, default='')
     content_type = models.CharField(max_length=100, blank=True, default='')
@@ -91,6 +141,36 @@ class Attachment(UUIDModel):
 
     def __str__(self):
         return f"{self.name} - {self.type}"
+
+
+class TaskApproval(UUIDModel):
+    """One evidence-submission review cycle for a task. A task may go through
+    several of these over its lifetime (submit -> reject -> resubmit ->
+    approve), so this is an append-only history, not a single mutable row
+    per task -- see projects_and_tasks.services.submit_task_for_approval/
+    approve_task/reject_task_approval."""
+
+    class STATUS(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        REJECTED = 'rejected', 'Rejected'
+
+    task = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='approvals')
+    submitted_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='submitted_approvals', null=True)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(max_length=10, choices=STATUS.choices, default=STATUS.PENDING)
+    decided_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='decided_approvals', null=True, blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    # Visible only to `submitted_by` -- enforced in the API serialization
+    # layer (api.routers.tasks), never returned to the approver or anyone
+    # else. See DEVELOPMENT_RULES on not leaking data via a shared read path.
+    rejection_comment = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['-submitted_at']
+
+    def __str__(self):
+        return f"{self.task_id} - {self.status}"
       
 class TaskType(UUIDModel):
     name = models.CharField(max_length=100)

@@ -1,0 +1,24 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-teal{% endblock %}
+{% block eyebrow %}Info Portal{% endblock %}
+{% block heading %}A folder was shared with you{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-teal"><span>&#128193;</span></div>
+
+    <div class="wr-highlight wr-highlight-teal">{{ title }}</div>
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-teal">Open Folder</a>
+    </div>
+
+    <p class="wr-muted" style="margin-top: 24px;">
+        You can turn off optional notifications like this one from Settings &rarr; Account.
+    </p>
+{% endblock %}

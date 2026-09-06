@@ -9,6 +9,7 @@ from company.services import get_member_company
 from ninja import Router
 from notifications_and_activity.models import CompanyActivity
 from utils.api_response import api_response as payload
+from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
 from ..auth import JWTBearerAuth
 from ..schemas import ApiResponse
@@ -35,6 +36,8 @@ def _activity_data(item) -> dict:
 
 @router.get('/', auth=auth, response={200: ApiResponse, 404: ApiResponse})
 async def list_activity(request, limit: int = DEFAULT_LIMIT):
+    """Unpaginated, capped preview -- unchanged, still used by the Analytics/
+    dashboard activity widgets that just want "the last N", not a page."""
     company = await get_member_company(request.auth)
     if company is None:
         return payload('You do not belong to a company.', 404, False)
@@ -46,3 +49,17 @@ async def list_activity(request, limit: int = DEFAULT_LIMIT):
         .order_by('-created_at')[:bounded_limit]
     ]
     return payload('Activity retrieved successfully.', 200, True, {'results': items})
+
+
+@router.get('/paginated/', auth=auth, response={200: ApiResponse, 404: ApiResponse})
+async def list_activity_paginated(request, page: int = 1, page_size: int = DEFAULT_PAGE_SIZE):
+    """Real page-through-everything listing for the dedicated Activity page,
+    as opposed to list_activity's fixed recent-N preview."""
+    company = await get_member_company(request.auth)
+    if company is None:
+        return payload('You do not belong to a company.', 404, False)
+    queryset = CompanyActivity.objects.filter(company=company).select_related('actor').order_by('-created_at')
+    items, meta = await paginate(queryset, page, page_size)
+    return payload('Activity retrieved successfully.', 200, True, {
+        'results': [_activity_data(item) for item in items], 'meta': meta,
+    })

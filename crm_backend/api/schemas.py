@@ -107,6 +107,10 @@ class PageFolderCreateIn(Schema):
     color: str = Field(default='amber')
 
 
+class PageFolderShareIn(Schema):
+    user_ids: list[UUID] = Field(min_length=1)
+
+
 class PageBlockIn(Schema):
     type: Literal['heading', 'paragraph', 'list', 'attachment']
     text: str | None = None

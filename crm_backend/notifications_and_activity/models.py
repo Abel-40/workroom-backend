@@ -19,6 +19,7 @@ class CompanyActivity(UUIDModel):
         MEMBER_REMOVED = 'member_removed', 'Member Removed'
         DEPARTMENT_CREATED = 'department_created', 'Department Created'
         TEAM_CREATED = 'team_created', 'Team Created'
+        PROJECT_REOPENED = 'project_reopened', 'Project Reopened'
 
     company = models.ForeignKey('company.Company', on_delete=models.CASCADE, related_name='activities')
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='+')
@@ -47,6 +48,20 @@ class Notification(UUIDModel):
         INVITATION_ACCEPTED = 'invitation_accepted', 'Invitation Accepted'
         AI_GENERATION_COMPLETED = 'ai_generation_completed', 'AI Generation Completed'
         AI_GENERATION_FAILED = 'ai_generation_failed', 'AI Generation Failed'
+        TASK_SUBMITTED_FOR_APPROVAL = 'task_submitted_for_approval', 'Task Submitted For Approval'
+        TASK_APPROVED = 'task_approved', 'Task Approved'
+        TASK_REJECTED = 'task_rejected', 'Task Rejected'
+        DEADLINE_EXTENDED = 'deadline_extended', 'Deadline Extended'
+        PROJECT_AUTO_COMPLETED = 'project_auto_completed', 'Project Auto-Completed'
+        VISIBILITY_REQUESTED = 'visibility_requested', 'Visibility Request'
+        VISIBILITY_APPROVED = 'visibility_approved', 'Visibility Request Approved'
+        VISIBILITY_DENIED = 'visibility_denied', 'Visibility Request Denied'
+        PROJECT_COMPLETED = 'project_completed', 'Project Completed'
+        PROJECT_REOPENED = 'project_reopened', 'Project Reopened'
+        PROJECT_OWNERSHIP_TRANSFERRED = 'project_ownership_transferred', 'Project Ownership Transferred'
+        FOLDER_SHARED = 'folder_shared', 'Folder Shared'
+        TODOS_GENERATED = 'todos_generated', 'Todos Generated'
+        TODOS_GENERATION_FAILED = 'todos_generation_failed', 'Todos Generation Failed'
 
     class Category(models.TextChoices):
         CRITICAL = 'critical', 'Critical'

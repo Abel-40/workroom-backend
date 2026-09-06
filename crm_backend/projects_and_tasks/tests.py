@@ -5,12 +5,16 @@ way every other endpoint's tests check it.
 """
 
 import json
+from datetime import timedelta
 
 from api.tests import TwoCompanyTestCase, auth_header
+from departments_and_teams.models import Department
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
 from notifications_and_activity.models import CompanyActivity
+from users.models import CompanyUserProfile, User
 
-from projects_and_tasks.models import DefaultTaskType, Project, TaskType
+from projects_and_tasks.models import DefaultTaskType, Project, ProjectVisibilityRequest, TaskType
 
 
 class TaskTypeListTests(TwoCompanyTestCase):
@@ -286,3 +290,423 @@ class ProjectImageTests(TwoCompanyTestCase):
         project = self.create_project()
         response = self.client.get(f"/api/v1/projects/{project['id']}/image/")
         self.assertEqual(response.status_code, 401)
+
+
+class DepartmentScopedProjectCreationTests(TwoCompanyTestCase):
+    """A4: a Department Leader/Member's project is locked to their own
+    department at creation, and stays locked afterward; Owner/CM are
+    unrestricted."""
+
+    def setUp(self):
+        super().setUp()
+        self.marketing = Department.objects.create(name='Marketing', company=self.company_a)
+        self.dl = User.objects.create_user(email='dl@example.com', username='dl', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=self.dl, company=self.company_a, department=self.department_a,
+            role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        )
+
+    def _create(self, user, **overrides):
+        body = {'title': 'Probe', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}
+        body.update(overrides)
+        return self.client.post(
+            '/api/v1/projects/', json.dumps(body), content_type='application/json', **auth_header(user),
+        )
+
+    def test_dl_cannot_create_a_project_in_another_department(self):
+        response = self._create(self.dl, department_id=str(self.marketing.id))
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Project.objects.filter(title='Probe').exists())
+
+    def test_dl_can_create_a_project_in_their_own_department(self):
+        response = self._create(self.dl, department_id=str(self.department_a.id))
+        self.assertEqual(response.status_code, 201)
+
+    def test_dm_cannot_create_a_project_in_another_department(self):
+        response = self._create(self.member_a, department_id=str(self.marketing.id))
+        self.assertEqual(response.status_code, 400)
+
+    def test_dm_can_create_a_project_in_their_own_department(self):
+        response = self._create(self.member_a, department_id=str(self.department_a.id))
+        self.assertEqual(response.status_code, 201)
+
+    def test_owner_can_create_a_project_in_any_department(self):
+        response = self._create(self.owner_a, department_id=str(self.marketing.id))
+        self.assertEqual(response.status_code, 201)
+
+    def test_dl_cannot_move_a_project_to_another_department_after_creation(self):
+        project = self._create(self.dl, department_id=str(self.department_a.id)).json()['data']['project']
+        response = self.client.patch(
+            f"/api/v1/projects/{project['id']}/", json.dumps({'department_id': str(self.marketing.id)}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Project.objects.get(id=project['id']).department_id, self.department_a.id)
+
+    def test_owner_can_move_a_project_to_another_department_after_creation(self):
+        project = self.create_project(department_id=str(self.department_a.id))
+        response = self.client.patch(
+            f"/api/v1/projects/{project['id']}/", json.dumps({'department_id': str(self.marketing.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+
+
+class PastDateValidationTests(TwoCompanyTestCase):
+    """A8: a project/task cannot be created with a start date or deadline in
+    the past. A task that later becomes overdue after creation is a separate,
+    still-allowed case -- not covered by this creation-time check."""
+
+    def test_create_project_rejects_a_past_start_date(self):
+        response = self.client.post(
+            '/api/v1/projects/', json.dumps({
+                'title': 'Time travel',
+                'start_date': (timezone.now() - timedelta(days=5)).isoformat(),
+                'deadline': (timezone.now() + timedelta(days=30)).isoformat(),
+            }), content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Project.objects.filter(title='Time travel').exists())
+
+    def test_create_project_rejects_a_past_deadline(self):
+        response = self.client.post(
+            '/api/v1/projects/', json.dumps({
+                'title': 'Already late',
+                'deadline': (timezone.now() - timedelta(days=1)).isoformat(),
+            }), content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_create_project_accepts_a_start_date_left_to_default_to_now(self):
+        """The router defaults a missing start_date to timezone.now() a
+        moment before this validation runs -- must not be spuriously
+        rejected as "in the past" (see PAST_DATE_GRACE)."""
+        response = self.client.post(
+            '/api/v1/projects/', json.dumps({
+                'title': 'Defaults to now',
+                'deadline': (timezone.now() + timedelta(days=30)).isoformat(),
+            }), content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_create_task_rejects_a_past_deadline(self):
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/tasks/", json.dumps({
+                'title': 'Late task', 'deadline': (timezone.now() - timedelta(days=1)).isoformat(),
+            }), content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+
+class DepartmentManagementScopeTests(TwoCompanyTestCase):
+    """A6: departments:manage is a coarse company-wide grant for a
+    Department Leader, so the "own department only" boundary is enforced in
+    code -- a DL must not be able to rename, or reassign the leader of, a
+    department that isn't their own."""
+
+    def setUp(self):
+        super().setUp()
+        self.marketing = Department.objects.create(name='Marketing', company=self.company_a)
+        self.dl = User.objects.create_user(email='dl@example.com', username='dl', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=self.dl, company=self.company_a, department=self.department_a,
+            role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        )
+
+    def test_dl_cannot_rename_another_department(self):
+        response = self.client.patch(
+            f'/api/v1/departments/{self.marketing.id}/', json.dumps({'description': 'hijacked'}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 403)
+        self.marketing.refresh_from_db()
+        self.assertNotEqual(self.marketing.description, 'hijacked')
+
+    def test_dl_can_rename_their_own_department(self):
+        response = self.client.patch(
+            f'/api/v1/departments/{self.department_a.id}/',
+            json.dumps({'description': 'Engineering, but better'}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_dl_cannot_reassign_another_departments_leader(self):
+        response = self.client.post(
+            f'/api/v1/departments/{self.marketing.id}/leader/', json.dumps({'user_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 403)
+        self.marketing.refresh_from_db()
+        self.assertIsNone(self.marketing.leader_id)
+
+    def test_dl_cannot_revoke_another_departments_leader(self):
+        self.marketing.leader = self.owner_a
+        self.marketing.save(update_fields=['leader'])
+        response = self.client.delete(f'/api/v1/departments/{self.marketing.id}/leader/', **auth_header(self.dl))
+        self.assertEqual(response.status_code, 403)
+        self.marketing.refresh_from_db()
+        self.assertIsNotNone(self.marketing.leader_id)
+
+    def test_owner_can_reassign_any_departments_leader(self):
+        response = self.client.post(
+            f'/api/v1/departments/{self.marketing.id}/leader/', json.dumps({'user_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+
+
+class VisibilityEscalationTests(TwoCompanyTestCase):
+    """A7: a Department Member's project starts private and can only reach
+    department visibility via request + their own Department Leader's
+    approval; company visibility is reachable only by a DL/Owner/CM acting
+    directly, never by DM self-escalation through any path."""
+
+    def setUp(self):
+        super().setUp()
+        self.dl = User.objects.create_user(email='dl@example.com', username='dl', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=self.dl, company=self.company_a, department=self.department_a,
+            role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        )
+        self.department_a.leader = self.dl
+        self.department_a.save(update_fields=['leader'])
+
+        self.marketing = Department.objects.create(name='Marketing', company=self.company_a)
+        self.other_dl = User.objects.create_user(
+            email='other-dl@example.com', username='other-dl', password='Kx9#mQ2vLp8Z',
+        )
+        CompanyUserProfile.objects.create(
+            user=self.other_dl, company=self.company_a, department=self.marketing,
+            role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        )
+        self.marketing.leader = self.other_dl
+        self.marketing.save(update_fields=['leader'])
+
+    def _dm_project(self):
+        response = self.client.post(
+            '/api/v1/projects/', json.dumps({
+                'title': 'DM project', 'department_id': str(self.department_a.id), 'visibility': 'company',
+                'deadline': (timezone.now() + timedelta(days=30)).isoformat(),
+            }), content_type='application/json', **auth_header(self.member_a),
+        )
+        return response.json()['data']['project']
+
+    def _request_department_visibility(self, project):
+        self.client.post(
+            f"/api/v1/projects/{project['id']}/visibility-requests/", json.dumps({'visibility': 'department'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        return ProjectVisibilityRequest.objects.get(project_id=project['id'])
+
+    def test_dm_created_project_defaults_to_private_regardless_of_requested_visibility(self):
+        project = self._dm_project()
+        self.assertEqual(project['visibility'], 'private')
+
+    def test_dm_cannot_patch_visibility_directly(self):
+        project = self._dm_project()
+        response = self.client.patch(
+            f"/api/v1/projects/{project['id']}/", json.dumps({'visibility': 'company'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_dm_can_request_department_visibility(self):
+        project = self._dm_project()
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/visibility-requests/", json.dumps({'visibility': 'department'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_dm_cannot_request_company_visibility(self):
+        project = self._dm_project()
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/visibility-requests/", json.dumps({'visibility': 'company'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_duplicate_pending_request_is_rejected(self):
+        project = self._dm_project()
+        self._request_department_visibility(project)
+        response = self.client.post(
+            f"/api/v1/projects/{project['id']}/visibility-requests/", json.dumps({'visibility': 'department'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_a_different_departments_leader_cannot_approve(self):
+        project = self._dm_project()
+        req = self._request_department_visibility(project)
+        response = self.client.post(f'/api/v1/projects/visibility-requests/{req.id}/approve/', **auth_header(self.other_dl))
+        self.assertEqual(response.status_code, 403)
+
+    def test_own_departments_leader_can_approve_and_it_raises_visibility(self):
+        project = self._dm_project()
+        req = self._request_department_visibility(project)
+        response = self.client.post(f'/api/v1/projects/visibility-requests/{req.id}/approve/', **auth_header(self.dl))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Project.objects.get(id=project['id']).visibility, Project.VISIBILITY.DEPARTMENT)
+
+    def test_dm_still_cannot_self_escalate_to_company_after_department_approval(self):
+        project = self._dm_project()
+        req = self._request_department_visibility(project)
+        self.client.post(f'/api/v1/projects/visibility-requests/{req.id}/approve/', **auth_header(self.dl))
+        response = self.client.patch(
+            f"/api/v1/projects/{project['id']}/", json.dumps({'visibility': 'company'}),
+            content_type='application/json', **auth_header(self.member_a),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_department_leader_can_raise_to_company_directly(self):
+        """A still-private project is outside a DL's general view/manage
+        reach (user_can_view_project's private branch is collaborators-only)
+        -- the DL's oversight is scoped through the request/approve path
+        below, which doesn't require it. Only once the DL has approved it to
+        department visibility can they manage it directly like any other
+        department-visible project, including raising it further."""
+        project = self._dm_project()
+        req = self._request_department_visibility(project)
+        self.client.post(f'/api/v1/projects/visibility-requests/{req.id}/approve/', **auth_header(self.dl))
+        response = self.client.patch(
+            f"/api/v1/projects/{project['id']}/", json.dumps({'visibility': 'company'}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_denying_a_request_leaves_the_project_private(self):
+        project = self._dm_project()
+        req = self._request_department_visibility(project)
+        response = self.client.post(
+            f'/api/v1/projects/visibility-requests/{req.id}/deny/', json.dumps({'comment': 'not needed'}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Project.objects.get(id=project['id']).visibility, Project.VISIBILITY.PRIVATE)
+
+    def test_visibility_requests_are_scoped_to_the_callers_own_company(self):
+        project = self._dm_project()
+        req = self._request_department_visibility(project)
+        response = self.client.post(f'/api/v1/projects/visibility-requests/{req.id}/approve/', **auth_header(self.owner_b))
+        self.assertEqual(response.status_code, 404)
+
+    def test_pending_requests_list_is_scoped_to_the_reviewers_own_department(self):
+        project = self._dm_project()
+        self._request_department_visibility(project)
+        response = self.client.get('/api/v1/projects/visibility-requests/', **auth_header(self.other_dl))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['results'], [])
+
+        response = self.client.get('/api/v1/projects/visibility-requests/', **auth_header(self.dl))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()['data']['results']), 1)
+
+
+class ProjectDeletionCascadeTests(TwoCompanyTestCase):
+    """B2: archiving a project (Project.is_deleted=True) must not leave its
+    tasks/documents individually reachable (or mutable) by direct id, and
+    must not leave them counted in company/workload/department stats --
+    archive_project never cascades is_deleted onto children, so every
+    by-id/aggregate lookup has to filter project__is_deleted itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.create_project()
+        self.task = self.client.post(
+            f"/api/v1/projects/{self.project['id']}/tasks/",
+            json.dumps({'title': 'Doomed task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+        self.document = self.client.post(
+            f"/api/v1/projects/{self.project['id']}/documents/",
+            {'file': SimpleUploadedFile('spec.txt', b'doomed doc', content_type='text/plain'), 'label': 'Spec'},
+            **auth_header(self.owner_a),
+        ).json()['data']['document']
+        # Assign before deletion so the workload-aggregate test below can
+        # verify the count drops to 0 once the project is archived, not just
+        # that assignment itself 404s afterward.
+        self.client.post(
+            f"/api/v1/tasks/{self.task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.client.delete(f"/api/v1/projects/{self.project['id']}/", **auth_header(self.owner_a))
+
+    def test_task_is_unreachable_by_direct_id_after_project_deletion(self):
+        response = self.client.get(f"/api/v1/tasks/{self.task['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 404)
+
+    def test_task_cannot_be_mutated_by_direct_id_after_project_deletion(self):
+        response = self.client.patch(
+            f"/api/v1/tasks/{self.task['id']}/", json.dumps({'title': 'still editable?'}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_document_is_unreachable_by_direct_id_after_project_deletion(self):
+        response = self.client.get(f"/api/v1/documents/{self.document['id']}/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 404)
+
+    def test_document_download_is_unreachable_after_project_deletion(self):
+        response = self.client.get(f"/api/v1/documents/{self.document['id']}/download/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 404)
+
+    def test_company_stats_excludes_deleted_projects_tasks(self):
+        response = self.client.get('/api/v1/analytics/company/', **auth_header(self.owner_a))
+        self.assertEqual(response.json()['data']['task_count'], 0)
+
+    def test_company_workload_excludes_deleted_projects_tasks(self):
+        response = self.client.get('/api/v1/analytics/company/members/', **auth_header(self.owner_a))
+        member_row = next(m for m in response.json()['data']['members'] if m['id'] == str(self.member_a.id))
+        self.assertEqual(member_row['active_task_count'], 0)
+
+
+class TaskAssignmentEligibilityTests(TwoCompanyTestCase):
+    """B4: list_eligible_assignees' department/team scoping is a curated
+    subset that doesn't include Owner/CM unless they happen to be a member
+    of that department -- so it's only actually enforced for a DL/DM
+    assigner (a manage_any role stays unrestricted, same as every other
+    department-scoped check this session)."""
+
+    def setUp(self):
+        super().setUp()
+        self.marketing = Department.objects.create(name='Marketing', company=self.company_a)
+        self.dl = User.objects.create_user(email='dl@example.com', username='dl', password='Kx9#mQ2vLp8Z')
+        CompanyUserProfile.objects.create(
+            user=self.dl, company=self.company_a, department=self.department_a,
+            role=CompanyUserProfile.Role.DEPARTMENT_LEADER,
+        )
+        self.outside_member = User.objects.create_user(
+            email='outside@example.com', username='outside', password='Kx9#mQ2vLp8Z',
+        )
+        CompanyUserProfile.objects.create(
+            user=self.outside_member, company=self.company_a, department=self.marketing,
+            role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
+        )
+        self.project = self.create_project(department_id=str(self.department_a.id))
+        self.task = self.client.post(
+            f"/api/v1/projects/{self.project['id']}/tasks/",
+            json.dumps({'title': 'Scoped task', 'deadline': (timezone.now() + timedelta(days=30)).isoformat()}),
+            content_type='application/json', **auth_header(self.owner_a),
+        ).json()['data']['task']
+
+    def test_dl_cannot_assign_to_a_member_outside_the_projects_department(self):
+        response = self.client.post(
+            f"/api/v1/tasks/{self.task['id']}/assign/", json.dumps({'assigned_to_id': str(self.outside_member.id)}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_dl_can_assign_within_the_projects_department(self):
+        response = self.client.post(
+            f"/api/v1/tasks/{self.task['id']}/assign/", json.dumps({'assigned_to_id': str(self.member_a.id)}),
+            content_type='application/json', **auth_header(self.dl),
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_owner_can_assign_to_a_member_outside_the_projects_department(self):
+        response = self.client.post(
+            f"/api/v1/tasks/{self.task['id']}/assign/", json.dumps({'assigned_to_id': str(self.outside_member.id)}),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)

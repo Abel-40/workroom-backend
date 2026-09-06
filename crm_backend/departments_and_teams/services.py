@@ -10,14 +10,28 @@ authorization primitive rather than introducing a new permission scheme.
 """
 
 from asgiref.sync import sync_to_async
-from company.services import get_managed_company, is_company_member
+from company.services import get_company_role, get_managed_company, get_member_department_id, is_company_member
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from notifications_and_activity.services import log_department_created, log_team_created
+from users.models import CompanyUserProfile
 
 from .models import DefaultDepartment, Department, Team
 
 User = get_user_model()
+
+
+async def _can_manage_this_department(user, company, department) -> bool:
+    """A Department Leader's 'departments:manage' grant is company-wide at
+    the flat-permission level (see permissions/roles_permission.yaml's own
+    comment on this), so the "own department only" boundary it promises has
+    to be enforced here. Owner/CM are unrestricted; a DL may only manage the
+    one department their own CompanyUserProfile currently points at."""
+    role = await get_company_role(user, company)
+    if role != CompanyUserProfile.Role.DEPARTMENT_LEADER:
+        return True
+    member_department_id = await get_member_department_id(user, company)
+    return member_department_id is not None and member_department_id == department.id
 
 
 async def _resolve_leader(company, leader_id):
@@ -87,6 +101,8 @@ async def update_department(user, department, *, name=None, description=None):
     or None."""
     company = await get_managed_company(user)
     if company is None or department.company_id != company.id:
+        return None, 'forbidden'
+    if not await _can_manage_this_department(user, company, department):
         return None, 'forbidden'
     if name is not None and name.lower() != department.name.lower():
         if await Department.objects.filter(company=company, name__iexact=name).exclude(id=department.id).aexists():

@@ -20,7 +20,7 @@ async def request_assistant_query(user, project, question: str, reference_url: s
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
     page_ids = page_ids or []
-    pages = await get_pages_by_ids_for_company(project.company, page_ids)
+    pages = await get_pages_by_ids_for_company(user, project.company, page_ids)
     if len(pages) != len(set(page_ids)):
         # Fail closed (Rule 4): a page id that doesn't resolve to this
         # company is rejected outright, not silently dropped.

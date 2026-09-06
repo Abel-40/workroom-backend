@@ -4,10 +4,13 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 from uuid import UUID
 
-from ninja import Router, Schema
+from company.services import get_member_company
+from ninja import File, Form, Router, Schema
+from ninja.files import UploadedFile
 from projects_and_tasks import services
-from projects_and_tasks.models import Task, TaskTimeLog
+from projects_and_tasks.models import Attachment, Task, TaskApproval, TaskTimeLog
 from pydantic import Field
+from todos import services as todo_services
 from utils.api_response import api_response as payload
 from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
@@ -28,7 +31,11 @@ class TaskIn(Schema):
     task_type_id: UUID | None = None
     assigned_to_id: UUID | None = None
     priority: PriorityLiteral = 'medium'
-    deadline: datetime | None = None
+    # Required, not defaulted to the project's own deadline: a task's
+    # deadline must be strictly before its project's (see
+    # projects_and_tasks.services.create_task), so silently defaulting it to
+    # an equal value would always fail. Forces a real per-task choice instead.
+    deadline: datetime
     estimated_time_hours: float | None = Field(default=None, gt=0, le=1000)
 
 
@@ -48,6 +55,14 @@ class TaskStatusIn(Schema):
 
 class TaskAssignIn(Schema):
     assigned_to_id: UUID | None = None
+
+
+class TaskRejectIn(Schema):
+    comment: str = Field(min_length=1, max_length=2000)
+
+
+class DeadlineExtendIn(Schema):
+    deadline: datetime
 
 
 class TimeLogIn(Schema):
@@ -114,12 +129,26 @@ async def create_task(request, project_id: UUID, data: TaskIn):
     task, error = await services.create_task(
         request.auth, project,
         title=data.title, description=data.description, priority=data.priority,
-        deadline=data.deadline or project.deadline,
+        deadline=data.deadline,
         estimated_time=_hours_to_duration(data.estimated_time_hours),
         department_id=data.department_id, task_type_id=data.task_type_id, assigned_to_id=data.assigned_to_id,
     )
     if error == 'forbidden':
         return payload('You do not have permission to add tasks to this project.', 403, False)
+    if error == 'invalid_deadline':
+        return payload(
+            "The task deadline must be before the project's deadline.", 400, False,
+            errors={'deadline': ['Must be earlier than the project deadline']},
+        )
+    if error == 'project_completed':
+        return payload(
+            'This project is marked Done -- reopen it before adding new tasks.', 400, False,
+        )
+    if error == 'ineligible_assignee':
+        return payload(
+            "That person isn't eligible for this project (outside its department/team).", 400, False,
+            errors={'assigned_to_id': ['Not eligible for this project']},
+        )
     if error:
         return payload('Invalid department, task type, or assignee for this company.', 400, False, errors={error: ['Invalid value']})
     return payload('Task created successfully.', 201, True, {'task': await task_data(task)})
@@ -139,6 +168,33 @@ async def list_tasks(request, project_id: UUID, status: StatusLiteral | None = N
     return payload('Tasks retrieved successfully.', 200, True, {
         'results': [await task_data(task) for task in items], 'meta': meta,
     })
+
+
+@router.get('/tasks/assigned-to-me/', auth=auth, response={200: ApiResponse, 404: ApiResponse})
+async def list_tasks_assigned_to_me(
+    request, open_only: bool = True, page: int = 1, page_size: int = DEFAULT_PAGE_SIZE,
+):
+    """The caller's own assigned work, across every project, nearest deadline
+    first. Scoped by assignment rather than by view permission: this is the
+    "what am I actually on the hook for" list that the personal to-do screen
+    and its AI generation build from, so it must never include work the
+    caller merely has permission to look at.
+
+    Declared here rather than under /tasks/{task_id}/ below because Ninja
+    matches routes in declaration order -- a literal path registered after a
+    parameterised sibling would be swallowed by it.
+    """
+    company = await get_member_company(request.auth)
+    if company is None:
+        return payload('You do not belong to a company.', 404, False)
+    queryset = todo_services.list_assigned_tasks(request.auth, company, open_only=open_only)
+    items, meta = await paginate(queryset, page, page_size)
+    results = []
+    for task in items:
+        data = await task_data(task)
+        data['project_title'] = task.project.title if task.project_id else None
+        results.append(data)
+    return payload('Assigned tasks retrieved successfully.', 200, True, {'results': results, 'meta': meta})
 
 
 @router.get('/tasks/{task_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -164,6 +220,11 @@ async def update_task(request, task_id: UUID, data: TaskUpdateIn):
     updated, error = await services.update_task(request.auth, task, updates)
     if error == 'forbidden':
         return payload('You do not have permission to modify this task.', 403, False)
+    if error == 'invalid_deadline':
+        return payload(
+            "The task deadline must be before the project's deadline.", 400, False,
+            errors={'deadline': ['Must be earlier than the project deadline']},
+        )
     if error:
         return payload('Invalid department or task type for this company.', 400, False)
     return payload('Task updated successfully.', 200, True, {'task': await task_data(updated)})
@@ -183,6 +244,11 @@ async def update_task_status(request, task_id: UUID, data: TaskStatusIn):
         return payload('You do not have permission to update this task.', 403, False)
     if error == 'invalid_status':
         return payload('Invalid status.', 400, False)
+    if error == 'invalid_transition':
+        return payload(
+            'Done and In Review can only be reached through the approval workflow '
+            '(see /submit-for-approval/, /approve/, and /reject/).', 400, False,
+        )
     return payload('Task status updated successfully.', 200, True, {'task': await task_data(updated)})
 
 
@@ -198,6 +264,11 @@ async def assign_task(request, task_id: UUID, data: TaskAssignIn):
         return payload('You do not have permission to assign this task.', 403, False)
     if error == 'invalid_assignee':
         return payload('The selected user is not a member of this company.', 400, False, errors={'assigned_to_id': ['Not eligible']})
+    if error == 'ineligible_assignee':
+        return payload(
+            "That person isn't eligible for this project (outside its department/team).", 400, False,
+            errors={'assigned_to_id': ['Not eligible for this project']},
+        )
     return payload('Task assigned successfully.', 200, True, {'task': await task_data(updated)})
 
 
@@ -212,6 +283,163 @@ async def archive_task(request, task_id: UUID):
         return payload('You do not have permission to archive this task.', 403, False)
     return payload('Task archived successfully.', 200, True)
 
+
+# --------------------------------------------------------------------------
+# Approval workflow -- evidence submission, approve/reject, and deadline
+# extension. Done/In Review are reachable ONLY through these endpoints (see
+# update_task_status above and projects_and_tasks.services for the rules).
+# --------------------------------------------------------------------------
+
+def _evidence_data(attachment: Attachment) -> dict:
+    data = {'id': str(attachment.id), 'type': attachment.type, 'name': attachment.name}
+    if attachment.type == Attachment.ATTACHMENT_TYPE.FILE:
+        data['download_url'] = f'/documents/{attachment.id}/download/'
+    elif attachment.type == Attachment.ATTACHMENT_TYPE.LINK:
+        data['url'] = attachment.url
+    elif attachment.type == Attachment.ATTACHMENT_TYPE.PAGE:
+        data['page_id'] = str(attachment.page_id) if attachment.page_id else None
+    return data
+
+
+async def _approval_data(approval: TaskApproval, viewer) -> dict:
+    """rejection_comment is included ONLY for the row's own submitted_by --
+    never for the approver or any other caller, even though they can see
+    every other field on the same row (see reject_task_approval)."""
+    evidence = [_evidence_data(a) async for a in approval.evidence.filter(is_deleted=False)]
+    visible_comment = approval.submitted_by_id == viewer.id and bool(approval.rejection_comment)
+    return {
+        'id': str(approval.id),
+        'task_id': str(approval.task_id),
+        'submitted_by': str(approval.submitted_by_id) if approval.submitted_by_id else None,
+        'submitted_at': approval.submitted_at.isoformat(),
+        'status': approval.status,
+        'decided_by': str(approval.decided_by_id) if approval.decided_by_id else None,
+        'decided_at': approval.decided_at.isoformat() if approval.decided_at else None,
+        'rejection_comment': approval.rejection_comment if visible_comment else None,
+        'evidence': evidence,
+    }
+
+
+@router.post(
+    '/tasks/{task_id}/submit-for-approval/', auth=auth,
+    response={202: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def submit_task_for_approval(
+    request, task_id: UUID,
+    files: list[UploadedFile] = File(default=[]),
+    links: list[str] = Form(default=[]),
+    page_ids: list[UUID] = Form(default=[]),
+):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    approval, error = await services.submit_task_for_approval(
+        request.auth, task, files=files, links=links, page_ids=page_ids,
+    )
+    if error == 'forbidden':
+        return payload('Only the assignee can submit this task for approval.', 403, False)
+    if error == 'invalid_status':
+        return payload('Only a task that is In Progress can be submitted for approval.', 400, False)
+    if error == 'already_pending':
+        return payload('This task already has a pending approval request.', 400, False)
+    if error == 'deadline_passed':
+        return payload('This task is past its deadline and can no longer be submitted.', 400, False)
+    if error == 'no_evidence':
+        return payload('At least one piece of evidence (file, link, or page) is required.', 400, False)
+    if error == 'too_large':
+        return payload('One of the uploaded files exceeds the maximum allowed size (10MB).', 400, False)
+    if error == 'invalid_content_type':
+        return payload('One of the uploaded files has a disallowed type.', 400, False)
+    if error == 'invalid_page':
+        return payload('One or more pages are invalid for this company.', 400, False)
+    return payload(
+        'Task submitted for approval.', 202, True, {'approval': await _approval_data(approval, request.auth)},
+    )
+
+
+@router.post(
+    '/tasks/{task_id}/approve/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def approve_task(request, task_id: UUID):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    updated, error = await services.approve_task(request.auth, task)
+    if error == 'forbidden':
+        return payload('You do not have permission to approve this task.', 403, False)
+    if error == 'no_pending_approval':
+        return payload('This task has no pending approval to review.', 400, False)
+    return payload('Task approved.', 200, True, {'task': await task_data(updated)})
+
+
+@router.post(
+    '/tasks/{task_id}/reject/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def reject_task(request, task_id: UUID, data: TaskRejectIn):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    updated, error = await services.reject_task_approval(request.auth, task, data.comment)
+    if error == 'forbidden':
+        return payload('You do not have permission to review this task.', 403, False)
+    if error == 'comment_required':
+        return payload('A rejection comment is required.', 400, False)
+    if error == 'no_pending_approval':
+        return payload('This task has no pending approval to review.', 400, False)
+    return payload('Task submission rejected.', 200, True, {'task': await task_data(updated)})
+
+
+@router.get(
+    '/tasks/{task_id}/approvals/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def list_task_approvals(request, task_id: UUID):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    approvals = [
+        a async for a in task.approvals.select_related('submitted_by', 'decided_by').order_by('-submitted_at')
+    ]
+    return payload('Approvals retrieved successfully.', 200, True, {
+        'results': [await _approval_data(a, request.auth) for a in approvals],
+    })
+
+
+@router.post(
+    '/tasks/{task_id}/extend-deadline/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def extend_task_deadline(request, task_id: UUID, data: DeadlineExtendIn):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    updated, error = await services.extend_task_deadline(request.auth, task, data.deadline)
+    if error == 'forbidden':
+        return payload('Only the project creator can extend a task deadline.', 403, False)
+    if error == 'not_an_extension':
+        return payload('The new deadline must be later than the current one.', 400, False)
+    if error == 'exceeds_project_deadline':
+        return payload("The task's deadline must remain before the project's deadline.", 400, False)
+    return payload('Task deadline extended.', 200, True, {'task': await task_data(updated)})
+
+
+# --------------------------------------------------------------------------
+# Time logs -- one real, attributable entry per unit of work logged against
+# a task. Independent of the approval workflow above: logging time tracks
+# effort spent, not task completion.
+# --------------------------------------------------------------------------
 
 @router.post('/tasks/{task_id}/time-logs/', auth=auth, response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse})
 async def create_time_log(request, task_id: UUID, data: TimeLogIn):

@@ -1,0 +1,25 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-amber{% endblock %}
+{% block eyebrow %}Changes requested{% endblock %}
+{% block heading %}Your submission needs another pass{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-amber"><span>&#128221;</span></div>
+
+    <div class="wr-highlight wr-highlight-amber">{{ title }}</div>
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-amber">View Feedback</a>
+    </div>
+
+    <p class="wr-muted" style="margin-top: 24px;">
+        This always reaches you regardless of your notification preferences, because
+        someone is waiting on you.
+    </p>
+{% endblock %}

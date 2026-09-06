@@ -50,6 +50,7 @@ from .routers.projects import router as projects_router
 from .routers.task_types import router as task_types_router
 from .routers.tasks import router as tasks_router
 from .routers.teams import router as teams_router
+from .routers.todos import router as todos_router
 from .schemas import (
     ApiResponse,
     CheckoutIn,
@@ -77,6 +78,7 @@ api.add_router('', tasks_router)
 api.add_router('', documents_router)
 api.add_router('', ai_router)
 api.add_router('', pages_router)
+api.add_router('/todos', todos_router)
 api.add_router('/notifications', notifications_router)
 api.add_router('/analytics', analytics_router)
 api.add_router('/departments', departments_router)
@@ -162,6 +164,13 @@ def accept_invite_in_transaction(
             address=address.strip() or 'Not provided',
             profile_picture=profile_picture,
         )
+        if (
+            invite.role == CompanyUserProfile.Role.DEPARTMENT_LEADER
+            and invite.department_id is not None
+            and invite.department.leader_id is None
+        ):
+            invite.department.leader = user
+            invite.department.save(update_fields=['leader'])
         company = invite.company
         invite.delete()
         notify_invitation_accepted(user, company)
@@ -233,15 +242,15 @@ async def refresh_token(request):
 
 def register_company_in_transaction(owner, name: str, sector: Sector):
     """Create the Company + owner's CompanyUserProfile as one atomic unit
-    (Rule 12) so a failure partway through (e.g. the skype/birthday schema
-    drift that used to make the CompanyUserProfile insert blow up) can never
-    leave a Company row with no owner membership behind it.
+    (Rule 12) so a failure partway through can never leave a Company row
+    with no owner membership behind it.
 
     Also self-heals that exact stuck state for anyone who already hit it: if
-    a Company exists for this owner but its CompanyUserProfile is missing,
-    finish creating the missing row instead of only reporting 'already has a
-    company' forever. Returns (company, error) where error is
-    'already_registered' or None.
+    a Company exists for this owner but its CompanyUserProfile is missing
+    (e.g. an earlier registration attempt died between the two writes before
+    this was atomic), finish creating the missing row instead of only ever
+    reporting 'already has a company'. Returns (company, error) where error
+    is 'already_registered' or None.
     """
     with transaction.atomic():
         company = Company.objects.select_for_update().filter(owner=owner).first()

@@ -9,22 +9,36 @@ import re
 from datetime import timedelta
 
 from asgiref.sync import sync_to_async
-from company.services import get_company_role, get_member_company, is_company_member
+from company.services import get_company_role, get_member_company, get_member_department_id, is_company_member
 from departments_and_teams.models import Department, Team
 from django.contrib.auth import get_user_model
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 from notifications_and_activity.services import (
     log_ownership_transferred,
     log_project_completed,
     log_project_created,
+    log_project_reopened,
+    notify_project_auto_completed,
+    notify_project_completed,
+    notify_project_deadline_extended,
+    notify_project_ownership_transferred,
+    notify_project_reopened,
+    notify_task_approved,
     notify_task_assigned,
-    notify_task_completed,
+    notify_task_deadline_extended,
+    notify_task_rejected,
+    notify_task_submitted_for_approval,
+    notify_visibility_approved,
+    notify_visibility_denied,
+    notify_visibility_requested,
 )
 from users.models import CompanyUserProfile
 
-from .models import Attachment, DefaultTaskType, Project, Task, TaskTimeLog, TaskType
+from .models import (
+    Attachment, DefaultTaskType, Project, ProjectVisibilityRequest, Task, TaskApproval, TaskTimeLog, TaskType,
+)
 
 User = get_user_model()
 
@@ -91,14 +105,18 @@ async def user_can_manage_task(user, task) -> bool:
 
 
 async def user_can_update_task_status(user, task) -> bool:
-    if task.assigned_to_id == user.id:
-        return True
-    return await user_can_manage_task(user, task)
+    """Assignee-only: Done/In Review are no longer reachable through this
+    direct status transition at all (see update_task_status) -- they're
+    only reachable via the approval workflow below (submit_task_for_approval
+    / approve_task / reject_task_approval)."""
+    return task.assigned_to_id == user.id
 
 
 async def user_can_log_time(user, task) -> bool:
-    """Logging time is closer to 'doing the work' than 'managing the task'
-    -- same assignee carve-out as user_can_update_task_status."""
+    """Logging time is closer to 'doing the work' than the Kanban status
+    transitions above (assignee-only, no manager fallback -- see
+    user_can_update_task_status) -- a task's creator/project-manager may also
+    log time on it, same as editing the task itself (user_can_manage_task)."""
     if task.assigned_to_id == user.id:
         return True
     return await user_can_manage_task(user, task)
@@ -108,6 +126,27 @@ async def user_can_delete_time_log(user, log) -> bool:
     if log.user_id == user.id:
         return True
     return await user_can_manage_task(user, log.task)
+
+
+async def user_can_approve_task(user, task) -> bool:
+    """Who may approve/reject a task's submitted evidence: the task's
+    creator, or -- if that creator has since left the company (created_by
+    is NULL after SET_NULL) -- the project's current owner, then the
+    project's own creator."""
+    if task.created_by_id is not None:
+        return task.created_by_id == user.id
+    project = task.project
+    if project.current_owner_id is not None:
+        return project.current_owner_id == user.id
+    return project.created_by_id == user.id
+
+
+async def user_can_extend_deadline(user, project) -> bool:
+    """Deadline extension is narrower than user_can_manage_project: only the
+    project's creator qualifies -- current owner, company owner/manager, and
+    department leader do not. Used for both a project's own deadline and any
+    of its tasks' deadlines (see extend_task_deadline/extend_project_deadline)."""
+    return project.created_by_id == user.id
 
 
 # --------------------------------------------------------------------------
@@ -180,11 +219,36 @@ async def _resolve_collaborators(company, collaborator_ids):
     return users, None
 
 
+DEPARTMENT_SCOPED_ROLES = (CompanyUserProfile.Role.DEPARTMENT_LEADER, CompanyUserProfile.Role.DEPARTMENT_MEMBER)
+
+# A client clock a little ahead, or a start_date left to default to the
+# router's own timezone.now() a moment before this function runs, must not
+# get spuriously rejected as "in the past" -- only a date meaningfully
+# earlier than now counts.
+PAST_DATE_GRACE = timedelta(minutes=1)
+
+
 async def create_project(user, *, title, description, visibility, priority, start_date, deadline,
                           department_id=None, team_id=None, collaborator_ids=None):
     company = await get_member_company(user)
     if company is None:
         return None, 'no_company'
+    now = timezone.now()
+    if start_date < now - PAST_DATE_GRACE:
+        return None, 'invalid_start_date'
+    if deadline < now - PAST_DATE_GRACE:
+        return None, 'invalid_deadline'
+    role = await get_company_role(user, company)
+    if role in DEPARTMENT_SCOPED_ROLES:
+        own_department_id = await get_member_department_id(user, company)
+        if department_id != own_department_id:
+            return None, 'department_locked'
+    if role == CompanyUserProfile.Role.DEPARTMENT_MEMBER:
+        # A DM-created project starts private regardless of what visibility
+        # was requested -- department/company visibility is only reachable
+        # afterward through request_visibility_change (department) or a
+        # Department Leader/Owner/CM raising it directly (company). See A7.
+        visibility = Project.VISIBILITY.PRIVATE
     department, error = await _resolve_department(company, department_id)
     if error:
         return None, error
@@ -208,7 +272,31 @@ async def create_project(user, *, title, description, visibility, priority, star
 async def update_project(user, project, updates: dict):
     if not await user_can_manage_project(user, project):
         return None, 'forbidden'
+    role = await get_company_role(user, project.company)
+    if 'department_id' in updates and role in DEPARTMENT_SCOPED_ROLES:
+        # A DL/DM's own department is fixed at creation (see create_project)
+        # and stays fixed afterward too -- only Owner/CM may move a project
+        # to a different department post-creation.
+        return None, 'department_locked'
+    if (
+        'visibility' in updates and role == CompanyUserProfile.Role.DEPARTMENT_MEMBER
+        and updates['visibility'] != project.visibility
+    ):
+        # A DM can't change visibility directly at all, even downward --
+        # only request_visibility_change (department) or a Department
+        # Leader/Owner/CM acting directly (company) may move it. See A7.
+        return None, 'visibility_locked'
     was_done = project.status == Project.STATUS.DONE
+    if 'status' in updates:
+        new_status = updates['status']
+        if new_status == Project.STATUS.DONE and not was_done:
+            total = await project.tasks.filter(is_deleted=False).acount()
+            if total == 0:
+                return None, 'no_tasks'
+            if await project.tasks.filter(is_deleted=False).exclude(status=Task.STATUS.DONE).aexists():
+                return None, 'tasks_incomplete'
+        if was_done and new_status != Project.STATUS.DONE and user.id != project.created_by_id:
+            return None, 'forbidden_revert'
     if 'department_id' in updates:
         department, error = await _resolve_department(project.company, updates.pop('department_id'))
         if error:
@@ -231,8 +319,141 @@ async def update_project(user, project, updates: dict):
     if collaborators is not None:
         await sync_to_async(project.collaborators.set, thread_sensitive=True)(collaborators)
     if project.status == Project.STATUS.DONE and not was_done:
-        await sync_to_async(log_project_completed, thread_sensitive=True)(project)
+        await sync_to_async(log_project_completed, thread_sensitive=True)(project, user)
+        await sync_to_async(notify_project_completed, thread_sensitive=True)(project, user)
+    elif was_done and project.status != Project.STATUS.DONE:
+        # B8: reopening (creator-only, see forbidden_revert above) had no
+        # activity/notification trail at all -- asymmetric with completion.
+        await sync_to_async(log_project_reopened, thread_sensitive=True)(project, user)
+        await sync_to_async(notify_project_reopened, thread_sensitive=True)(project, user)
     return project, None
+
+
+# --------------------------------------------------------------------------
+# Visibility escalation (A7) -- a Department Member's project starts private
+# (see create_project) and can't be raised directly by them (see
+# update_project's visibility_locked check). This is their only path to
+# department visibility; company visibility is reachable only by a
+# Department Leader/Owner/CM acting directly through update_project, never
+# through this request/approval cycle.
+# --------------------------------------------------------------------------
+
+async def _resolve_visibility_reviewer(project):
+    """The department's own leader, or -- if it currently has none -- the
+    company owner, so a request is never left unreviewable by anyone."""
+    if project.department_id:
+        department = await Department.objects.select_related('leader').filter(id=project.department_id).afirst()
+        if department is not None and department.leader_id is not None:
+            return department.leader
+    return await User.objects.filter(id=project.company.owner_id).afirst()
+
+
+async def _can_review_visibility_request(user, project) -> bool:
+    """Same department-scoping as _can_manage_this_department: Owner/CM may
+    review any request, a Department Leader only their own department's."""
+    role = await get_company_role(user, project.company)
+    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
+        return True
+    if role == CompanyUserProfile.Role.DEPARTMENT_LEADER and project.department_id:
+        own_department_id = await get_member_department_id(user, project.company)
+        return own_department_id == project.department_id
+    return False
+
+
+async def request_visibility_change(user, project, target_visibility):
+    """A Department Member requests their own private project be raised to
+    department visibility. Returns (request, error) where error is
+    'forbidden', 'invalid_target', 'already_pending', or None."""
+    if project.created_by_id != user.id:
+        return None, 'forbidden'
+    role = await get_company_role(user, project.company)
+    if role != CompanyUserProfile.Role.DEPARTMENT_MEMBER:
+        return None, 'forbidden'
+    if target_visibility != Project.VISIBILITY.DEPARTMENT:
+        return None, 'invalid_target'
+    if project.visibility != Project.VISIBILITY.PRIVATE or project.department_id is None:
+        return None, 'invalid_target'
+    try:
+        request = await ProjectVisibilityRequest.objects.acreate(
+            project=project, requested_by=user, requested_visibility=target_visibility,
+        )
+    except IntegrityError:
+        return None, 'already_pending'
+    reviewer = await _resolve_visibility_reviewer(project)
+    await sync_to_async(notify_visibility_requested, thread_sensitive=True)(request, reviewer)
+    return request, None
+
+
+async def list_visibility_requests_for_user(user):
+    """Pending visibility requests the caller may review: Owner/CM see every
+    pending request company-wide; a Department Leader sees only their own
+    department's; anyone else sees none."""
+    company = await get_member_company(user)
+    if company is None:
+        return ProjectVisibilityRequest.objects.none()
+    role = await get_company_role(user, company)
+    qs = ProjectVisibilityRequest.objects.filter(
+        project__company=company, project__is_deleted=False, status=ProjectVisibilityRequest.STATUS.PENDING,
+    ).select_related('project', 'requested_by')
+    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
+        return qs.order_by('-created_at')
+    if role == CompanyUserProfile.Role.DEPARTMENT_LEADER:
+        own_department_id = await get_member_department_id(user, company)
+        if own_department_id is None:
+            return ProjectVisibilityRequest.objects.none()
+        return qs.filter(project__department_id=own_department_id).order_by('-created_at')
+    return ProjectVisibilityRequest.objects.none()
+
+
+async def get_visibility_request_for_user(user, request_id):
+    """Returns (request, error) where error is 'not_found' or None. Tenant
+    scoping only here -- review-authority scoping happens in
+    approve/deny_visibility_request so a 403 there is distinguishable from a
+    404 for something outside the caller's company entirely."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'not_found'
+    request = await ProjectVisibilityRequest.objects.select_related(
+        'project', 'project__company', 'project__department', 'requested_by',
+    ).filter(id=request_id, project__company=company).afirst()
+    if request is None:
+        return None, 'not_found'
+    return request, None
+
+
+async def approve_visibility_request(user, request):
+    """Returns (request, error) where error is 'forbidden', 'not_pending', or
+    None. Raises the project straight to department visibility."""
+    if request.status != ProjectVisibilityRequest.STATUS.PENDING:
+        return None, 'not_pending'
+    project = request.project
+    if not await _can_review_visibility_request(user, project):
+        return None, 'forbidden'
+    request.status = ProjectVisibilityRequest.STATUS.APPROVED
+    request.decided_by = user
+    request.decided_at = timezone.now()
+    await request.asave(update_fields=['status', 'decided_by', 'decided_at'])
+    project.visibility = request.requested_visibility
+    await project.asave(update_fields=['visibility'])
+    await sync_to_async(notify_visibility_approved, thread_sensitive=True)(request)
+    return request, None
+
+
+async def deny_visibility_request(user, request, comment=''):
+    """Returns (request, error) where error is 'forbidden', 'not_pending', or
+    None."""
+    if request.status != ProjectVisibilityRequest.STATUS.PENDING:
+        return None, 'not_pending'
+    project = request.project
+    if not await _can_review_visibility_request(user, project):
+        return None, 'forbidden'
+    request.status = ProjectVisibilityRequest.STATUS.DENIED
+    request.decided_by = user
+    request.decided_at = timezone.now()
+    request.decision_comment = comment
+    await request.asave(update_fields=['status', 'decided_by', 'decided_at', 'decision_comment'])
+    await sync_to_async(notify_visibility_denied, thread_sensitive=True)(request)
+    return request, None
 
 
 async def archive_project(user, project) -> bool:
@@ -259,6 +480,7 @@ async def transfer_project_ownership(user, project, new_owner_id):
     project.current_owner = new_owner
     await project.asave(update_fields=['current_owner'])
     await sync_to_async(log_ownership_transferred, thread_sensitive=True)(project, user, previous_owner, new_owner)
+    await sync_to_async(notify_project_ownership_transferred, thread_sensitive=True)(project, new_owner, user)
     return project, None
 
 
@@ -325,8 +547,11 @@ async def get_viewable_project(user, project_id):
 
 
 async def get_task_for_user(user, task_id):
+    # project__is_deleted=False: an archived project's tasks are otherwise
+    # still individually reachable (and mutable) by a direct task id, since
+    # archive_project never cascades is_deleted onto its tasks -- see B2.
     task = await Task.objects.select_related('project', 'project__company', 'department', 'assigned_to').filter(
-        id=task_id, is_deleted=False,
+        id=task_id, is_deleted=False, project__is_deleted=False,
     ).afirst()
     if task is None:
         return None, 'not_found'
@@ -360,6 +585,17 @@ async def create_task(user, project, *, title, description, priority, deadline, 
     requires management rights via user_can_manage_task."""
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
+    if project.status == Project.STATUS.DONE:
+        # A new (necessarily not-Done) task would silently break the "all
+        # tasks Done" invariant Done itself represents, and letting anyone
+        # who can merely view the project add one would be a backdoor around
+        # update_project's creator-only revert-from-Done restriction (B5).
+        # Reopening has to stay that explicit, creator-only action.
+        return None, 'project_completed'
+    if deadline < timezone.now() - PAST_DATE_GRACE:
+        return None, 'invalid_deadline'
+    if deadline >= project.deadline:
+        return None, 'invalid_deadline'
     department, error = await _resolve_department(project.company, department_id)
     if error:
         return None, error
@@ -369,17 +605,31 @@ async def create_task(user, project, *, title, description, priority, deadline, 
     assignee, error = await _resolve_assignee(project.company, assigned_to_id)
     if error:
         return None, error
+    if assignee is not None:
+        # Same eligibility scoping as assign_task (B4) -- otherwise a DL/DM
+        # could bypass it by setting the assignee at creation instead of
+        # through the separate assign endpoint.
+        role = await get_company_role(user, project.company)
+        if role in DEPARTMENT_SCOPED_ROLES and not await is_eligible_assignee(user, project, assignee):
+            return None, 'ineligible_assignee'
     task = await Task.objects.acreate(
         project=project, department=department, task_type=task_type, assigned_to=assignee,
         title=title, description=description, priority=priority, deadline=deadline,
         estimated_time=estimated_time, created_by=user, source=Task.SOURCE.MANUAL,
     )
+    if assignee is not None:
+        # B8: create_task previously never notified an assignee set at
+        # creation time, unlike assign_task's separate reassignment path --
+        # inconsistent for what's the same outcome (you were assigned to X).
+        await sync_to_async(notify_task_assigned, thread_sensitive=True)(task)
     return task, None
 
 
 async def update_task(user, task, updates: dict):
     if not await user_can_manage_task(user, task):
         return None, 'forbidden'
+    if 'deadline' in updates and updates['deadline'] >= task.project.deadline:
+        return None, 'invalid_deadline'
     if 'department_id' in updates:
         department, error = await _resolve_department(task.project.company, updates.pop('department_id'))
         if error:
@@ -461,6 +711,15 @@ async def assign_task(user, task, assignee_id):
     assignee, error = await _resolve_assignee(task.project.company, assignee_id)
     if error:
         return None, error
+    if assignee is not None:
+        # list_eligible_assignees' department/team branches are a curated
+        # subset (they don't include the Owner/CM unless literally a member
+        # of that department), not a security boundary for a manage_any
+        # role -- so only DL/DM assignment is actually restricted to it,
+        # matching every other department-scoped check this session (B4).
+        role = await get_company_role(user, task.project.company)
+        if role in DEPARTMENT_SCOPED_ROLES and not await is_eligible_assignee(user, task.project, assignee):
+            return None, 'ineligible_assignee'
     task.assigned_to = assignee
     await task.asave(update_fields=['assigned_to', 'updated_at'])
     if assignee is not None:
@@ -469,15 +728,18 @@ async def assign_task(user, task, assignee_id):
 
 
 async def update_task_status(user, task, status):
+    """Kanban drag-and-drop transitions for To Do/In Progress only. Done and
+    In Review are never reachable here -- they're only reached via the
+    approval workflow (submit_task_for_approval sets In Review; approve_task
+    sets Done) so an evidence trail always exists behind a completed task."""
     if not await user_can_update_task_status(user, task):
         return None, 'forbidden'
     if status not in Task.STATUS.values:
         return None, 'invalid_status'
-    was_done = task.status == Task.STATUS.DONE
+    if status in (Task.STATUS.DONE, Task.STATUS.IN_REVIEW):
+        return None, 'invalid_transition'
     task.status = status
     await task.asave(update_fields=['status', 'updated_at'])
-    if status == Task.STATUS.DONE and not was_done:
-        await sync_to_async(notify_task_completed, thread_sensitive=True)(task)
     return task, None
 
 
@@ -529,6 +791,188 @@ async def task_spent_hours(task) -> float | None:
     result = await TaskTimeLog.objects.filter(task=task, is_deleted=False).aaggregate(total=Sum('duration'))
     total = result['total']
     return round(total.total_seconds() / 3600, 2) if total else None
+
+
+# --------------------------------------------------------------------------
+# Task approval workflow -- evidence submission, approve/reject, and the
+# deadline-extension actions that are narrower than general project
+# management (see user_can_approve_task/user_can_extend_deadline above).
+# --------------------------------------------------------------------------
+
+def _maybe_auto_complete_project(project):
+    """Flips a project to Done automatically once every one of its own
+    (non-deleted) tasks is Done. Never fires for a zero-task project -- an
+    empty project can never be considered "complete," matching the same
+    rule update_project enforces for a manual Done set. Sync, not async:
+    called via sync_to_async from approve_task, same convention as the rest
+    of this module's notification/activity side-effects."""
+    if project.status == Project.STATUS.DONE:
+        return
+    tasks_qs = Task.objects.filter(project=project, is_deleted=False)
+    if tasks_qs.count() == 0:
+        return
+    if tasks_qs.exclude(status=Task.STATUS.DONE).exists():
+        return
+    project.status = Project.STATUS.DONE
+    project.save(update_fields=['status', 'updated_at'])
+    log_project_completed(project)
+    notify_project_auto_completed(project)
+
+
+async def submit_task_for_approval(user, task, *, files=None, links=None, page_ids=None):
+    """Assignee-only: submits evidence (any mix of uploaded files, external
+    links, and Info Portal pages) for the task's approver to review. Moves
+    the task to In Review. Returns (approval, error) where error is one of
+    'forbidden', 'invalid_status' (task isn't In Progress), 'already_pending'
+    (an unresolved approval already exists), 'deadline_passed', 'no_evidence',
+    'invalid_content_type', 'too_large', 'invalid_page', or None."""
+    if task.assigned_to_id != user.id:
+        return None, 'forbidden'
+    if task.status != Task.STATUS.IN_PROGRESS:
+        return None, 'invalid_status'
+    if await TaskApproval.objects.filter(task=task, status=TaskApproval.STATUS.PENDING).aexists():
+        return None, 'already_pending'
+    if task.deadline < timezone.now():
+        return None, 'deadline_passed'
+
+    files = files or []
+    links = links or []
+    page_ids = page_ids or []
+    if not files and not links and not page_ids:
+        return None, 'no_evidence'
+
+    for uploaded_file in files:
+        if uploaded_file.size > MAX_DOCUMENT_SIZE_BYTES:
+            return None, 'too_large'
+        if (uploaded_file.content_type or '') not in ALLOWED_DOCUMENT_CONTENT_TYPES:
+            return None, 'invalid_content_type'
+
+    pages = []
+    if page_ids:
+        from pages.models import Page  # local import: projects_and_tasks stays independent of pages at module load
+
+        pages = [
+            page async for page in
+            Page.objects.filter(id__in=page_ids, folder__company=task.project.company, is_deleted=False)
+        ]
+        if len(pages) != len(set(page_ids)):
+            return None, 'invalid_page'
+
+    approval = await TaskApproval.objects.acreate(task=task, submitted_by=user)
+    to_create = []
+    for uploaded_file in files:
+        to_create.append(Attachment(
+            project=task.project, task=task, approval=approval, uploaded_by=user,
+            type=Attachment.ATTACHMENT_TYPE.FILE, file=uploaded_file, name=uploaded_file.name[:255],
+            content_type=uploaded_file.content_type or '', size=uploaded_file.size,
+        ))
+    for url in links:
+        to_create.append(Attachment(
+            project=task.project, task=task, approval=approval, uploaded_by=user,
+            type=Attachment.ATTACHMENT_TYPE.LINK, url=url, name=str(url)[:255],
+        ))
+    for page in pages:
+        to_create.append(Attachment(
+            project=task.project, task=task, approval=approval, uploaded_by=user,
+            type=Attachment.ATTACHMENT_TYPE.PAGE, page=page, name=page.title[:255],
+        ))
+    if to_create:
+        await Attachment.objects.abulk_create(to_create)
+
+    task.status = Task.STATUS.IN_REVIEW
+    await task.asave(update_fields=['status', 'updated_at'])
+    await sync_to_async(notify_task_submitted_for_approval, thread_sensitive=True)(approval)
+    return approval, None
+
+
+async def approve_task(user, task):
+    """Approver-only (see user_can_approve_task). Sets the task Done and
+    auto-completes the parent project when eligible. Returns (task, error)
+    where error is 'forbidden', 'no_pending_approval', or None."""
+    if not await user_can_approve_task(user, task):
+        return None, 'forbidden'
+    approval = await TaskApproval.objects.filter(
+        task=task, status=TaskApproval.STATUS.PENDING,
+    ).order_by('-submitted_at').afirst()
+    if approval is None:
+        return None, 'no_pending_approval'
+
+    approval.status = TaskApproval.STATUS.APPROVED
+    approval.decided_by = user
+    approval.decided_at = timezone.now()
+    await approval.asave(update_fields=['status', 'decided_by', 'decided_at'])
+
+    task.status = Task.STATUS.DONE
+    await task.asave(update_fields=['status', 'updated_at'])
+
+    await sync_to_async(notify_task_approved, thread_sensitive=True)(approval)
+    await sync_to_async(_maybe_auto_complete_project, thread_sensitive=True)(task.project)
+    return task, None
+
+
+async def reject_task_approval(user, task, comment: str):
+    """Approver-only. A rejection comment is required and is visible only to
+    the original submitter -- enforced in the API serialization layer (see
+    api.routers.tasks), never returned to anyone else. Sets the task back to
+    In Progress so the assignee can rework and resubmit. Returns
+    (task, error) where error is 'forbidden', 'comment_required',
+    'no_pending_approval', or None."""
+    if not await user_can_approve_task(user, task):
+        return None, 'forbidden'
+    if not comment or not comment.strip():
+        return None, 'comment_required'
+    approval = await TaskApproval.objects.filter(
+        task=task, status=TaskApproval.STATUS.PENDING,
+    ).order_by('-submitted_at').afirst()
+    if approval is None:
+        return None, 'no_pending_approval'
+
+    approval.status = TaskApproval.STATUS.REJECTED
+    approval.decided_by = user
+    approval.decided_at = timezone.now()
+    approval.rejection_comment = comment
+    await approval.asave(update_fields=['status', 'decided_by', 'decided_at', 'rejection_comment'])
+
+    task.status = Task.STATUS.IN_PROGRESS
+    await task.asave(update_fields=['status', 'updated_at'])
+
+    await sync_to_async(notify_task_rejected, thread_sensitive=True)(approval)
+    return task, None
+
+
+async def extend_task_deadline(user, task, new_deadline):
+    """Project-creator-only (narrower than general project management -- see
+    user_can_extend_deadline), extend-only: the new deadline must be later
+    than the task's current one, and must still land strictly before the
+    project's own deadline (the same invariant enforced at task creation).
+    Returns (task, error) where error is 'forbidden', 'not_an_extension',
+    'exceeds_project_deadline', or None."""
+    if not await user_can_extend_deadline(user, task.project):
+        return None, 'forbidden'
+    if new_deadline <= task.deadline:
+        return None, 'not_an_extension'
+    if new_deadline >= task.project.deadline:
+        return None, 'exceeds_project_deadline'
+    old_deadline = task.deadline
+    task.deadline = new_deadline
+    await task.asave(update_fields=['deadline', 'updated_at'])
+    await sync_to_async(notify_task_deadline_extended, thread_sensitive=True)(task, old_deadline, new_deadline)
+    return task, None
+
+
+async def extend_project_deadline(user, project, new_deadline):
+    """Project-creator-only, extend-only -- see extend_task_deadline above
+    for the matching task-level action. Returns (project, error) where
+    error is 'forbidden', 'not_an_extension', or None."""
+    if not await user_can_extend_deadline(user, project):
+        return None, 'forbidden'
+    if new_deadline <= project.deadline:
+        return None, 'not_an_extension'
+    old_deadline = project.deadline
+    project.deadline = new_deadline
+    await project.asave(update_fields=['deadline', 'updated_at'])
+    await sync_to_async(notify_project_deadline_extended, thread_sensitive=True)(project, old_deadline, new_deadline)
+    return project, None
 
 
 # --------------------------------------------------------------------------
@@ -614,7 +1058,11 @@ def persist_ai_generated_tasks(generation):
             title=row.title, description=row.description, priority=row.priority, sequence=row.sequence,
             estimated_time=_parse_estimated_effort(row.estimated_effort), assigned_to=assignee,
             created_by=generation.requested_by, source=Task.SOURCE.AI_GENERATED,
-            deadline=project.deadline,
+            # Must be strictly before the project's own deadline (see
+            # create_task/update_task's matching validation for
+            # manually-created tasks) -- an hour's buffer is a safe default
+            # a human can extend later via extend_task_deadline.
+            deadline=project.deadline - timedelta(hours=1),
         ))
 
     with transaction.atomic():
@@ -689,8 +1137,10 @@ async def upload_document(user, project, uploaded_file, *, label='', task_id=Non
 
 
 async def get_document_for_user(user, document_id):
+    # project__is_deleted=False: see get_task_for_user's comment -- the same
+    # gap applies to documents (B2).
     document = await Attachment.objects.select_related('project', 'project__company').filter(
-        id=document_id, is_deleted=False,
+        id=document_id, is_deleted=False, project__is_deleted=False,
     ).afirst()
     if document is None:
         return None, 'not_found'

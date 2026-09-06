@@ -7,7 +7,14 @@ import logging
 from zoneinfo import available_timezones
 
 from analytics.services import get_member_workload
-from company.services import get_company_role_sync, get_managed_company_sync, get_member_company, is_company_member_sync
+from asgiref.sync import sync_to_async
+from company.services import (
+    get_company_role_sync,
+    get_managed_company_sync,
+    get_member_company,
+    get_member_department_id_sync,
+    is_company_member_sync,
+)
 from departments_and_teams.models import Department, Team
 from django.conf import settings
 from django.db import transaction
@@ -153,6 +160,18 @@ def _demote_leader_if_unneeded(company, user_id):
     ).update(role=CompanyUserProfile.Role.DEPARTMENT_MEMBER)
 
 
+def _can_manage_this_department_sync(requester, company, department) -> bool:
+    """Sync mirror of departments_and_teams.services._can_manage_this_department
+    -- a Department Leader's 'departments:manage' grant is company-wide at the
+    flat-permission level, so leadership changes must be additionally scoped
+    to the requester's own department here."""
+    requester_role = get_company_role_sync(requester, company)
+    if requester_role != CompanyUserProfile.Role.DEPARTMENT_LEADER:
+        return True
+    member_department_id = get_member_department_id_sync(requester, company)
+    return member_department_id is not None and member_department_id == department.id
+
+
 def set_department_leader(requester, department, new_leader_user_id):
     """Assign a company member as a department's leader. Returns
     (department, error) where error is 'forbidden', 'invalid_leader', or None.
@@ -170,6 +189,8 @@ def set_department_leader(requester, department, new_leader_user_id):
             return None, 'forbidden'
         requester_role = get_company_role_sync(requester, company)
         if not has_permission(requester_role, 'departments:manage'):
+            return None, 'forbidden'
+        if not _can_manage_this_department_sync(requester, company, department):
             return None, 'forbidden'
 
         new_leader = User.objects.filter(id=new_leader_user_id).first()
@@ -200,6 +221,8 @@ def revoke_department_leader(requester, department):
             return None, 'forbidden'
         requester_role = get_company_role_sync(requester, company)
         if not has_permission(requester_role, 'departments:manage'):
+            return None, 'forbidden'
+        if not _can_manage_this_department_sync(requester, company, department):
             return None, 'forbidden'
 
         previous_leader_id = department.leader_id
@@ -488,3 +511,87 @@ async def update_user_theme(user, theme: str):
         user.theme = theme
         await user.asave(update_fields=['theme'])
     return user, None
+
+
+# --------------------------------------------------------------------------
+# Self-service profile fields (birthday/skype are new; profession/address/
+# phone_number/resume already existed on CompanyUserProfile) -- same
+# no-company-profile gap as update_notification_preference above (the
+# company owner has no CompanyUserProfile row).
+# --------------------------------------------------------------------------
+
+PROFILE_UPDATABLE_FIELDS = {'profession', 'address', 'phone_number', 'birthday', 'skype'}
+
+MAX_RESUME_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB -- smaller than the general 10MB document cap.
+ALLOWED_RESUME_CONTENT_TYPES = {
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+}
+
+
+async def get_own_profile(user):
+    """Self-service: fetch the caller's own CompanyUserProfile fields, e.g.
+    to hydrate a profile-edit form. Returns (profile, error) where error is
+    'forbidden' (no company) or 'no_profile' (the company owner has no
+    profile row), or None."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'forbidden'
+    profile = await CompanyUserProfile.objects.filter(user=user, company=company).afirst()
+    if profile is None:
+        return None, 'no_profile'
+    return profile, None
+
+
+async def update_own_profile(user, updates: dict):
+    """Self-service: a member updates their own CompanyUserProfile fields.
+    Returns (profile, error) where error is 'forbidden' (no company) or
+    'no_profile' (the company owner has no profile row), or None."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'forbidden'
+    profile = await CompanyUserProfile.objects.filter(user=user, company=company).afirst()
+    if profile is None:
+        return None, 'no_profile'
+    update_fields = [field for field in updates if field in PROFILE_UPDATABLE_FIELDS]
+    for field in update_fields:
+        setattr(profile, field, updates[field])
+    if update_fields:
+        await profile.asave(update_fields=update_fields)
+    return profile, None
+
+
+async def upload_own_resume(user, uploaded_file):
+    """Self-service resume upload. Returns (profile, error) where error is
+    'forbidden', 'no_profile', 'too_large', 'invalid_content_type', or
+    None."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'forbidden'
+    profile = await CompanyUserProfile.objects.filter(user=user, company=company).afirst()
+    if profile is None:
+        return None, 'no_profile'
+    if uploaded_file.size > MAX_RESUME_SIZE_BYTES:
+        return None, 'too_large'
+    content_type = uploaded_file.content_type or ''
+    if content_type not in ALLOWED_RESUME_CONTENT_TYPES:
+        return None, 'invalid_content_type'
+    if profile.resume:
+        await sync_to_async(profile.resume.delete, thread_sensitive=True)(save=False)
+    profile.resume = uploaded_file
+    await profile.asave(update_fields=['resume'])
+    return profile, None
+
+
+async def get_own_resume(user):
+    """Self-service resume lookup, used to stream it back to its owner only
+    -- mirrors get_member_profile_picture's ownership-scoped read. Returns
+    (profile, error) where error is 'forbidden' or 'not_found'."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'forbidden'
+    profile = await CompanyUserProfile.objects.filter(user=user, company=company).afirst()
+    if profile is None or not profile.resume:
+        return None, 'not_found'
+    return profile, None
