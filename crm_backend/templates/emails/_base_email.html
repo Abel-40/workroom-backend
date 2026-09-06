@@ -1,158 +1,206 @@
 <!DOCTYPE html>
-<html lang="en" style="margin: 0; padding: 0;">
+<html lang="en" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="x-apple-disable-message-reformatting" />
+    <meta name="format-detection" content="telephone=no, date=no, address=no, email=no" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="supported-color-schemes" content="light dark" />
     <title>{% block title %}Workroom{% endblock %}</title>
+
+    <!--[if mso]>
+    <noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        /* Outlook (Word engine) ignores web fonts, radii and shadows. Pin a
+           real font so it doesn't fall back to Times New Roman. */
+        body, table, td, p, a, h1, h2 { font-family: 'Segoe UI', Arial, sans-serif !important; }
+    </style>
+    <![endif]-->
+
+    <style>
+        /* No @import / <link> for webfonts: Gmail and Outlook strip both, so
+           it only buys a silent fallback and a flash. A system stack renders
+           natively everywhere instead. */
+
+        :root { color-scheme: light dark; supported-color-schemes: light dark; }
+
+        html, body { margin: 0 !important; padding: 0 !important; width: 100% !important; }
 
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background-color: #eef3fb;
-            margin: 0;
-            padding: 0;
+            background-color: #eaeff6;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             line-height: 1.6;
             color: #334155;
+            -webkit-font-smoothing: antialiased;
+            -webkit-text-size-adjust: 100%;
+            -ms-text-size-adjust: 100%;
         }
+
+        table { border-collapse: collapse !important; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+        img { border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }
+        a { text-decoration: none; }
+
         .wr-preheader {
-            display: none;
+            display: none !important;
             visibility: hidden;
             opacity: 0;
             height: 0;
             width: 0;
+            max-height: 0;
+            max-width: 0;
             overflow: hidden;
             mso-hide: all;
+            font-size: 1px;
+            line-height: 1px;
+            color: #eaeff6;
         }
-        .wr-wrapper {
-            width: 100%;
-            padding: 32px 16px;
-        }
+
+        .wr-bg { background-color: #eaeff6; width: 100%; }
+
         .wr-container {
+            width: 600px;
             max-width: 600px;
-            margin: 0 auto;
             background-color: #ffffff;
-            border-radius: 16px;
+            border-radius: 18px;
             overflow: hidden;
-            box-shadow: 0 20px 45px rgba(15, 23, 42, 0.08);
+            box-shadow: 0 18px 48px rgba(15, 23, 42, 0.10);
         }
-        .wr-header {
-            text-align: center;
-            padding: 36px 24px 32px;
-        }
-        .wr-header-blue { background: linear-gradient(135deg, #3F8CFF 0%, #2563eb 100%); }
-        .wr-header-green { background: linear-gradient(135deg, #34d399 0%, #059669 100%); }
-        .wr-header-teal { background: linear-gradient(135deg, #2dd4bf 0%, #0d9488 100%); }
-        .wr-header-violet { background: linear-gradient(135deg, #a78bfa 0%, #7c3aed 100%); }
-        .wr-header-amber { background: linear-gradient(135deg, #fbbf24 0%, #d97706 100%); }
+
+        /* --- header ------------------------------------------------------ */
+        /* Every gradient is preceded by a solid background-color of the same
+           family. Outlook drops the gradient entirely, and without that solid
+           fallback the band renders white -- with white text on it. */
+
+        .wr-header { padding: 44px 32px 40px; text-align: center; }
+
+        /* Each header layers a soft radial highlight over the base gradient so
+           the band has depth rather than reading as a flat colour block. A
+           client that supports neither still gets the solid background-color. */
+        .wr-header-blue   { background-color: #2563eb; background-image: radial-gradient(circle at 28% 8%, rgba(255,255,255,0.26) 0%, rgba(255,255,255,0) 58%), linear-gradient(135deg, #4f93ff 0%, #1d4ed8 100%); }
+        .wr-header-green  { background-color: #059669; background-image: radial-gradient(circle at 28% 8%, rgba(255,255,255,0.26) 0%, rgba(255,255,255,0) 58%), linear-gradient(135deg, #34d399 0%, #047857 100%); }
+        .wr-header-teal   { background-color: #0d9488; background-image: radial-gradient(circle at 28% 8%, rgba(255,255,255,0.26) 0%, rgba(255,255,255,0) 58%), linear-gradient(135deg, #2dd4bf 0%, #0f766e 100%); }
+        .wr-header-violet { background-color: #7c3aed; background-image: radial-gradient(circle at 28% 8%, rgba(255,255,255,0.26) 0%, rgba(255,255,255,0) 58%), linear-gradient(135deg, #a78bfa 0%, #6d28d9 100%); }
+        .wr-header-amber  { background-color: #d97706; background-image: radial-gradient(circle at 28% 8%, rgba(255,255,255,0.26) 0%, rgba(255,255,255,0) 58%), linear-gradient(135deg, #fbbf24 0%, #b45309 100%); }
+
+        /* Accent seam under the band. Drawn as an inset border on the header
+           itself rather than its own element, so it always picks up the right
+           hue from header_class -- a child template only ever sets that one
+           block, and a Django block cannot be rendered twice to feed a second. */
+        .wr-header { border-bottom: 4px solid rgba(255, 255, 255, 0.22); }
+
         .wr-logo-badge {
-            width: 56px;
-            height: 56px;
-            margin: 0 auto 16px;
+            width: 60px;
             background-color: #ffffff;
-            border-radius: 16px;
-            display: table;
-            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+            border-radius: 17px;
+            box-shadow: 0 8px 20px rgba(2, 6, 23, 0.20);
         }
-        .wr-logo-badge img {
-            display: block;
-            width: 32px;
-            height: 32px;
-            margin: 12px auto;
-        }
+        .wr-logo-badge img { display: block; width: 30px; height: 30px; margin: 0 auto; }
+
         .wr-eyebrow {
-            margin: 0 0 6px;
-            font-size: 12px;
+            margin: 0 0 8px;
+            font-size: 11px;
             font-weight: 700;
-            letter-spacing: 2px;
+            letter-spacing: 2.2px;
             text-transform: uppercase;
-            color: rgba(255, 255, 255, 0.85);
+            color: #ffffff;
+            opacity: 0.82;
         }
+
         .wr-heading {
             margin: 0;
-            font-size: 24px;
-            font-weight: 800;
-            letter-spacing: -0.4px;
+            font-size: 26px;
+            line-height: 1.25;
+            font-weight: 700;
+            letter-spacing: -0.5px;
             color: #ffffff;
         }
-        .wr-content {
-            padding: 36px 40px 12px;
-            color: #334155;
-        }
-        .wr-footer {
-            font-size: 12px;
+
+        /* --- content ----------------------------------------------------- */
+
+        .wr-content { padding: 36px 40px 8px; color: #334155; font-size: 15px; }
+        .wr-content p { margin: 0 0 16px; }
+
+        /* Circular, ringed and shadowed so it reads as deliberate iconography
+           rather than a stray tinted square floating beside the copy. */
+        .wr-badge {
+            width: 54px;
+            height: 54px;
+            border-radius: 50%;
+            font-size: 24px;
+            line-height: 54px;
             text-align: center;
-            color: #94a3b8;
-            padding: 24px;
-            border-top: 1px solid #eef2f7;
+            margin: 0 0 18px;
         }
-        .wr-footer a { color: #3F8CFF; text-decoration: none; }
-        .wr-btn-container { text-align: center; margin: 28px 0 8px; }
+        .wr-badge span { display: block; line-height: 54px; }
+
+        .wr-badge-blue   { background-color: #eff6ff; border: 2px solid #dbeafe; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.14); }
+        .wr-badge-green  { background-color: #ecfdf5; border: 2px solid #d1fae5; box-shadow: 0 4px 12px rgba(5, 150, 105, 0.14); }
+        .wr-badge-teal   { background-color: #f0fdfa; border: 2px solid #ccfbf1; box-shadow: 0 4px 12px rgba(13, 148, 136, 0.14); }
+        .wr-badge-violet { background-color: #f5f3ff; border: 2px solid #ede9fe; box-shadow: 0 4px 12px rgba(124, 58, 237, 0.14); }
+        .wr-badge-amber  { background-color: #fffbeb; border: 2px solid #fef3c7; box-shadow: 0 4px 12px rgba(217, 119, 6, 0.14); }
+
+        .wr-highlight {
+            border-radius: 12px;
+            padding: 18px 22px;
+            margin: 4px 0 22px;
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.45;
+        }
+        .wr-highlight-blue   { background-color: #eff6ff; border-left: 4px solid #2563eb; color: #1e3a8a; }
+        .wr-highlight-green  { background-color: #ecfdf5; border-left: 4px solid #059669; color: #065f46; }
+        .wr-highlight-teal   { background-color: #f0fdfa; border-left: 4px solid #0d9488; color: #115e59; }
+        .wr-highlight-violet { background-color: #f5f3ff; border-left: 4px solid #7c3aed; color: #5b21b6; }
+        .wr-highlight-amber  { background-color: #fffbeb; border-left: 4px solid #d97706; color: #92400e; }
+
+        /* --- button ------------------------------------------------------ */
+
+        .wr-btn-container { text-align: center; margin: 30px 0 10px; }
+
         .wr-btn {
             display: inline-block;
             color: #ffffff !important;
             text-decoration: none;
-            padding: 14px 30px;
-            border-radius: 10px;
+            padding: 15px 34px;
+            border-radius: 11px;
             font-weight: 600;
             font-size: 15px;
+            line-height: 1.2;
+            mso-padding-alt: 0;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
         }
-        .wr-btn-blue { background: linear-gradient(135deg, #3F8CFF 0%, #2563eb 100%); box-shadow: 0 6px 16px rgba(37, 99, 235, 0.28); }
-        .wr-btn-green { background: linear-gradient(135deg, #34d399 0%, #059669 100%); box-shadow: 0 6px 16px rgba(5, 150, 105, 0.28); }
-        .wr-btn-teal { background: linear-gradient(135deg, #2dd4bf 0%, #0d9488 100%); box-shadow: 0 6px 16px rgba(13, 148, 136, 0.28); }
-        .wr-btn-violet { background: linear-gradient(135deg, #a78bfa 0%, #7c3aed 100%); box-shadow: 0 6px 16px rgba(124, 58, 237, 0.28); }
-        .wr-btn-amber { background: linear-gradient(135deg, #fbbf24 0%, #d97706 100%); box-shadow: 0 6px 16px rgba(217, 119, 6, 0.28); }
-        .wr-badge {
-            display: table;
-            width: 44px;
-            height: 44px;
-            border-radius: 12px;
-            font-size: 20px;
-            text-align: center;
-            margin-bottom: 16px;
-        }
-        .wr-badge span { display: table-cell; vertical-align: middle; }
-        .wr-badge-blue { background-color: #eff6ff; }
-        .wr-badge-green { background-color: #ecfdf5; }
-        .wr-badge-teal { background-color: #f0fdfa; }
-        .wr-badge-violet { background-color: #f5f3ff; }
-        .wr-badge-amber { background-color: #fffbeb; }
-        .wr-highlight {
-            border-radius: 10px;
-            padding: 18px 20px;
-            margin: 8px 0 24px;
-            font-size: 15px;
-        }
-        .wr-highlight-blue { background-color: #f1f5f9; border-left: 4px solid #3F8CFF; color: #1e293b; }
-        .wr-highlight-green { background-color: #ecfdf5; border-left: 4px solid #10b981; color: #065f46; }
-        .wr-highlight-teal { background-color: #f0fdfa; border-left: 4px solid #14b8a6; color: #0f766e; }
-        .wr-highlight-violet { background-color: #f5f3ff; border-left: 4px solid #8b5cf6; color: #5b21b6; }
-        .wr-highlight-amber { background-color: #fffbeb; border-left: 4px solid #f59e0b; color: #92400e; }
-        .wr-muted {
-            font-size: 14px;
-            color: #64748b;
-        }
+
+        .wr-btn-blue   { background-color: #2563eb; background-image: linear-gradient(135deg, #4f93ff 0%, #1d4ed8 100%); box-shadow: 0 8px 18px rgba(37, 99, 235, 0.32); }
+        .wr-btn-green  { background-color: #059669; background-image: linear-gradient(135deg, #34d399 0%, #047857 100%); box-shadow: 0 8px 18px rgba(5, 150, 105, 0.32); }
+        .wr-btn-teal   { background-color: #0d9488; background-image: linear-gradient(135deg, #2dd4bf 0%, #0f766e 100%); box-shadow: 0 8px 18px rgba(13, 148, 136, 0.32); }
+        .wr-btn-violet { background-color: #7c3aed; background-image: linear-gradient(135deg, #a78bfa 0%, #6d28d9 100%); box-shadow: 0 8px 18px rgba(124, 58, 237, 0.32); }
+        .wr-btn-amber  { background-color: #d97706; background-image: linear-gradient(135deg, #fbbf24 0%, #b45309 100%); box-shadow: 0 8px 18px rgba(217, 119, 6, 0.32); }
+
+        /* Hover lands in Apple Mail, Outlook.com and most webmail; everywhere
+           else it is simply ignored, never leaving the button mis-styled. */
+        .wr-btn:hover { filter: brightness(1.07); transform: translateY(-1px); }
+
+        .wr-muted { font-size: 14px; color: #64748b; line-height: 1.6; }
+
+        .wr-divider { height: 1px; background-color: #e8edf4; font-size: 0; line-height: 0; }
+
+        /* --- steps / notice ---------------------------------------------- */
+
         .wr-steps { margin: 24px 0; }
-        .wr-step { display: table; width: 100%; margin-bottom: 14px; }
+        .wr-step { width: 100%; margin-bottom: 14px; }
         .wr-step-num {
-            display: table-cell;
             width: 26px;
-            height: 26px;
-            background-color: #3F8CFF;
+            background-color: #2563eb;
             color: #ffffff;
             border-radius: 50%;
             text-align: center;
-            vertical-align: middle;
             font-size: 13px;
             font-weight: 700;
+            line-height: 26px;
         }
-        .wr-step-text {
-            display: table-cell;
-            padding-left: 14px;
-            font-size: 15px;
-            color: #475569;
-            vertical-align: middle;
-        }
+        .wr-step-text { padding-left: 14px; font-size: 15px; color: #475569; }
+
         .wr-notice {
             margin-top: 28px;
             padding: 16px 18px;
@@ -162,27 +210,122 @@
             font-size: 14px;
             color: #92400e;
         }
+
+        /* --- footer ------------------------------------------------------ */
+
+        .wr-footer {
+            padding: 26px 32px 30px;
+            text-align: center;
+            font-size: 12px;
+            line-height: 1.7;
+            color: #94a3b8;
+        }
+        .wr-footer a { color: #2563eb; text-decoration: none; }
+
+        /* --- responsive --------------------------------------------------- */
+
+        @media only screen and (max-width: 620px) {
+            .wr-container { width: 100% !important; max-width: 100% !important; border-radius: 14px !important; }
+            .wr-outer-pad { padding: 16px 12px !important; }
+            .wr-header { padding: 30px 22px 26px !important; }
+            .wr-heading { font-size: 22px !important; letter-spacing: -0.3px !important; }
+            .wr-eyebrow { font-size: 10px !important; letter-spacing: 1.8px !important; }
+            .wr-content { padding: 28px 22px 6px !important; }
+            .wr-highlight { padding: 16px 18px !important; font-size: 15px !important; }
+            .wr-footer { padding: 22px 20px 26px !important; }
+            /* Full-width tap target -- a 34px-padded inline button is easy to
+               miss with a thumb. */
+            .wr-btn { display: block !important; width: 100% !important; padding: 16px 20px !important; box-sizing: border-box !important; }
+        }
+
+        /* --- dark mode ---------------------------------------------------- */
+        /* Honoured by Apple Mail, iOS Mail and Outlook.com. Gmail ignores it
+           and keeps the light palette, which stays fully legible. */
+
+        @media (prefers-color-scheme: dark) {
+            body, .wr-bg { background-color: #0b1220 !important; }
+            .wr-preheader { color: #0b1220 !important; }
+            .wr-container { background-color: #161f2f !important; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45) !important; }
+            .wr-content { color: #cbd5e1 !important; }
+            .wr-content p { color: #cbd5e1 !important; }
+            .wr-muted { color: #94a3b8 !important; }
+            .wr-divider { background-color: #26324a !important; }
+            .wr-footer { color: #7d8ba1 !important; }
+            .wr-footer a { color: #7aa8f5 !important; }
+            .wr-logo-badge { background-color: #f8fafc !important; }
+
+            .wr-badge-blue   { background-color: #17233b !important; }
+            .wr-badge-green  { background-color: #102b23 !important; }
+            .wr-badge-teal   { background-color: #0e2a29 !important; }
+            .wr-badge-violet { background-color: #1f1a38 !important; }
+            .wr-badge-amber  { background-color: #2e2312 !important; }
+
+            .wr-highlight-blue   { background-color: #17233b !important; color: #bfd6ff !important; }
+            .wr-highlight-green  { background-color: #102b23 !important; color: #a7ecd0 !important; }
+            .wr-highlight-teal   { background-color: #0e2a29 !important; color: #99e9de !important; }
+            .wr-highlight-violet { background-color: #1f1a38 !important; color: #d3c4ff !important; }
+            .wr-highlight-amber  { background-color: #2e2312 !important; color: #f6d18c !important; }
+
+            .wr-notice { background-color: #2e2312 !important; color: #f6d18c !important; }
+            .wr-step-text { color: #cbd5e1 !important; }
+        }
     </style>
 </head>
-<body>
+<body style="margin: 0; padding: 0; background-color: #eaeff6;">
     <span class="wr-preheader">{% block preheader %}{% endblock %}</span>
-    <div class="wr-wrapper">
-        <div class="wr-container">
-            <div class="wr-header {% block header_class %}wr-header-blue{% endblock %}">
-                <div class="wr-logo-badge">
-                    <img src="cid:{{ logo_cid }}" alt="Workroom" />
-                </div>
-                <p class="wr-eyebrow">{% block eyebrow %}Workroom{% endblock %}</p>
-                <h1 class="wr-heading">{% block heading %}{% endblock %}</h1>
-            </div>
-            <div class="wr-content">
-                {% block content %}{% endblock %}
-            </div>
-            <div class="wr-footer">
-                &copy; {% now "Y" %} Workroom Inc. &mdash; All rights reserved.<br>
-                {% block footer_extra %}{% endblock %}
-            </div>
-        </div>
-    </div>
+
+    <table role="presentation" class="wr-bg" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#eaeff6">
+        <tr>
+            <td class="wr-outer-pad" align="center" style="padding: 32px 16px;">
+
+                <!--[if mso]>
+                <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0"><tr><td>
+                <![endif]-->
+
+                <table role="presentation" class="wr-container" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="width: 600px; max-width: 600px;">
+
+                    <tr>
+                        <td class="wr-header {% block header_class %}wr-header-blue{% endblock %}" align="center" style="padding: 40px 32px 36px;">
+                            <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin: 0 auto 18px;">
+                                <tr>
+                                    <td class="wr-logo-badge" align="center" valign="middle" bgcolor="#ffffff" height="60" style="width: 60px; height: 60px; border-radius: 17px;">
+                                        <img src="cid:{{ logo_cid }}" width="30" height="30" alt="Workroom" style="display: block; margin: 0 auto;" />
+                                    </td>
+                                </tr>
+                            </table>
+                            <p class="wr-eyebrow">{% block eyebrow %}Workroom{% endblock %}</p>
+                            <h1 class="wr-heading">{% block heading %}{% endblock %}</h1>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td class="wr-content" style="padding: 36px 40px 8px;">
+                            {% block content %}{% endblock %}
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style="padding: 20px 40px 0;">
+                            <div class="wr-divider" style="height: 1px; background-color: #e8edf4; font-size: 0; line-height: 0;">&nbsp;</div>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td class="wr-footer" align="center" style="padding: 26px 32px 30px;">
+                            <strong style="color: #64748b;">Workroom</strong><br />
+                            &copy; {% now "Y" %} Workroom Inc. &mdash; All rights reserved.<br />
+                            {% block footer_extra %}{% endblock %}
+                        </td>
+                    </tr>
+
+                </table>
+
+                <!--[if mso]>
+                </td></tr></table>
+                <![endif]-->
+
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
