@@ -31,7 +31,9 @@ def send_notification_email_task(self, notification_id: str):
         return
 
     try:
-        send_notification_email(notification.recipient.email, notification.title, notification.message)
+        send_notification_email(
+            notification.recipient.email, notification.title, notification.message, notification.type,
+        )
     except Exception as exc:
         if self.request.retries >= self.max_retries:
             logger.error(

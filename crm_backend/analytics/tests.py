@@ -102,6 +102,7 @@ class CompanyWorkloadTests(TwoCompanyTestCase):
         self.assertEqual(owner_row['in_progress_count'], 1)
         self.assertEqual(owner_row['todo_count'], 0)
         self.assertIsNone(owner_row['department'])
+        self.assertIsNone(owner_row['profession'])  # no CompanyUserProfile row to read one from
 
         member_row = members[str(self.member_a.id)]
         self.assertEqual(member_row['role'], 'DM')
@@ -109,6 +110,7 @@ class CompanyWorkloadTests(TwoCompanyTestCase):
         self.assertEqual(member_row['todo_count'], 1)
         self.assertEqual(member_row['in_progress_count'], 0)
         self.assertEqual(member_row['department'], 'Engineering')
+        self.assertEqual(member_row['profession'], self.member_a.company_profiles.get(company=self.company_a).profession)
 
     def test_workload_is_scoped_to_the_caller_own_company(self):
         response = self.get_workload(self.owner_b)

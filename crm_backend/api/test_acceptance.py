@@ -49,9 +49,10 @@ class V1AcceptanceJourneyTests(TestCase):
 
     def _run_journey(self, tag: str) -> dict:
         # 1. Register
-        signup = self._post('/api/v1/auth/signup/', {
-            'email': f'owner-{tag}@example.com', 'username': f'owner-{tag}', 'password': 'Kx9#mQ2vLp8Z',
-        })
+        with patch('users.tasks.send_welcome_email_task.delay'):
+            signup = self._post('/api/v1/auth/signup/', {
+                'email': f'owner-{tag}@example.com', 'username': f'owner-{tag}', 'password': 'Kx9#mQ2vLp8Z',
+            })
         self.assertEqual(signup.status_code, 201)
         owner = User.objects.get(email=f'owner-{tag}@example.com')
 

@@ -1,0 +1,37 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}Welcome to Workroom{% endblock %}
+{% block preheader %}Your Workroom account is ready, {{ username }}.{% endblock %}
+{% block header_class %}wr-header-blue{% endblock %}
+{% block eyebrow %}Account created{% endblock %}
+{% block heading %}Welcome to Workroom, {{ username }}!{% endblock %}
+
+{% block content %}
+    <p style="font-size: 16px; margin-bottom: 20px; color: #475569;">
+        Your account is ready. Workroom helps you plan projects, organize tasks on a Kanban board, and
+        get an AI-generated head start on your next plan.
+    </p>
+
+    <div class="wr-steps">
+        <div class="wr-step">
+            <div class="wr-step-num">1</div>
+            <div class="wr-step-text">Create or join a company</div>
+        </div>
+        <div class="wr-step">
+            <div class="wr-step-num">2</div>
+            <div class="wr-step-text">Start your first project</div>
+        </div>
+        <div class="wr-step">
+            <div class="wr-step-num">3</div>
+            <div class="wr-step-text">Add tasks manually, or let AI draft a plan for you</div>
+        </div>
+    </div>
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-blue">Get Started</a>
+    </div>
+
+    <p class="wr-muted" style="margin-top: 32px;">
+        If you didn't create this account, you can safely ignore this email.
+    </p>
+{% endblock %}

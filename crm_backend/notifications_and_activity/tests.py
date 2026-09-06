@@ -8,7 +8,10 @@ import json
 from unittest.mock import patch
 
 from api.tests import TwoCompanyTestCase, auth_header
+from django.template.loader import render_to_string
+from django.test import SimpleTestCase
 from users.models import CompanyUserProfile, User
+from utils.notification_email import TEMPLATE_MAP
 
 from notifications_and_activity.models import CompanyActivity, Notification
 from notifications_and_activity.tasks import send_notification_email_task
@@ -218,7 +221,7 @@ class NotificationEmailTaskTests(TwoCompanyTestCase):
             category=Notification.Category.CRITICAL, title='Test', message='Body',
         )
         send_notification_email_task(str(notification.id))
-        mock_send.assert_called_once_with(self.owner_a.email, 'Test', 'Body')
+        mock_send.assert_called_once_with(self.owner_a.email, 'Test', 'Body', Notification.Type.TASK_ASSIGNED)
         notification.refresh_from_db()
         self.assertTrue(notification.email_sent)
 
@@ -230,6 +233,30 @@ class NotificationEmailTaskTests(TwoCompanyTestCase):
         )
         send_notification_email_task(str(notification.id))
         mock_send.assert_not_called()
+
+
+class NotificationEmailTemplateMappingTests(SimpleTestCase):
+    """Each Notification.Type must render its own template, not the one
+    generic notification_email.html shared by everything (the original gap
+    this feature closes) -- and an unmapped/future type must still fall back
+    to the generic template rather than raising."""
+
+    def test_every_notification_type_maps_to_a_distinct_template(self):
+        mapped_templates = {TEMPLATE_MAP[value] for value in Notification.Type.values}
+        self.assertEqual(len(mapped_templates), len(Notification.Type.values))
+        for value in Notification.Type.values:
+            self.assertIn(value, TEMPLATE_MAP, f'{value} has no dedicated email template mapped')
+
+    def test_unmapped_type_falls_back_to_generic_template(self):
+        self.assertEqual(TEMPLATE_MAP.get('some_future_type', 'emails/notification_email.html'), 'emails/notification_email.html')
+
+    def test_mapped_templates_render_without_error(self):
+        for notification_type, template in TEMPLATE_MAP.items():
+            html = render_to_string(template, {
+                'title': 'Test title', 'message': 'Test message',
+                'frontend_url': 'http://localhost:3000', 'logo_cid': 'workroom-logo',
+            })
+            self.assertIn('Test title', html, f'{notification_type} template did not render the title')
 
 
 class NotificationPreferenceTests(TwoCompanyTestCase):

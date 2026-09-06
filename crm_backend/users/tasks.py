@@ -8,8 +8,9 @@ import logging
 from celery import shared_task
 from django.conf import settings
 from utils.Invitation_email import send_invitation_email
+from utils.welcome_email import send_welcome_email
 
-from .models import PendingInvite
+from .models import PendingInvite, User
 from .services import retry_pending_invite_emails
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ def send_invite_email_task(invite_id: str, raw_token: str, inviter_name: str):
     if invite.is_expired():
         invite.delete()
         return
-    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://your-frontend.com').rstrip('/')
+    frontend_url = settings.FRONTEND_URL
     try:
         send_invitation_email(
             invite.email, inviter_name, invite.company.name,
@@ -47,3 +48,28 @@ def send_invite_email_task(invite_id: str, raw_token: str, inviter_name: str):
 def retry_pending_invite_emails_task():
     """Celery Beat schedule entry (see settings.CELERY_BEAT_SCHEDULE)."""
     return retry_pending_invite_emails()
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_welcome_email_task(self, user_id: str):
+    """Same idempotency/retry shape as
+    notifications_and_activity.tasks.send_notification_email_task: re-fetch
+    filtered on the not-yet-sent flag rather than trusting this is the first
+    delivery attempt (a task can run twice), and give up permanently after
+    max_retries -- a welcome email is not irreplaceable."""
+    user = User.objects.filter(id=user_id, welcome_email_sent=False).first()
+    if user is None:
+        logger.info('welcome_email.skipped_already_sent', extra={'user_id': user_id})
+        return
+
+    try:
+        send_welcome_email(user.email, user.username)
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            logger.error('welcome_email.permanent_failure', extra={'user_id': user_id, 'error': str(exc)})
+            return
+        raise self.retry(exc=exc)
+
+    user.welcome_email_sent = True
+    user.save(update_fields=['welcome_email_sent'])
+    logger.info('welcome_email.sent', extra={'user_id': user_id})

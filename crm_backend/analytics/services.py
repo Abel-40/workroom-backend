@@ -127,6 +127,7 @@ async def get_company_workload(company) -> list[dict]:
             'email': owner.email,
             'role': CompanyUserProfile.Role.Owner,
             'department': None,
+            'profession': None,
             'profile_picture_url': None,
             'is_active': True,
             **workload_fields(str(owner.id)),
@@ -145,6 +146,9 @@ async def get_company_workload(company) -> list[dict]:
             'email': profile.user.email,
             'role': profile.role,
             'department': profile.department.name if profile.department_id else None,
+            # Defaults to 'Not provided' at the model level (CompanyUserProfile.profession) --
+            # the frontend falls back to role/department when it's that placeholder.
+            'profession': profile.profession,
             # Profile uploads are private. The frontend resolves this
             # authenticated endpoint to a short-lived object URL rather than
             # exposing a public media path.

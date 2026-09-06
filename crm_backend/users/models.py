@@ -42,6 +42,20 @@ class User(AbstractUser):
   # .update_notification_preference's 'no_profile' case for the gap this
   # avoids).
   timezone = models.CharField(max_length=64, default='UTC')
+
+  class Theme(models.TextChoices):
+      LIGHT = 'light', 'Light'
+      DARK = 'dark', 'Dark'
+      SYSTEM = 'system', 'System'
+
+  # Personal display preference -- same rationale as timezone above: lives on
+  # User (not CompanyUserProfile) so it works for every authenticated user,
+  # including a company Owner with no profile row.
+  theme = models.CharField(max_length=10, choices=Theme.choices, default=Theme.SYSTEM)
+  # Idempotency flag for users.tasks.send_welcome_email_task -- same
+  # convention as Notification.email_sent / PendingInvite.email_sent below.
+  welcome_email_sent = models.BooleanField(default=False)
+
   USERNAME_FIELD = "email"
   REQUIRED_FIELDS = ['username']
   objects= UserManger()

@@ -1,0 +1,24 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-teal{% endblock %}
+{% block eyebrow %}Welcome aboard{% endblock %}
+{% block heading %}You're in!{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-teal"><span>&#127881;</span></div>
+
+    <div class="wr-highlight wr-highlight-teal">{{ title }}</div>
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-teal">Go to Workroom</a>
+    </div>
+
+    <p class="wr-muted" style="margin-top: 24px;">
+        Take a look around, join a project, and say hello to your new team.
+    </p>
+{% endblock %}

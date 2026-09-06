@@ -43,7 +43,7 @@ def retry_pending_invite_emails() -> dict:
     issues a fresh token instead, which also invalidates whatever token may
     have partially leaked (e.g. into mail server logs) from the failed try.
     """
-    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://your-frontend.com').rstrip('/')
+    frontend_url = settings.FRONTEND_URL
     expired = purge_expired_invites()
     invites = PendingInvite.objects.filter(
         status=PendingInvite.Status.Pending, email_sent=False,
@@ -320,7 +320,7 @@ def update_member_department(requester, target_user_id, department_id):
 
 async def get_member_detail(requester, target_user_id):
     """Returns (data, error) where data is
-    {'user', 'role', 'department_name', 'is_active', 'email_notifications_enabled',
+    {'user', 'role', 'department_name', 'profession', 'is_active', 'email_notifications_enabled',
     'workload'} and error is 'forbidden' or 'not_found'."""
     company = await get_member_company(requester)
     if company is None:
@@ -342,6 +342,7 @@ async def get_member_detail(requester, target_user_id):
             'user': profile.user, 'role': profile.role,
             'email_notifications_enabled': profile.email_notifications_enabled,
             'department_name': profile.department.name if profile.department_id else None,
+            'profession': profile.profession,
             'profile_picture_url': profile_picture_url,
             'is_active': profile.is_active, 'workload': workload,
         }, None
@@ -353,7 +354,7 @@ async def get_member_detail(requester, target_user_id):
         workload = await get_member_workload(company, target)
         return {
             'user': target, 'role': CompanyUserProfile.Role.Owner,
-            'department_name': None, 'is_active': True,
+            'department_name': None, 'profession': None, 'is_active': True,
             'profile_picture_url': None,
             # No profile row to store a preference on -- always gets
             # critical-only-style behavior, see _should_email's fallback.
@@ -473,4 +474,17 @@ async def update_user_timezone(user, tz_name: str):
     if user.timezone != tz_name:
         user.timezone = tz_name
         await user.asave(update_fields=['timezone'])
+    return user, None
+
+
+async def update_user_theme(user, theme: str):
+    """Self-service: a user updates their own display theme preference.
+    Same shape/reasoning as update_user_timezone above -- lives on User, not
+    CompanyUserProfile. Returns (user, error) where error is 'invalid_theme'
+    or None."""
+    if theme not in User.Theme.values:
+        return None, 'invalid_theme'
+    if user.theme != theme:
+        user.theme = theme
+        await user.asave(update_fields=['theme'])
     return user, None

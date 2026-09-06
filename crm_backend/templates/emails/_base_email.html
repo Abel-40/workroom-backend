@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en" style="margin: 0; padding: 0;">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{% block title %}Workroom{% endblock %}</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background-color: #eef3fb;
+            margin: 0;
+            padding: 0;
+            line-height: 1.6;
+            color: #334155;
+        }
+        .wr-preheader {
+            display: none;
+            visibility: hidden;
+            opacity: 0;
+            height: 0;
+            width: 0;
+            overflow: hidden;
+            mso-hide: all;
+        }
+        .wr-wrapper {
+            width: 100%;
+            padding: 32px 16px;
+        }
+        .wr-container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 20px 45px rgba(15, 23, 42, 0.08);
+        }
+        .wr-header {
+            text-align: center;
+            padding: 36px 24px 32px;
+        }
+        .wr-header-blue { background: linear-gradient(135deg, #3F8CFF 0%, #2563eb 100%); }
+        .wr-header-green { background: linear-gradient(135deg, #34d399 0%, #059669 100%); }
+        .wr-header-teal { background: linear-gradient(135deg, #2dd4bf 0%, #0d9488 100%); }
+        .wr-header-violet { background: linear-gradient(135deg, #a78bfa 0%, #7c3aed 100%); }
+        .wr-header-amber { background: linear-gradient(135deg, #fbbf24 0%, #d97706 100%); }
+        .wr-logo-badge {
+            width: 56px;
+            height: 56px;
+            margin: 0 auto 16px;
+            background-color: #ffffff;
+            border-radius: 16px;
+            display: table;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+        }
+        .wr-logo-badge img {
+            display: block;
+            width: 32px;
+            height: 32px;
+            margin: 12px auto;
+        }
+        .wr-eyebrow {
+            margin: 0 0 6px;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: rgba(255, 255, 255, 0.85);
+        }
+        .wr-heading {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: -0.4px;
+            color: #ffffff;
+        }
+        .wr-content {
+            padding: 36px 40px 12px;
+            color: #334155;
+        }
+        .wr-footer {
+            font-size: 12px;
+            text-align: center;
+            color: #94a3b8;
+            padding: 24px;
+            border-top: 1px solid #eef2f7;
+        }
+        .wr-footer a { color: #3F8CFF; text-decoration: none; }
+        .wr-btn-container { text-align: center; margin: 28px 0 8px; }
+        .wr-btn {
+            display: inline-block;
+            color: #ffffff !important;
+            text-decoration: none;
+            padding: 14px 30px;
+            border-radius: 10px;
+            font-weight: 600;
+            font-size: 15px;
+        }
+        .wr-btn-blue { background: linear-gradient(135deg, #3F8CFF 0%, #2563eb 100%); box-shadow: 0 6px 16px rgba(37, 99, 235, 0.28); }
+        .wr-btn-green { background: linear-gradient(135deg, #34d399 0%, #059669 100%); box-shadow: 0 6px 16px rgba(5, 150, 105, 0.28); }
+        .wr-btn-teal { background: linear-gradient(135deg, #2dd4bf 0%, #0d9488 100%); box-shadow: 0 6px 16px rgba(13, 148, 136, 0.28); }
+        .wr-btn-violet { background: linear-gradient(135deg, #a78bfa 0%, #7c3aed 100%); box-shadow: 0 6px 16px rgba(124, 58, 237, 0.28); }
+        .wr-btn-amber { background: linear-gradient(135deg, #fbbf24 0%, #d97706 100%); box-shadow: 0 6px 16px rgba(217, 119, 6, 0.28); }
+        .wr-badge {
+            display: table;
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            font-size: 20px;
+            text-align: center;
+            margin-bottom: 16px;
+        }
+        .wr-badge span { display: table-cell; vertical-align: middle; }
+        .wr-badge-blue { background-color: #eff6ff; }
+        .wr-badge-green { background-color: #ecfdf5; }
+        .wr-badge-teal { background-color: #f0fdfa; }
+        .wr-badge-violet { background-color: #f5f3ff; }
+        .wr-badge-amber { background-color: #fffbeb; }
+        .wr-highlight {
+            border-radius: 10px;
+            padding: 18px 20px;
+            margin: 8px 0 24px;
+            font-size: 15px;
+        }
+        .wr-highlight-blue { background-color: #f1f5f9; border-left: 4px solid #3F8CFF; color: #1e293b; }
+        .wr-highlight-green { background-color: #ecfdf5; border-left: 4px solid #10b981; color: #065f46; }
+        .wr-highlight-teal { background-color: #f0fdfa; border-left: 4px solid #14b8a6; color: #0f766e; }
+        .wr-highlight-violet { background-color: #f5f3ff; border-left: 4px solid #8b5cf6; color: #5b21b6; }
+        .wr-highlight-amber { background-color: #fffbeb; border-left: 4px solid #f59e0b; color: #92400e; }
+        .wr-muted {
+            font-size: 14px;
+            color: #64748b;
+        }
+        .wr-steps { margin: 24px 0; }
+        .wr-step { display: table; width: 100%; margin-bottom: 14px; }
+        .wr-step-num {
+            display: table-cell;
+            width: 26px;
+            height: 26px;
+            background-color: #3F8CFF;
+            color: #ffffff;
+            border-radius: 50%;
+            text-align: center;
+            vertical-align: middle;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .wr-step-text {
+            display: table-cell;
+            padding-left: 14px;
+            font-size: 15px;
+            color: #475569;
+            vertical-align: middle;
+        }
+        .wr-notice {
+            margin-top: 28px;
+            padding: 16px 18px;
+            background-color: #fffbeb;
+            border-radius: 10px;
+            border-left: 4px solid #f59e0b;
+            font-size: 14px;
+            color: #92400e;
+        }
+    </style>
+</head>
+<body>
+    <span class="wr-preheader">{% block preheader %}{% endblock %}</span>
+    <div class="wr-wrapper">
+        <div class="wr-container">
+            <div class="wr-header {% block header_class %}wr-header-blue{% endblock %}">
+                <div class="wr-logo-badge">
+                    <img src="cid:{{ logo_cid }}" alt="Workroom" />
+                </div>
+                <p class="wr-eyebrow">{% block eyebrow %}Workroom{% endblock %}</p>
+                <h1 class="wr-heading">{% block heading %}{% endblock %}</h1>
+            </div>
+            <div class="wr-content">
+                {% block content %}{% endblock %}
+            </div>
+            <div class="wr-footer">
+                &copy; {% now "Y" %} Workroom Inc. &mdash; All rights reserved.<br>
+                {% block footer_extra %}{% endblock %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>

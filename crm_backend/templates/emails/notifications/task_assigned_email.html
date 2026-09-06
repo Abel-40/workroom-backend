@@ -1,0 +1,25 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-blue{% endblock %}
+{% block eyebrow %}Task assigned{% endblock %}
+{% block heading %}You have a new task{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-blue"><span>&#128203;</span></div>
+
+    <div class="wr-highlight wr-highlight-blue">{{ title }}</div>
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-blue">View Task</a>
+    </div>
+
+    <p class="wr-muted" style="margin-top: 24px;">
+        Task assignments always email you, regardless of your notification preferences, so you never
+        miss new work.
+    </p>
+{% endblock %}

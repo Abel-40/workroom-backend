@@ -53,6 +53,10 @@ class TimezonePreferenceIn(Schema):
     timezone: str
 
 
+class ThemePreferenceIn(Schema):
+    theme: Literal['light', 'dark', 'system']
+
+
 def _member_data(profile) -> dict:
     return {
         'user_id': profile.user_id,
@@ -71,6 +75,7 @@ def _member_detail_data(detail: dict) -> dict:
         'last_name': detail['user'].last_name,
         'role': detail['role'],
         'department_name': detail['department_name'],
+        'profession': detail['profession'],
         'profile_picture_url': detail['profile_picture_url'],
         'is_active': detail['is_active'],
         'email_notifications_enabled': detail['email_notifications_enabled'],
@@ -223,3 +228,17 @@ async def update_timezone(request, data: TimezonePreferenceIn):
             errors={'timezone': ['Must be a valid IANA timezone name']},
         )
     return payload('Timezone updated successfully.', 200, True, {'timezone': user.timezone})
+
+
+@router.patch(
+    '/me/theme/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse},
+)
+async def update_theme(request, data: ThemePreferenceIn):
+    user, error = await services.update_user_theme(request.auth, data.theme)
+    if error == 'invalid_theme':
+        return payload(
+            'Unrecognized theme.', 400, False,
+            errors={'theme': ['Must be one of: light, dark, system']},
+        )
+    return payload('Theme updated successfully.', 200, True, {'theme': user.theme})

@@ -359,6 +359,7 @@ class MemberDetailTests(TwoCompanyTestCase):
         self.assertEqual(data['role'], CompanyUserProfile.Role.DEPARTMENT_MEMBER)
         self.assertEqual(data['department_name'], self.department_a.name)
         self.assertIn('workload', data)
+        self.assertIn('profession', data)
 
     def test_owner_detail_has_no_department_and_owner_role(self):
         response = self.get_detail(self.owner_a)
@@ -366,6 +367,7 @@ class MemberDetailTests(TwoCompanyTestCase):
         data = response.json()['data']['member']
         self.assertEqual(data['role'], CompanyUserProfile.Role.Owner)
         self.assertIsNone(data['department_name'])
+        self.assertIsNone(data['profession'])
 
     def test_outsider_cannot_view_member_detail(self):
         outsider = User.objects.create_user(email='outsider@example.com', username='outsider', password='Kx9#mQ2vLp8Z')
@@ -378,4 +380,33 @@ class MemberDetailTests(TwoCompanyTestCase):
 
     def test_requires_authentication(self):
         response = self.client.get(f'/api/v1/company/members/{self.member_a.id}/')
+        self.assertEqual(response.status_code, 401)
+
+
+class ThemePreferenceTests(TwoCompanyTestCase):
+    def update_theme(self, user, theme):
+        return self.client.patch(
+            '/api/v1/company/members/me/theme/', json.dumps({'theme': theme}),
+            content_type='application/json', **auth_header(user),
+        )
+
+    def test_owner_can_update_theme(self):
+        response = self.update_theme(self.owner_a, 'dark')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['theme'], 'dark')
+        self.owner_a.refresh_from_db()
+        self.assertEqual(self.owner_a.theme, 'dark')
+
+    def test_invalid_theme_is_rejected(self):
+        # 'theme' is a Literal['light', 'dark', 'system'] at the schema layer
+        # (same pattern as MemberRoleIn.role) -- Ninja's own schema
+        # validation rejects an out-of-set value before update_user_theme's
+        # own defensive check would ever run.
+        response = self.update_theme(self.owner_a, 'purple')
+        self.assertEqual(response.status_code, 422)
+
+    def test_requires_authentication(self):
+        response = self.client.patch(
+            '/api/v1/company/members/me/theme/', json.dumps({'theme': 'dark'}), content_type='application/json',
+        )
         self.assertEqual(response.status_code, 401)

@@ -29,7 +29,7 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from subscriptions.models import Subscription
 from users.models import CompanyUserProfile, PendingInvite
-from users.tasks import send_invite_email_task
+from users.tasks import send_invite_email_task, send_welcome_email_task
 from utils.api_response import api_response
 from utils.rate_limit import rate_limit
 from utils.tokens import generate_token, hash_token
@@ -121,7 +121,7 @@ def user_data(user):
     return {
         'id': user.id, 'email': user.email, 'username': user.username,
         'first_name': user.first_name, 'last_name': user.last_name,
-        'timezone': user.timezone,
+        'timezone': user.timezone, 'theme': user.theme,
     }
 
 
@@ -183,6 +183,7 @@ async def signup(request, data: SignUpIn):
     )
     user.first_name, user.last_name = data.first_name, data.last_name
     await user.asave(update_fields=['first_name', 'last_name'])
+    await sync_to_async(send_welcome_email_task.delay, thread_sensitive=True)(str(user.id))
     return payload('User account created successfully', 201, True, {'user': user_data(user)})
 
 
@@ -230,21 +231,46 @@ async def refresh_token(request):
     return payload('Token refreshed successfully', 200, True, {'access': str(refresh.access_token)})
 
 
+def register_company_in_transaction(owner, name: str, sector: Sector):
+    """Create the Company + owner's CompanyUserProfile as one atomic unit
+    (Rule 12) so a failure partway through (e.g. the skype/birthday schema
+    drift that used to make the CompanyUserProfile insert blow up) can never
+    leave a Company row with no owner membership behind it.
+
+    Also self-heals that exact stuck state for anyone who already hit it: if
+    a Company exists for this owner but its CompanyUserProfile is missing,
+    finish creating the missing row instead of only reporting 'already has a
+    company' forever. Returns (company, error) where error is
+    'already_registered' or None.
+    """
+    with transaction.atomic():
+        company = Company.objects.select_for_update().filter(owner=owner).first()
+        if company is not None:
+            if CompanyUserProfile.objects.filter(user=owner, company=company).exists():
+                return None, 'already_registered'
+            CompanyUserProfile.objects.create(user=owner, company=company, role=CompanyUserProfile.Role.Owner)
+            return company, None
+        company = Company.objects.create(name=name, owner=owner, sector=sector)
+        # The owner is a full company member like any other -- give them a real
+        # CompanyUserProfile row (role=Owner, every other field left at its model
+        # default) instead of leaving them reachable only through Company.owner.
+        # See users/models.py, analytics/services.py, users/services.py for the
+        # fallback paths that still cover a company that predates this row.
+        CompanyUserProfile.objects.create(user=owner, company=company, role=CompanyUserProfile.Role.Owner)
+        return company, None
+
+
 @api.post('/company/register/', auth=auth, response={201: ApiResponse, 400: ApiResponse, 404: ApiResponse})
 async def register_company(request, data: CompanyRegistrationIn):
     owner = request.auth
     sector = await Sector.objects.filter(id=data.sector).afirst()
     if sector is None:
         return payload('Sector not found.', 404, False, errors={'sector': ['Invalid sector ID']})
-    if await Company.objects.filter(owner=owner).aexists():
+    company, error = await sync_to_async(register_company_in_transaction, thread_sensitive=True)(
+        owner, data.name, sector,
+    )
+    if error == 'already_registered':
         return payload('User already has a company.', 400, False, errors={'owner': ['User already has a company.']})
-    company = await Company.objects.acreate(name=data.name, owner=owner, sector=sector)
-    # The owner is a full company member like any other -- give them a real
-    # CompanyUserProfile row (role=Owner, every other field left at its model
-    # default) instead of leaving them reachable only through Company.owner.
-    # See users/models.py, analytics/services.py, users/services.py for the
-    # fallback paths that still cover a company that predates this row.
-    await CompanyUserProfile.objects.acreate(user=owner, company=company, role=CompanyUserProfile.Role.Owner)
     return payload('Company registered successfully.', 201, True, {
         'id': company.id, 'company_name': company.name, 'owner': owner.email, 'sector': sector.id,
     })
@@ -442,7 +468,7 @@ async def start_checkout(request, data: CheckoutIn):
             customer = await sync_to_async(stripe.Customer.retrieve, thread_sensitive=False)(
                 subscription.stripe_customer_id,
             )
-        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:3000').rstrip('/')
+        frontend_url = settings.FRONTEND_URL
         session = await sync_to_async(stripe.checkout.Session.create, thread_sensitive=False)(
             customer=customer.id, payment_method_types=['card'],
             line_items=[{'price': plan.stripe_price_id, 'quantity': 1}], mode='subscription',
