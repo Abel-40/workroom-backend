@@ -37,6 +37,7 @@ from notifications_and_activity.services import (
 )
 from users.models import CompanyUserProfile
 
+from .access import AccessLevel, resolve_project_access
 from .models import (
     Attachment, DefaultTaskType, Project, ProjectVisibilityRequest, Task, TaskApproval, TaskTimeLog, TaskType,
 )
@@ -64,51 +65,17 @@ ALLOWED_DOCUMENT_CONTENT_TYPES = {
 # --------------------------------------------------------------------------
 
 async def user_can_view_project(user, project) -> bool:
-    # Public is checked before company membership on purpose: a public
-    # project is deliberately outside the tenant boundary and readable by any
-    # authenticated user. Who may *set* that visibility is a separate question
-    # (Owner/CM behind a company flag) handled at the transition.
-    if project.visibility == Project.VISIBILITY.PUBLIC:
-        return True
-    role = await get_company_role(user, project.company)
-    if role is None:
-        return False
-    if project.created_by_id == user.id:
-        return True
-    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
-        return True
-    if project.visibility == Project.VISIBILITY.COMPANY:
-        return True
-    if project.visibility == Project.VISIBILITY.DEPARTMENT:
-        if not project.department_id:
-            return False
-        profile = await CompanyUserProfile.objects.filter(user=user, company=project.company).afirst()
-        return bool(profile and profile.department_id == project.department_id)
-    if project.visibility == Project.VISIBILITY.PRIVATE:
-        return await project.collaborators.filter(id=user.id).aexists()
-    return False
+    """Any access at all. See :func:`projects_and_tasks.access
+    .resolve_project_access` for what grants it."""
+    return await resolve_project_access(user, project) is not None
 
 
 async def user_can_manage_project(user, project) -> bool:
-    """Edit/archive rights: creator, current owner, company owner, or the
-    leader of the project's own department -- and in every case an active
-    member of the project's own company.
-
-    Membership is resolved first, before any per-project reference is
-    consulted. A stale ``created_by``/``current_owner`` pointing at somebody
-    who has left the company, or who was never in it, must grant nothing.
-    """
-    role = await get_company_role(user, project.company)
-    if role is None:
-        return False
-    if project.created_by_id == user.id or project.current_owner_id == user.id:
-        return True
-    if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
-        return True
-    if role == CompanyUserProfile.Role.DEPARTMENT_LEADER and project.department_id:
-        profile = await CompanyUserProfile.objects.filter(user=user, company=project.company).afirst()
-        return bool(profile and profile.department_id == project.department_id)
-    return False
+    """Edit/archive/assign rights. Kept as a named predicate because thirty
+    call sites read better asking this question than comparing an enum, but
+    the answer comes from one place."""
+    access = await resolve_project_access(user, project)
+    return access is not None and access >= AccessLevel.MANAGE
 
 
 async def user_can_manage_task(user, task) -> bool:

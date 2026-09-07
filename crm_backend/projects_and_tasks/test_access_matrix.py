@@ -37,11 +37,12 @@ from api.tests import auth_header
 from asgiref.sync import async_to_sync
 from company.models import Company, Sector
 from departments_and_teams.models import Department
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 from users.models import CompanyUserProfile, User
 
 from projects_and_tasks import services
+from projects_and_tasks.access import AccessLevel, resolve_project_access
 from projects_and_tasks.models import Project, Task
 
 BASELINE_PATH = Path(__file__).with_name('access_matrix_baseline.txt')
@@ -225,6 +226,60 @@ class AccessMatrixCharacterizationTests(AccessWorldMixin, TestCase):
             f'{len(changed)} row(s) differ, {len(generated_rows) - len(expected_rows):+d} row(s) '
             'added:\n' + '\n'.join(changed[:40])
         )
+
+
+class BaselineInvariantTests(SimpleTestCase):
+    """Properties that must hold across the whole recorded matrix, asserted
+    against the committed baseline rather than by re-deriving it.
+
+    These need no database: the baseline is the recorded truth, and stating
+    the invariants separately means a regression fails with "MANAGE no longer
+    implies VIEW" rather than with a 900-line diff a reviewer has to decode.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.rows = []
+        for line in BASELINE_PATH.read_text(encoding='utf-8').splitlines():
+            if line.startswith('#') or line.startswith('-') or '|' not in line or 'actor' in line:
+                continue
+            actor, visibility, department, flags, answers = (part.strip() for part in line.split('|'))
+            values = dict(zip([name for name, _ in COLUMNS], [v == '1' for v in answers.split()]))
+            cls.rows.append((actor, visibility, department, flags, values))
+
+    def test_the_baseline_covers_the_whole_cross_product(self):
+        self.assertEqual(len(self.rows), 5 * 4 * 3 * 16)
+
+    def test_manage_always_implies_view(self):
+        """The property an ordered AccessLevel exists to guarantee, and the
+        reason the resolver had to be extracted rather than left as scattered
+        predicates: 30 combinations previously granted management of a project
+        the same user could not open."""
+        for actor, visibility, department, flags, values in self.rows:
+            if values['manage_proj']:
+                self.assertTrue(
+                    values['view'],
+                    f'{actor} / {visibility} / dept={department} / {flags} can manage but not view',
+                )
+
+    def test_a_non_member_is_granted_nothing_beyond_reading_a_public_project(self):
+        """Tenant isolation stated as a property over every row rather than as
+        one example. ``public`` is the single deliberate exception."""
+        for actor, visibility, department, flags, values in self.rows:
+            if actor != 'outsider':
+                continue
+            where = f'{actor} / {visibility} / dept={department} / {flags}'
+            self.assertEqual(values['view'], visibility == 'public', f'{where}: unexpected view')
+            for capability in ('manage_proj', 'manage_task', 'own_task', 'approve', 'deadline'):
+                self.assertFalse(values[capability], f'{where}: unexpected {capability}')
+
+    def test_the_company_owner_can_always_manage(self):
+        """No combination of visibility, department or relationship takes a
+        project away from the person who owns the company."""
+        for actor, visibility, department, flags, values in self.rows:
+            if actor == 'Owner':
+                self.assertTrue(values['manage_proj'], f'Owner blocked on {visibility}/{department}/{flags}')
 
 
 class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
@@ -413,6 +468,44 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
         self.project.visibility = Project.VISIBILITY.PUBLIC
         self.assertTrue(async_to_sync(services.user_can_view_project)(self.stranger, self.project))
         self.assertFalse(async_to_sync(services.user_can_manage_project)(self.stranger, self.project))
+
+    def test_a_department_leader_can_now_open_the_private_project_they_manage(self):
+        """FIXED (was D11): a DL of the project's own department could edit,
+        archive and transfer a private project that GET returned 403 for, and a
+        DM who was current_owner was in the same position. Thirty combinations
+        in all. The ordered AccessLevel cannot express "manage but not view",
+        and granting read to someone who can already rewrite the thing is
+        strictly the smaller of the two ways to resolve it."""
+        self.project.visibility = Project.VISIBILITY.PRIVATE
+        self.project.save(update_fields=['visibility'])
+
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dl, self.project), AccessLevel.MANAGE)
+        self.assertTrue(async_to_sync(services.user_can_view_project)(self.dl, self.project))
+
+        self.project.current_owner = self.dm
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.MANAGE)
+        self.assertTrue(async_to_sync(services.user_can_view_project)(self.dm, self.project))
+
+    def test_the_resolver_returns_the_maximum_of_every_grant(self):
+        """Effective access is a max, not a first-match: adding a source can
+        widen access for the people it names but never narrow it for anyone
+        else. A DM who is merely a collaborator on a private project gets VIEW;
+        the same DM as current_owner gets MANAGE and keeps it."""
+        self.project.visibility = Project.VISIBILITY.PRIVATE
+        self.project.save(update_fields=['visibility'])
+        self.assertIsNone(async_to_sync(resolve_project_access)(self.dm, self.project))
+
+        self.project.collaborators.add(self.dm)
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.VIEW)
+
+        self.project.current_owner = self.dm
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.MANAGE)
+
+    def test_the_resolver_returns_none_for_someone_with_no_relationship(self):
+        self.project.visibility = Project.VISIBILITY.PRIVATE
+        self.project.save(update_fields=['visibility'])
+        self.assertIsNone(async_to_sync(resolve_project_access)(self.dm, self.project))
+        self.assertIsNone(async_to_sync(resolve_project_access)(self.stranger, self.project))
 
     def test_the_project_list_and_the_detail_check_disagree(self):
         """KNOWN DEFECT (decision sec.10): list_projects_for_user grants a
