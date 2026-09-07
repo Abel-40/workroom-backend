@@ -64,13 +64,17 @@ ALLOWED_DOCUMENT_CONTENT_TYPES = {
 # --------------------------------------------------------------------------
 
 async def user_can_view_project(user, project) -> bool:
+    # Public is checked before company membership on purpose: a public
+    # project is deliberately outside the tenant boundary and readable by any
+    # authenticated user. Who may *set* that visibility is a separate question
+    # (Owner/CM behind a company flag) handled at the transition.
     if project.visibility == Project.VISIBILITY.PUBLIC:
-        return True
-    if project.created_by_id == user.id:
         return True
     role = await get_company_role(user, project.company)
     if role is None:
         return False
+    if project.created_by_id == user.id:
+        return True
     if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
         return True
     if project.visibility == Project.VISIBILITY.COMPANY:
@@ -87,10 +91,18 @@ async def user_can_view_project(user, project) -> bool:
 
 async def user_can_manage_project(user, project) -> bool:
     """Edit/archive rights: creator, current owner, company owner, or the
-    leader of the project's own department."""
+    leader of the project's own department -- and in every case an active
+    member of the project's own company.
+
+    Membership is resolved first, before any per-project reference is
+    consulted. A stale ``created_by``/``current_owner`` pointing at somebody
+    who has left the company, or who was never in it, must grant nothing.
+    """
+    role = await get_company_role(user, project.company)
+    if role is None:
+        return False
     if project.created_by_id == user.id or project.current_owner_id == user.id:
         return True
-    role = await get_company_role(user, project.company)
     if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
         return True
     if role == CompanyUserProfile.Role.DEPARTMENT_LEADER and project.department_id:
@@ -100,17 +112,22 @@ async def user_can_manage_project(user, project) -> bool:
 
 
 async def user_can_manage_task(user, task) -> bool:
-    if task.created_by_id == user.id:
+    """The task's creator, or whoever can manage its parent project -- and in
+    either case an active member of the company. See user_can_manage_project
+    for why membership is checked before the per-task reference."""
+    if task.created_by_id == user.id and await is_company_member(user, task.project.company):
         return True
     return await user_can_manage_project(user, task.project)
 
 
 async def user_can_update_task_status(user, task) -> bool:
-    """Assignee-only: Done/In Review are no longer reachable through this
-    direct status transition at all (see update_task_status) -- they're
-    only reachable via the approval workflow below (submit_task_for_approval
-    / approve_task / reject_task_approval)."""
-    return task.assigned_to_id == user.id
+    """Assignee-only, and an active member: Done/In Review are no longer
+    reachable through this direct status transition at all (see
+    update_task_status) -- they're only reachable via the approval workflow
+    below (submit_task_for_approval / approve_task / reject_task_approval)."""
+    if task.assigned_to_id != user.id:
+        return False
+    return await is_company_member(user, task.project.company)
 
 
 async def user_can_log_time(user, task) -> bool:
@@ -118,22 +135,37 @@ async def user_can_log_time(user, task) -> bool:
     transitions above (assignee-only, no manager fallback -- see
     user_can_update_task_status) -- a task's creator/project-manager may also
     log time on it, same as editing the task itself (user_can_manage_task)."""
-    if task.assigned_to_id == user.id:
+    if task.assigned_to_id == user.id and await is_company_member(user, task.project.company):
         return True
     return await user_can_manage_task(user, task)
 
 
-async def user_can_delete_time_log(user, log) -> bool:
-    if log.user_id == user.id:
+async def user_can_delete_time_log(user, log, task) -> bool:
+    """The log's author, or whoever can manage the task.
+
+    ``task`` is passed in rather than reached through ``log.task`` on purpose:
+    every caller already holds it with ``project__company`` selected, and
+    traversing the foreign key here would be a lazy load inside an async
+    context -- a runtime error, not a slow query.
+    """
+    if log.user_id == user.id and await is_company_member(user, task.project.company):
         return True
-    return await user_can_manage_task(user, log.task)
+    return await user_can_manage_task(user, task)
 
 
 async def user_can_approve_task(user, task) -> bool:
     """Who may approve/reject a task's submitted evidence: the task's
     creator, or -- if that creator has since left the company (created_by
     is NULL after SET_NULL) -- the project's current owner, then the
-    project's own creator."""
+    project's own creator.
+
+    The fallback chain is unchanged. What is added is that whoever it lands on
+    must still be an active member of the company: approving work is a
+    company action, and a reference left behind by someone who has gone must
+    not authorize it.
+    """
+    if not await is_company_member(user, task.project.company):
+        return False
     if task.created_by_id is not None:
         return task.created_by_id == user.id
     project = task.project
@@ -146,8 +178,14 @@ async def user_can_extend_deadline(user, project) -> bool:
     """Deadline extension is narrower than user_can_manage_project: only the
     project's creator qualifies -- current owner, company owner/manager, and
     department leader do not. Used for both a project's own deadline and any
-    of its tasks' deadlines (see extend_task_deadline/extend_project_deadline)."""
-    return project.created_by_id == user.id
+    of its tasks' deadlines (see extend_task_deadline/extend_project_deadline).
+
+    Membership is required as well, so a creator who has left the company
+    cannot still move dates in it.
+    """
+    if project.created_by_id != user.id:
+        return False
+    return await is_company_member(user, project.company)
 
 
 # --------------------------------------------------------------------------
@@ -782,7 +820,7 @@ async def delete_time_log(user, task, log_id):
     log = await TaskTimeLog.objects.filter(id=log_id, task=task, is_deleted=False).afirst()
     if log is None:
         return False, 'not_found'
-    if not await user_can_delete_time_log(user, log):
+    if not await user_can_delete_time_log(user, log, task):
         return False, 'forbidden'
     log.is_deleted = True
     await log.asave(update_fields=['is_deleted'])
@@ -831,7 +869,10 @@ async def submit_task_for_approval(user, task, *, files=None, links=None, page_i
     'forbidden', 'invalid_status' (task isn't In Progress), 'already_pending'
     (an unresolved approval already exists), 'deadline_passed', 'no_evidence',
     'invalid_content_type', 'too_large', 'invalid_page', or None."""
-    if task.assigned_to_id != user.id:
+    # Assignee-only, and an active member of the company -- same rule as
+    # user_can_update_task_status, for the same reason: a task reference left
+    # pointing at somebody who is no longer here authorizes nothing.
+    if not await user_can_update_task_status(user, task):
         return None, 'forbidden'
     if task.status != Task.STATUS.IN_PROGRESS:
         return None, 'invalid_status'

@@ -82,7 +82,7 @@ characterization matrix.
 | `user_can_manage_task` | 101 | `task.created_by`, else whoever can manage the project |
 | `user_can_update_task_status` | 107 | the assignee only |
 | `user_can_log_time` | 115 | the assignee, else whoever can manage the task |
-| `user_can_delete_time_log` | 125 | the log's author, else whoever can manage the task |
+| `user_can_delete_time_log` | 125 | the log's author, else whoever can manage the task. Takes `task` explicitly rather than reaching it through `log.task`: every caller already holds it with `project__company` selected, and traversing the FK inside an async context is a runtime error, not a slow query |
 | `user_can_approve_task` | 131 | `task.created_by`; if null, `project.current_owner`; if null, `project.created_by` |
 | `user_can_extend_deadline` | 144 | `project.created_by` **only** |
 
@@ -216,4 +216,5 @@ it. None are fixed by the extraction itself.
 | D7 | `public` visibility short-circuits the company check, so any authenticated user of any tenant can read the project by id — and any manager, including a DM managing their own project, can set it | §1: Owner/CM only, behind `allow_public_projects`, audited |
 | D8 | Anyone who can view a project can read — and a project manager can delete — another user's AI Assistant conversation | §5: private by default, explicit sharing, delete-others endpoint removed |
 | D9 | `list_projects_for_user` and `user_can_view_project` disagree: a creator sees a project by id that never appears in their list | §10: one resolver, one queryset derived from it |
-| D10 | Neither `user_can_manage_task` (on `created_by`) nor `user_can_manage_project` (on `current_owner`) performs any company check before granting rights. Nothing today sets a cross-tenant reference, so this is a missing backstop rather than a live breach | §10: the resolver establishes membership before any per-project grant |
+| D10 | ~~Neither `user_can_manage_task` (on `created_by`) nor `user_can_manage_project` (on `current_owner`) performs any company check before granting rights~~ | **FIXED in WP3a.** Every predicate resolves membership before consulting any per-project reference. The case that made it more than theoretical: removal from a company leaves `created_by` intact as provenance, so a removed member kept view over projects they had created. `public` is still checked before membership, deliberately. |
+| D11 | 30 combinations grant MANAGE without VIEW — a DL or DM can edit, archive and transfer a private project that `GET` returns 403 for | §10: an ordered `AccessLevel` cannot represent this; absorbed by `resolve_project_access` in WP3 |

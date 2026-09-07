@@ -158,6 +158,87 @@ exclusion.
 
 ---
 
+## WP3a — A per-project reference grants nothing to a non-member
+
+**Why this came first.** WP3's job is to extract `resolve_project_access` as an
+ordered `VIEW < CONTRIBUTE < MANAGE` level. Before extracting, the baseline was
+checked for whether MANAGE already implies VIEW, because an ordered type cannot
+represent "manage but not view". It did not: **66 rows granted MANAGE without
+VIEW**.
+
+Breaking those 66 down decided the order of work:
+
+- **36 were the outsider** — a member of another company holding `created_by`
+  or `current_owner`. Those must *lose* MANAGE, not gain VIEW. Rolling them
+  into an ordered enum would have widened a cross-tenant hole rather than
+  closing it.
+- **30 were a DL or DM** who could genuinely edit, archive and transfer a
+  private project that `GET` returned 403 for.
+
+So the cross-tenant half is fixed here, on its own, with its own baseline diff.
+The remaining coherence half is WP3's to absorb.
+
+**What changed.** Every project/task predicate now resolves company membership
+*before* consulting `created_by`, `current_owner`, `assigned_to` or
+`task.created_by`:
+
+`user_can_view_project`, `user_can_manage_project`, `user_can_manage_task`,
+`user_can_approve_task`, `user_can_extend_deadline`,
+`user_can_update_task_status`, `user_can_log_time`, `user_can_delete_time_log`,
+and the assignee guard inlined in `submit_task_for_approval` (now delegating to
+`user_can_update_task_status` rather than repeating the comparison).
+
+`public` is deliberately still checked *before* membership: that visibility
+exists to put a project outside the tenant boundary. Restricting who may set it
+is a separate decision, enforced at the transition.
+
+**Was this a live breach?** No, and the commit says so rather than overclaiming.
+Assignees, collaborators and new project owners are all validated against the
+company today, so no API path sets a cross-tenant reference. It was a missing
+backstop.
+
+It was not purely theoretical, though, and this is the part worth attention: a
+reference can outlive the membership behind it. `created_by` is `SET_NULL` when
+a *user* is deleted, but is deliberately left untouched when someone is merely
+**removed from the company** — it is immutable provenance. Before this change,
+a removed member kept `view` over every project they had created, and `manage`
+over every task. Two tests pin exactly that, one for removal and one for
+deactivation.
+
+**Baseline diff: 192 rows, every one of them an outsider row.** No Owner, CM,
+DL or DM row moved. Outsider rows are now all-zero except `view=1` on public
+projects. That the diff is entirely confined to the actor the change was aimed
+at is the evidence the change is scoped.
+
+**Files touched.**
+
+- `crm_backend/projects_and_tasks/services.py` — the eight predicates and the
+  submission guard
+- `crm_backend/projects_and_tasks/access_matrix_baseline.txt` — regenerated
+- `crm_backend/projects_and_tasks/test_access_matrix.py` — D10's pinned test
+  rewritten from defect to fix, plus three new tests (removed member,
+  deactivated member, public still cross-tenant readable)
+
+**Cost.** Predicates that previously short-circuited on an in-memory attribute
+now issue one membership query first. WP3's resolver consolidates that into a
+single lookup per request.
+
+**One regression, caught by the full suite and fixed.** Adding the membership
+check to `user_can_delete_time_log` made it traverse `log.task.project.company`
+— a lazy foreign-key load inside an async context, which Django raises
+`SynchronousOnlyOperation` for rather than merely running slowly. The fix is
+not to prefetch at that call site but to change the signature to take `task`
+explicitly: every caller already holds it with `project__company` selected, so
+the traversal should never have been there. Same hazard checked across the
+other predicates that newly touch `.company` (`user_can_approve_task`,
+`user_can_extend_deadline`) — all their callers load through
+`get_task_for_user` or `get_project_for_user`, both of which select the company.
+
+This is the argument for the resolver in one paragraph: eight predicates each
+deciding independently what they need loaded is how that class of bug gets in.
+
+---
+
 ## Test gate in use
 
 The full suite takes **41 minutes** on this machine, which is not a workable

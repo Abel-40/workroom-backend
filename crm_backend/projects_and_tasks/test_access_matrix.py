@@ -362,20 +362,57 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
             )
             self.assertEqual(error, 'department_locked', f'{actor.email} was allowed to move the project')
 
-    def test_task_management_short_circuits_before_any_company_check(self):
-        """KNOWN DEFECT (decision sec.10): user_can_manage_task returns True on
-        ``task.created_by`` alone, and user_can_manage_project returns True on
-        ``current_owner`` alone -- neither predicate asks which company the
-        actor belongs to. A user from another tenant holding either reference
-        is granted management rights. Nothing today is supposed to *set* such a
-        reference, so this is a missing backstop rather than a live breach, but
-        the resolver must not inherit it: resolve_project_access establishes
-        company membership before considering any per-project grant."""
+    def test_a_per_project_reference_grants_nothing_to_a_non_member(self):
+        """FIXED (was D10): every predicate resolves company membership before
+        consulting ``created_by``, ``current_owner`` or ``assigned_to``.
+
+        Nothing in the API sets a cross-tenant reference today -- assignees,
+        collaborators and new owners are all validated against the company --
+        so this was a missing backstop rather than a live breach. It stops
+        being theoretical once a reference can outlive the membership behind
+        it, which is exactly what ``created_by`` already does: SET_NULL on user
+        deletion, but left untouched when someone is merely removed from the
+        company. See the two tests below."""
         outsider_task = Task(project=self.project, created_by_id=self.stranger.id)
-        self.assertTrue(async_to_sync(services.user_can_manage_task)(self.stranger, outsider_task))
+        self.assertFalse(async_to_sync(services.user_can_manage_task)(self.stranger, outsider_task))
 
         self.project.current_owner = self.stranger
-        self.assertTrue(async_to_sync(services.user_can_manage_project)(self.stranger, self.project))
+        self.project.created_by = self.stranger
+        self.assertFalse(async_to_sync(services.user_can_manage_project)(self.stranger, self.project))
+        self.assertFalse(async_to_sync(services.user_can_view_project)(self.stranger, self.project))
+        self.assertFalse(async_to_sync(services.user_can_extend_deadline)(self.stranger, self.project))
+
+    def test_a_removed_member_loses_access_to_the_projects_they_created(self):
+        """The practical case the membership check exists for: removal deletes
+        the CompanyUserProfile but deliberately leaves ``created_by`` intact as
+        immutable provenance -- so provenance must not double as a grant."""
+        self.project.created_by = self.dm
+        self.project.visibility = Project.VISIBILITY.PRIVATE
+        self.project.save(update_fields=['created_by', 'visibility'])
+        self.assertTrue(async_to_sync(services.user_can_view_project)(self.dm, self.project))
+
+        CompanyUserProfile.objects.filter(user=self.dm, company=self.company).delete()
+        self.assertFalse(async_to_sync(services.user_can_view_project)(self.dm, self.project))
+        self.assertFalse(async_to_sync(services.user_can_manage_project)(self.dm, self.project))
+
+    def test_a_deactivated_member_loses_access_the_same_way(self):
+        """Deactivation revokes company access without touching Django auth
+        (PRESERVE). The JWT still authenticates; every company-scoped answer
+        goes to no."""
+        self.project.created_by = self.dm
+        self.project.save(update_fields=['created_by'])
+        CompanyUserProfile.objects.filter(user=self.dm, company=self.company).update(is_active=False)
+        self.assertFalse(async_to_sync(services.user_can_view_project)(self.dm, self.project))
+        self.assertFalse(async_to_sync(services.user_can_manage_project)(self.dm, self.project))
+
+    def test_a_public_project_is_still_readable_across_tenants(self):
+        """Unchanged on purpose. ``public`` is meant to place a project outside
+        the tenant boundary, so it is checked before membership. Restricting
+        who may *set* it is a separate decision (sec.1), handled at the
+        transition rather than here."""
+        self.project.visibility = Project.VISIBILITY.PUBLIC
+        self.assertTrue(async_to_sync(services.user_can_view_project)(self.stranger, self.project))
+        self.assertFalse(async_to_sync(services.user_can_manage_project)(self.stranger, self.project))
 
     def test_the_project_list_and_the_detail_check_disagree(self):
         """KNOWN DEFECT (decision sec.10): list_projects_for_user grants a
