@@ -9,6 +9,7 @@ import re
 from datetime import timedelta
 
 from asgiref.sync import sync_to_async
+from audit.services import AuditAction, arecord_event
 from company.services import get_company_role, get_member_company, get_member_department_id, is_company_member
 from departments_and_teams.models import Department, Team
 from django.contrib.auth import get_user_model
@@ -479,6 +480,10 @@ async def transfer_project_ownership(user, project, new_owner_id):
     previous_owner = project.current_owner
     project.current_owner = new_owner
     await project.asave(update_fields=['current_owner'])
+    await arecord_event(
+        company=project.company, actor=user, action=AuditAction.PROJECT_OWNERSHIP_TRANSFERRED, target=project,
+        before={'current_owner': previous_owner}, after={'current_owner': new_owner},
+    )
     await sync_to_async(log_ownership_transferred, thread_sensitive=True)(project, user, previous_owner, new_owner)
     await sync_to_async(notify_project_ownership_transferred, thread_sensitive=True)(project, new_owner, user)
     return project, None
@@ -905,6 +910,10 @@ async def approve_task(user, task):
     task.status = Task.STATUS.DONE
     await task.asave(update_fields=['status', 'updated_at'])
 
+    await arecord_event(
+        company=task.project.company, actor=user, action=AuditAction.TASK_APPROVED, target=task,
+        before={'status': Task.STATUS.IN_REVIEW}, after={'status': Task.STATUS.DONE, 'approval': approval.pk},
+    )
     await sync_to_async(notify_task_approved, thread_sensitive=True)(approval)
     await sync_to_async(_maybe_auto_complete_project, thread_sensitive=True)(task.project)
     return task, None
@@ -936,6 +945,15 @@ async def reject_task_approval(user, task, comment: str):
     task.status = Task.STATUS.IN_PROGRESS
     await task.asave(update_fields=['status', 'updated_at'])
 
+    # The rejection comment is deliberately absent: it is visible only to the
+    # submitter (see TaskApproval.rejection_comment), and copying it into a
+    # company-scoped audit row would route around that on the day the audit
+    # trail grows a UI. The row records that a rejection happened, not what
+    # was said.
+    await arecord_event(
+        company=task.project.company, actor=user, action=AuditAction.TASK_APPROVAL_REJECTED, target=task,
+        before={'status': Task.STATUS.IN_REVIEW}, after={'status': Task.STATUS.IN_PROGRESS, 'approval': approval.pk},
+    )
     await sync_to_async(notify_task_rejected, thread_sensitive=True)(approval)
     return task, None
 

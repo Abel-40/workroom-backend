@@ -14,7 +14,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP | Covers | Status |
 |---|---|---|
 | WP1 | Characterization suite + permission inventory (§10, prerequisite) | **done** |
-| WP2 | `AuditEvent` + `record_event()` (§10) | |
+| WP2 | `AuditEvent` + `record_event()` (§10) | **done** |
 | WP3 | `resolve_project_access`, `ProjectMembership`, collaborator migration (§10) | |
 | WP4 | Company context returns a membership; Owner backfill (§10) | |
 | WP5 | Deadlines: `<=`, AI buffer removal, MANAGE + reason + audit; late submission (§2) | |
@@ -85,6 +85,98 @@ inline role check", implying scattered checks. It is already consolidated:
 `usePermissions()` wraps `lib/permissions.ts`, `lib/projectPermissions.ts` and
 `lib/eventPermissions.ts`, and components consume the composable. WP20 is an
 extension of that structure to three access levels, not a cleanup of scatter.
+
+---
+
+## WP2 — Append-only audit log
+
+**What changed.** A new `audit` app holding `AuditEvent` and the single writer
+`record_event()`, wired into the four consequential mutations that already
+exist. The rest (deadline changes, visibility changes) arrive with the work
+packages that introduce them.
+
+Workroom now has three records of "something happened", and the module
+docstring states the distinction so nobody adds a fourth by accident:
+`CompanyActivity` is a curated, skimmable company feed; `Notification` is
+per-recipient and permission-aware; `AuditEvent` is complete, append-only, and
+answers "who changed this, when, from what, to what, and why".
+
+Wired now: member role change, deactivation, reactivation, removal, project
+ownership transfer, task approval, task approval rejection.
+
+**Files touched.**
+
+- `crm_backend/audit/{__init__,apps,models,services,admin,tests}.py` (new)
+- `crm_backend/audit/migrations/0001_initial.py` (new)
+- `crm_backend/crm_backend/settings/base.py` — registered the app
+- `crm_backend/users/services.py` — role change, active status, removal
+- `crm_backend/projects_and_tasks/services.py` — ownership transfer, approve, reject
+
+**Judgment calls.**
+
+1. **`record_event` lets failures propagate rather than swallowing them.** The
+   obvious design is catch-log-return-None so a broken audit write never fails
+   a business operation. It does not work: callers record inside the
+   transaction that made the change, and once a statement errors there,
+   Postgres refuses every subsequent statement in that transaction anyway. The
+   real choice is "fail loudly or fail confusingly".
+2. **`action` is a `TextChoices` catalog, not free text.** The prompt shows
+   `action = CharField()`. An audit trail whose action names drift cannot be
+   queried, and querying is the only reason it exists.
+3. **Append-only is enforced at three layers, not in the database.** The
+   instance (`save`/`delete`), the manager (`update`/`delete`), and the admin
+   (all three permissions refused). No trigger: the brief asks for append-only
+   "in code or in Django admin", and a trigger would also block a future
+   retention/purge job — a decision to take when retention is designed, not one
+   to foreclose here.
+4. **A cascade from `Company` still removes rows, deliberately.** Django's
+   deletion collector issues its own SQL and bypasses the manager. A tenant's
+   trail should not outlive the tenant and a deletion request has to be
+   satisfiable. Documented on the model and covered by a test so it is a choice
+   rather than a hole someone finds later.
+5. **The rejection comment is deliberately excluded from the audit row.**
+   Rejection comments are visible only to the submitter, and PRESERVE EXACTLY
+   requires that. Copying one into a company-scoped audit row would route
+   around it the day the audit trail grows a UI. The row records that a
+   rejection happened, not what was said. Covered by a test.
+6. **`before`/`after` hold only the changed fields, and model instances are
+   reduced to their primary key.** An audit table that copies whole records
+   becomes a second, unmanaged store of data that was deleted elsewhere for a
+   reason.
+7. **Member removal is recorded against the `User`, not the
+   `CompanyUserProfile`.** The profile row is about to stop existing, and "what
+   happened to this person" has to stay answerable afterwards.
+
+**Deferred.** Deadline-change and visibility-change events, which land with
+WP5 and WP6. No audit read API, UI, export or retention policy — all out of
+scope by the brief.
+
+**Tests.** 25 in `audit/tests.py`: one per wired action, no-op changes writing
+no row, append-only refused at every layer with the row verified unchanged
+afterwards, the company cascade, JSON coercion, and the rejection-comment
+exclusion.
+
+---
+
+## Test gate in use
+
+The full suite takes **41 minutes** on this machine, which is not a workable
+per-commit gate. Per commit: the affected app's tests, plus
+`makemigrations --check --dry-run`, plus `ruff` on the touched files. The full
+suite runs at work-package boundaries and before any PR.
+
+**Pre-existing baseline, recorded before any change on this branch:
+511 passed, 1 failed.** The failure is
+`api/tests.py::AIHealthSummarySecurityTests::test_rate_limit_boundary`, which
+its own docstring says needs a real Redis at `CELERY_BROKER_URL`; Docker is not
+running on this machine. It is an environment failure, not a code failure, and
+not something this work introduced or should fix.
+
+`ruff` also has **5 pre-existing errors** in
+`projects_and_tasks/services.py` (2 × `I001`, 2 × `E501`) and
+`users/services.py` (1 × `E501`). Left alone: fixing them would put unrelated
+import-reordering noise into commits whose diffs are meant to be read closely.
+Worth a separate `chore(lint)` commit at some point.
 
 ---
 

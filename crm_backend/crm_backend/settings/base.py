@@ -85,6 +85,7 @@ INSTALLED_APPS = [
     'connected_apps',
     'pages',
     'todos',
+    'audit',
 ]
 
 MIDDLEWARE = [

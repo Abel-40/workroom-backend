@@ -8,6 +8,7 @@ from zoneinfo import available_timezones
 
 from analytics.services import get_member_workload
 from asgiref.sync import sync_to_async
+from audit.services import AuditAction, record_event
 from company.services import (
     get_company_role_sync,
     get_managed_company_sync,
@@ -140,6 +141,10 @@ def update_member_role(requester, target_user_id, new_role: str):
             Department.objects.filter(company=company, leader_id=target_user_id).update(leader=None)
             Team.objects.filter(company=company, leader_id=target_user_id).update(leader=None)
 
+        record_event(
+            company=company, actor=requester, action=AuditAction.MEMBER_ROLE_CHANGED, target=profile,
+            before={'role': old_role}, after={'role': new_role},
+        )
         return profile, None
 
 
@@ -307,6 +312,11 @@ def set_member_active_status(requester, target_user_id, is_active: bool):
         if profile.is_active != is_active:
             profile.is_active = is_active
             profile.save(update_fields=['is_active'])
+            record_event(
+                company=company, actor=requester, target=profile,
+                action=AuditAction.MEMBER_REACTIVATED if is_active else AuditAction.MEMBER_DEACTIVATED,
+                before={'is_active': not is_active}, after={'is_active': is_active},
+            )
         return profile, None
 
 
@@ -461,6 +471,14 @@ def remove_member(requester, target_user_id, *, reassign_to_user_id=None):
             team.members.remove(target_user_id)
 
         removed_user = profile.user
+        # Recorded against the User, not the CompanyUserProfile: the profile
+        # row is about to stop existing, and "what happened to this person"
+        # has to stay answerable afterwards.
+        record_event(
+            company=company, actor=requester, action=AuditAction.MEMBER_REMOVED, target=removed_user,
+            before={'role': profile.role, 'department': profile.department_id, 'is_active': profile.is_active},
+            after=None,
+        )
         profile.delete()
         log_member_removed(company, requester, removed_user, reassigned_count=reassigned_count)
         return {'reassigned_count': reassigned_count}, None
