@@ -39,7 +39,8 @@ from users.models import CompanyUserProfile
 
 from .access import AccessLevel, resolve_project_access
 from .models import (
-    Attachment, DefaultTaskType, Project, ProjectVisibilityRequest, Task, TaskApproval, TaskTimeLog, TaskType,
+    Attachment, DefaultTaskType, Project, ProjectMembership, ProjectVisibilityRequest, Task, TaskApproval,
+    TaskTimeLog, TaskType,
 )
 
 User = get_user_model()
@@ -225,6 +226,40 @@ async def _resolve_collaborators(company, collaborator_ids):
     return users, None
 
 
+def _set_collaborators_sync(project, collaborators, *, actor=None):
+    """Write the collaborator set to both stores, transactionally.
+
+    ``ProjectMembership(role="contributor")`` is authoritative -- it is what
+    ``resolve_project_access`` reads. ``Project.collaborators`` is the
+    deprecated M2M, dual-written for one release so a rollback does not lose
+    who was on a project. Both writes live here, in one place, so they cannot
+    drift; delete the M2M half once the backfill release has shipped.
+
+    Only ``contributor`` rows are touched. A ``viewer`` or ``manager``
+    membership was granted deliberately through the members panel and is not
+    the collaborator field's to remove.
+    """
+    keep_ids = {u.id for u in collaborators}
+    with transaction.atomic():
+        project.collaborators.set(collaborators)
+        ProjectMembership.objects.filter(
+            project=project, role=ProjectMembership.Role.CONTRIBUTOR,
+        ).exclude(user_id__in=keep_ids).delete()
+        existing = set(
+            ProjectMembership.objects.filter(project=project, user_id__in=keep_ids)
+            .values_list('user_id', flat=True)
+        )
+        ProjectMembership.objects.bulk_create([
+            ProjectMembership(
+                project=project, user=collaborator, role=ProjectMembership.Role.CONTRIBUTOR, added_by=actor,
+            )
+            for collaborator in collaborators if collaborator.id not in existing
+        ])
+
+
+_set_collaborators = sync_to_async(_set_collaborators_sync, thread_sensitive=True)
+
+
 DEPARTMENT_SCOPED_ROLES = (CompanyUserProfile.Role.DEPARTMENT_LEADER, CompanyUserProfile.Role.DEPARTMENT_MEMBER)
 
 # A client clock a little ahead, or a start_date left to default to the
@@ -270,7 +305,7 @@ async def create_project(user, *, title, description, visibility, priority, star
         created_by=user, current_owner=user,
     )
     if collaborators:
-        await sync_to_async(project.collaborators.set, thread_sensitive=True)(collaborators)
+        await _set_collaborators(project, collaborators, actor=user)
     await sync_to_async(log_project_created, thread_sensitive=True)(project)
     return project, None
 
@@ -323,7 +358,7 @@ async def update_project(user, project, updates: dict):
             setattr(project, field, value)
     await project.asave()
     if collaborators is not None:
-        await sync_to_async(project.collaborators.set, thread_sensitive=True)(collaborators)
+        await _set_collaborators(project, collaborators, actor=user)
     if project.status == Project.STATUS.DONE and not was_done:
         await sync_to_async(log_project_completed, thread_sensitive=True)(project, user)
         await sync_to_async(notify_project_completed, thread_sensitive=True)(project, user)

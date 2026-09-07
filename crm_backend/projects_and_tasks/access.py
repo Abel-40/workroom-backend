@@ -31,7 +31,7 @@ YAML permission catalog and ``users.services``.
 from django.db import models
 from users.models import CompanyUserProfile
 
-from .models import Project
+from .models import Project, ProjectMembership
 
 
 class AccessLevel(models.IntegerChoices):
@@ -45,6 +45,12 @@ class AccessLevel(models.IntegerChoices):
 
 
 MANAGE_ANY_ROLES = (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER)
+
+MEMBERSHIP_ACCESS = {
+    ProjectMembership.Role.VIEWER: AccessLevel.VIEW,
+    ProjectMembership.Role.CONTRIBUTOR: AccessLevel.CONTRIBUTE,
+    ProjectMembership.Role.MANAGER: AccessLevel.MANAGE,
+}
 
 
 async def company_standing(user, company):
@@ -92,6 +98,7 @@ async def resolve_project_access(user, project) -> AccessLevel | None:
         # immutable provenance, and provenance must not double as a grant.
         return max(grants, default=None)
 
+    # -- company standing ---------------------------------------------------
     if role in MANAGE_ANY_ROLES:
         grants.append(AccessLevel.MANAGE)
     elif (
@@ -100,25 +107,45 @@ async def resolve_project_access(user, project) -> AccessLevel | None:
     ):
         grants.append(AccessLevel.MANAGE)
 
+    # -- the accountable owner ----------------------------------------------
     if project.current_owner_id == user.id:
         grants.append(AccessLevel.MANAGE)
 
-    # created_by still grants MANAGE. The decision to reduce it to permanent
-    # VIEW-only provenance comes with ProjectMembership, which is what gives
-    # the people who need management a way to keep it.
+    # -- provenance ---------------------------------------------------------
+    # created_by is permanent, immutable and grants VIEW only. It records who
+    # started the project, which is worth keeping forever; it is not a claim
+    # on the project, which is what current_owner and a manager membership are
+    # for. Anyone who genuinely needs to keep managing what they created gets
+    # a manager membership -- the backfill gives every existing creator one.
     if project.created_by_id == user.id:
-        grants.append(AccessLevel.MANAGE)
+        grants.append(AccessLevel.VIEW)
 
+    # -- explicit per-person grants ----------------------------------------
+    membership_role = await ProjectMembership.objects.filter(
+        project=project, user=user,
+    ).values_list('role', flat=True).afirst()
+    if membership_role is not None:
+        grants.append(MEMBERSHIP_ACCESS[membership_role])
+
+    # -- being given work to do --------------------------------------------
+    # An assignment is itself a grant: somebody with MANAGE decided this
+    # person should do this task, and they cannot do it without being able to
+    # reach the project. Live tasks only -- a deleted task, or one on an
+    # archived project, grants nothing.
+    if AccessLevel.CONTRIBUTE not in grants and await project.tasks.filter(
+        assigned_to=user, is_deleted=False,
+    ).aexists():
+        grants.append(AccessLevel.CONTRIBUTE)
+
+    # -- visibility ---------------------------------------------------------
+    # Discovery only, never capability. This is the rule the whole model turns
+    # on: widening a project's visibility lets more people find it and must
+    # never let more people change it.
     if project.visibility == Project.VISIBILITY.COMPANY:
         grants.append(AccessLevel.VIEW)
     elif (
         project.visibility == Project.VISIBILITY.DEPARTMENT
         and project.department_id and department_id == project.department_id
-    ):
-        grants.append(AccessLevel.VIEW)
-    elif (
-        project.visibility == Project.VISIBILITY.PRIVATE
-        and await project.collaborators.filter(id=user.id).aexists()
     ):
         grants.append(AccessLevel.VIEW)
 

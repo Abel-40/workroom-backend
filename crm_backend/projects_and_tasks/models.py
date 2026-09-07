@@ -48,6 +48,14 @@ class Project(UUIDModel):
     # mutual-exclusion rule enforced whenever either is set.
     image_url = models.URLField(blank=True, default='')
     priority = models.CharField(max_length=20, choices=PRIORITY.choices, default=PRIORITY.MEDIUM)
+    # DEPRECATED -- superseded by ProjectMembership (role="contributor").
+    #
+    # Kept for one release and dual-written by the service layer so a rollback
+    # does not lose who was on a project. Nothing should *read* it: every
+    # access decision goes through projects_and_tasks.access
+    # .resolve_project_access, which reads ProjectMembership. Remove the field,
+    # and the dual-write in services._resolve_collaborators, once the release
+    # carrying the backfill has shipped.
     collaborators = models.ManyToManyField(User, related_name='collaborated_projects', blank=True)
     is_deleted = models.BooleanField(default=False)
 
@@ -69,6 +77,64 @@ class Project(UUIDModel):
             return 0
         completed = self.tasks.filter(status=Task.STATUS.DONE).count()
         return (completed / total) * 100
+
+
+class ProjectMembership(UUIDModel):
+    """An explicit grant of access to one project, for one person.
+
+    This is what separates *discovery* from *capability*. Before it, the only
+    way to give somebody rights on a project was to widen the project's
+    visibility -- which handed the same rights to everyone else the visibility
+    covered -- or to make them its owner. Visibility now grants VIEW and
+    nothing more, and anything beyond VIEW is named here, per person.
+
+    The three roles map onto the access levels in
+    :mod:`projects_and_tasks.access`:
+
+    ``viewer``
+        VIEW. Useful on a private project, where visibility grants nothing.
+    ``contributor``
+        CONTRIBUTE. Work on what you are given: move your tasks, submit
+        evidence, log time, upload.
+    ``manager``
+        MANAGE. Shape the work. This is the replacement for co-ownership --
+        a project has exactly one accountable ``current_owner``, and any
+        number of managers.
+
+    A membership only ever *adds*: effective access is the maximum of every
+    grant that applies, so a row here can never take away what a company role
+    already gives.
+    """
+
+    class Role(models.TextChoices):
+        VIEWER = 'viewer', 'Viewer'
+        CONTRIBUTOR = 'contributor', 'Contributor'
+        MANAGER = 'manager', 'Manager'
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memberships')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='project_memberships')
+    role = models.CharField(max_length=20, choices=Role.choices, default=Role.CONTRIBUTOR)
+    # Who granted it. SET_NULL so the grant survives the granter leaving --
+    # the same reasoning as Project.created_by.
+    added_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name='granted_project_memberships', null=True, blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # One row per person per project. Two grants at different levels
+            # would make "what may they do" ambiguous at exactly the moment it
+            # matters; changing access means changing the role on this row.
+            models.UniqueConstraint(fields=['project', 'user'], name='one_membership_per_project_user'),
+        ]
+        indexes = [
+            # The resolver's lookup: this user, on this project.
+            models.Index(fields=['user', 'project']),
+        ]
+
+    def __str__(self):
+        return f'{self.user_id} on {self.project_id} ({self.role})'
 
 
 class ProjectVisibilityRequest(UUIDModel):

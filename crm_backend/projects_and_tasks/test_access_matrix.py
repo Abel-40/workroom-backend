@@ -10,13 +10,13 @@ in the commit.
 
 Two parts:
 
-1. A generated matrix over
-   ``(actor) x (visibility) x (project department) x (created_by,
-   current_owner, collaborator, assignee)``, evaluated against the real
-   predicates in :mod:`projects_and_tasks.services` and compared against the
-   checked-in baseline ``access_matrix_baseline.txt``. Regenerate it
-   deliberately with ``WORKROOM_UPDATE_ACCESS_BASELINE=1 pytest ...`` and treat
-   the resulting diff as the review artifact for the change.
+1. A generated matrix of 1440 rows over ``(actor) x (visibility) x (project
+   department) x (ProjectMembership role) x (created_by / current_owner /
+   neither) x (assigned a live task)``, evaluated against the real predicates
+   in :mod:`projects_and_tasks.services` and compared against the checked-in
+   baseline ``access_matrix_baseline.txt``. Regenerate it deliberately with
+   ``WORKROOM_UPDATE_ACCESS_BASELINE=1 pytest ...`` and treat the resulting
+   diff as the review artifact for the change.
 
 2. Named tests for the gates that are not standalone predicates -- the
    visibility/department locks inlined in ``update_project`` -- and for the
@@ -43,7 +43,7 @@ from users.models import CompanyUserProfile, User
 
 from projects_and_tasks import services
 from projects_and_tasks.access import AccessLevel, resolve_project_access
-from projects_and_tasks.models import Project, Task
+from projects_and_tasks.models import Project, ProjectMembership, Task
 
 BASELINE_PATH = Path(__file__).with_name('access_matrix_baseline.txt')
 UPDATE_ENV = 'WORKROOM_UPDATE_ACCESS_BASELINE'
@@ -61,6 +61,14 @@ COLUMNS = (
     ('log_time', 'user_can_log_time'),
     ('approve', 'user_can_approve_task, task created by someone else'),
     ('deadline', 'user_can_extend_deadline'),
+)
+
+# The membership dimension: no row, or one at each of the three roles.
+MEMBERSHIP_STATES = (
+    ('none', None),
+    ('viewer', ProjectMembership.Role.VIEWER),
+    ('contrib', ProjectMembership.Role.CONTRIBUTOR),
+    ('manager', ProjectMembership.Role.MANAGER),
 )
 
 VISIBILITIES = (
@@ -122,19 +130,39 @@ class AccessMatrixCharacterizationTests(AccessWorldMixin, TestCase):
             ('outsider', cls.stranger),
         )
 
-        # Two persisted projects differing only in their collaborator set, so
-        # the collaborator dimension costs no per-row M2M writes. Every other
-        # dimension is applied to these instances in memory: the predicates
-        # under test only read attributes and the collaborators relation, and
-        # never saving keeps the matrix honest about what it is measuring.
+        # Grants that live in the database -- a ProjectMembership row and a
+        # task assignment -- cannot be simulated by mutating an instance, so
+        # there is one persisted project per (membership role, has an assigned
+        # task) combination and the row picks between them. Everything the
+        # resolver reads off the instance (visibility, department, created_by,
+        # current_owner) is still applied in memory and never saved, which
+        # keeps the matrix honest about what it is measuring.
         now = timezone.now()
         common = {
             'company': cls.company, 'start_date': now, 'deadline': now + timedelta(days=365),
             'created_by': cls.other, 'current_owner': cls.other,
         }
-        cls.project_plain = Project.objects.create(title='No collaborators', **common)
-        cls.project_collab = Project.objects.create(title='All collaborators', **common)
-        cls.project_collab.collaborators.set([cls.owner, cls.cm, cls.dl, cls.dm, cls.stranger])
+        everyone = [cls.owner, cls.cm, cls.dl, cls.dm, cls.stranger]
+        cls.projects = {}
+        for membership_name, membership_role in MEMBERSHIP_STATES:
+            for has_task in (False, True):
+                project = Project.objects.create(
+                    title=f'member={membership_name} task={has_task}', **common,
+                )
+                if membership_role is not None:
+                    ProjectMembership.objects.bulk_create([
+                        ProjectMembership(project=project, user=person, role=membership_role)
+                        for person in everyone
+                    ])
+                if has_task:
+                    Task.objects.bulk_create([
+                        Task(
+                            project=project, title=f'for {person.username}', created_by=cls.other,
+                            assigned_to=person, deadline=common['deadline'],
+                        )
+                        for person in everyone
+                    ])
+                cls.projects[(membership_name, has_task)] = project
 
     def _evaluate(self, actor, project, task):
         """One row's worth of predicate answers, in COLUMNS order."""
@@ -154,7 +182,7 @@ class AccessMatrixCharacterizationTests(AccessWorldMixin, TestCase):
     def _generate(self):
         departments = (('match', self.dept_match.id), ('other', self.dept_other.id), ('none', None))
         widths = [max(len(name), 3) for name, _ in COLUMNS]
-        header = 'actor    | vis        | dept  | by own col asg | ' + ' '.join(
+        header = 'actor    | vis        | dept  | member  | rel     | asg | ' + ' '.join(
             name.ljust(width) for (name, _), width in zip(COLUMNS, widths)
         )
         lines = [
@@ -164,8 +192,11 @@ class AccessMatrixCharacterizationTests(AccessWorldMixin, TestCase):
             '# Columns:',
             *[f'#   {name:<12} {source}' for name, source in COLUMNS],
             '#',
-            '# Flags: by = actor is project.created_by, own = actor is project.current_owner,',
-            '#        col = actor is a collaborator, asg = actor is the task assignee.',
+            '# Dimensions:',
+            '#   member  the actor ProjectMembership role on this project, or none',
+            '#   rel     none | creator (actor is created_by) | owner (actor is current_owner)',
+            '#           "both" is omitted: effective access is a max, so it adds nothing',
+            '#   asg     the actor is assigned a live task on this project',
             '',
             header,
             '-' * len(header),
@@ -173,31 +204,27 @@ class AccessMatrixCharacterizationTests(AccessWorldMixin, TestCase):
         for actor_name, actor in self.actors:
             for visibility in VISIBILITIES:
                 for dept_name, dept_id in departments:
-                    for is_collaborator in (False, True):
-                        project = self.project_collab if is_collaborator else self.project_plain
-                        project.visibility = visibility
-                        project.department_id = dept_id
-                        for is_creator in (False, True):
-                            project.created_by_id = actor.id if is_creator else self.other.id
-                            for is_owner in (False, True):
-                                project.current_owner_id = actor.id if is_owner else self.other.id
-                                for is_assignee in (False, True):
-                                    task = Task(
-                                        project=project, created_by_id=self.other.id,
-                                        assigned_to_id=actor.id if is_assignee else self.other.id,
-                                    )
-                                    flags = ' '.join(
-                                        ' 1' if flag else ' 0'
-                                        for flag in (is_creator, is_owner, is_collaborator, is_assignee)
-                                    )
-                                    answers = ' '.join(
-                                        ('1' if value else '0').ljust(width)
-                                        for value, width in zip(self._evaluate(actor, project, task), widths)
-                                    )
-                                    lines.append(
-                                        f'{actor_name:<8} | {visibility:<10} | {dept_name:<5} |'
-                                        f'{flags} | {answers}'.rstrip()
-                                    )
+                    for membership_name, _ in MEMBERSHIP_STATES:
+                        for is_assignee in (False, True):
+                            project = self.projects[(membership_name, is_assignee)]
+                            project.visibility = visibility
+                            project.department_id = dept_id
+                            for relation in ('none', 'creator', 'owner'):
+                                project.created_by_id = actor.id if relation == 'creator' else self.other.id
+                                project.current_owner_id = actor.id if relation == 'owner' else self.other.id
+                                task = Task(
+                                    project=project, created_by_id=self.other.id,
+                                    assigned_to_id=actor.id if is_assignee else self.other.id,
+                                )
+                                answers = ' '.join(
+                                    ('1' if value else '0').ljust(width)
+                                    for value, width in zip(self._evaluate(actor, project, task), widths)
+                                )
+                                lines.append(
+                                    f'{actor_name:<8} | {visibility:<10} | {dept_name:<5} | '
+                                    f'{membership_name:<7} | {relation:<7} | {"1" if is_assignee else "0"}   | '
+                                    f'{answers}'.rstrip()
+                                )
         return '\n'.join(lines) + '\n'
 
     def test_access_matrix_matches_baseline(self):
@@ -244,12 +271,18 @@ class BaselineInvariantTests(SimpleTestCase):
         for line in BASELINE_PATH.read_text(encoding='utf-8').splitlines():
             if line.startswith('#') or line.startswith('-') or '|' not in line or 'actor' in line:
                 continue
-            actor, visibility, department, flags, answers = (part.strip() for part in line.split('|'))
+            actor, visibility, department, member, relation, assignee, answers = (
+                part.strip() for part in line.split('|')
+            )
+            flags = f'member={member} rel={relation} asg={assignee}'
             values = dict(zip([name for name, _ in COLUMNS], [v == '1' for v in answers.split()]))
             cls.rows.append((actor, visibility, department, flags, values))
 
     def test_the_baseline_covers_the_whole_cross_product(self):
-        self.assertEqual(len(self.rows), 5 * 4 * 3 * 16)
+        actors, visibilities, departments, memberships, assignee, relations = 5, 4, 3, 4, 2, 3
+        self.assertEqual(
+            len(self.rows), actors * visibilities * departments * memberships * assignee * relations,
+        )
 
     def test_manage_always_implies_view(self):
         """The property an ordered AccessLevel exists to guarantee, and the
@@ -395,27 +428,74 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
         self.assertIsNone(error)
         self.assertEqual(updated.visibility, Project.VISIBILITY.PUBLIC)
 
-    def test_a_department_member_cannot_change_visibility_at_all(self):
-        """Current behaviour, preserved for contrast with the test above: the
-        DM lock lives inline in update_project rather than in a predicate, so
-        it is invisible to the generated matrix."""
-        self.project.created_by = self.dm
-        self.project.save(update_fields=['created_by'])
+    def grant(self, user, role):
+        return ProjectMembership.objects.create(project=self.project, user=user, role=role)
+
+    def test_a_department_member_cannot_change_visibility_even_when_they_manage(self):
+        """The DM visibility lock lives inline in update_project rather than in
+        a predicate, so it is invisible to the generated matrix.
+
+        The membership is what makes this test meaningful now. It used to reach
+        the lock by making the DM ``created_by``, which granted MANAGE; that
+        route is gone, so without an explicit manager grant the DM is refused
+        earlier with ``forbidden`` and the lock itself is never exercised."""
+        self.grant(self.dm, ProjectMembership.Role.MANAGER)
         _, error = async_to_sync(services.update_project)(
             self.dm, self.project, {'visibility': Project.VISIBILITY.PRIVATE},
         )
         self.assertEqual(error, 'visibility_locked')
 
     def test_a_department_scoped_role_cannot_move_a_project_between_departments(self):
-        """Current behaviour: another inline gate in update_project, recorded
-        here so the consolidation does not quietly drop it."""
+        """Another inline gate in update_project, recorded so the consolidation
+        does not quietly drop it. Both actors are given a manager membership so
+        the department lock is what refuses them, not a lack of access."""
         for actor in (self.dl, self.dm):
-            self.project.created_by = actor
-            self.project.save(update_fields=['created_by'])
+            ProjectMembership.objects.update_or_create(
+                project=self.project, user=actor, defaults={'role': ProjectMembership.Role.MANAGER},
+            )
             _, error = async_to_sync(services.update_project)(
                 actor, self.project, {'department_id': self.dept_other.id},
             )
             self.assertEqual(error, 'department_locked', f'{actor.email} was allowed to move the project')
+
+    def test_creating_a_project_no_longer_grants_management_of_it(self):
+        """created_by is permanent, immutable provenance and grants VIEW only.
+        It records who started the project; it is not a claim on it. Anyone who
+        needs to keep managing what they created holds a manager membership --
+        which, unlike created_by, can be revoked."""
+        self.project.created_by = self.dm
+        self.project.save(update_fields=['created_by'])
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.VIEW)
+        self.assertFalse(async_to_sync(services.user_can_manage_project)(self.dm, self.project))
+
+        self.grant(self.dm, ProjectMembership.Role.MANAGER)
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.MANAGE)
+
+    def test_being_assigned_a_task_grants_contribute_but_never_manage(self):
+        """An assignment is itself a grant: somebody with MANAGE decided this
+        person should do this work, and they cannot do it without reaching the
+        project. It stops at CONTRIBUTE -- doing the work is not running it."""
+        self.project.visibility = Project.VISIBILITY.PRIVATE
+        self.project.save(update_fields=['visibility'])
+        self.assertIsNone(async_to_sync(resolve_project_access)(self.dm, self.project))
+
+        task = Task.objects.create(
+            project=self.project, title='Do it', created_by=self.other, assigned_to=self.dm,
+            deadline=self.project.deadline,
+        )
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.CONTRIBUTE)
+
+        task.is_deleted = True
+        task.save(update_fields=['is_deleted'])
+        self.assertIsNone(async_to_sync(resolve_project_access)(self.dm, self.project))
+
+    def test_visibility_grants_discovery_and_never_capability(self):
+        """The rule the whole model turns on. Widening visibility must let more
+        people find a project and never let more people change it."""
+        self.project.visibility = Project.VISIBILITY.COMPANY
+        self.project.save(update_fields=['visibility'])
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.VIEW)
+        self.assertFalse(async_to_sync(services.user_can_manage_project)(self.dm, self.project))
 
     def test_a_per_project_reference_grants_nothing_to_a_non_member(self):
         """FIXED (was D10): every predicate resolves company membership before
@@ -495,10 +575,15 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
         self.project.save(update_fields=['visibility'])
         self.assertIsNone(async_to_sync(resolve_project_access)(self.dm, self.project))
 
-        self.project.collaborators.add(self.dm)
+        membership = self.grant(self.dm, ProjectMembership.Role.VIEWER)
         self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.VIEW)
 
+        # A lower-ranked grant never reduces a higher one that already applies.
         self.project.current_owner = self.dm
+        self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.MANAGE)
+
+        membership.role = ProjectMembership.Role.CONTRIBUTOR
+        membership.save(update_fields=['role'])
         self.assertEqual(async_to_sync(resolve_project_access)(self.dm, self.project), AccessLevel.MANAGE)
 
     def test_the_resolver_returns_none_for_someone_with_no_relationship(self):
