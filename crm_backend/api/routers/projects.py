@@ -21,7 +21,7 @@ from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
 from ..auth import JWTBearerAuth
 from ..schemas import ApiResponse
-from .tasks import DeadlineExtendIn
+from .tasks import DeadlineChangeIn
 
 router = Router(tags=['projects'])
 auth = JWTBearerAuth()
@@ -370,23 +370,35 @@ async def list_eligible_assignees(request, project_id: UUID):
 
 
 @router.post(
-    '/{project_id}/extend-deadline/', auth=auth,
-    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    '/{project_id}/change-deadline/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse, 409: ApiResponse},
 )
-async def extend_project_deadline(request, project_id: UUID, data: DeadlineExtendIn):
-    """Project-creator-only, extend-only -- see
-    projects_and_tasks.services.user_can_extend_deadline."""
+async def change_project_deadline(request, project_id: UUID, data: DeadlineChangeIn):
+    """Open to whoever can manage the project, in either direction, with a
+    required reason. Shortening past a task's own deadline returns 409 and the
+    offending tasks, so the UI can list them and let someone fix them inline
+    rather than making the user find them."""
     project, error = await services.get_project_for_user(request.auth, project_id)
     if error == 'not_found':
         return payload('Project not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this project.', 403, False)
-    updated, error = await services.extend_project_deadline(request.auth, project, data.deadline)
+    result, error = await services.change_project_deadline(
+        request.auth, project, data.deadline, reason=data.reason,
+    )
     if error == 'forbidden':
-        return payload('Only the project creator can extend the deadline.', 403, False)
-    if error == 'not_an_extension':
-        return payload('The new deadline must be later than the current one.', 400, False)
-    return payload('Project deadline extended.', 200, True, {'project': await project_data(updated)})
+        return payload('You do not have permission to change this deadline.', 403, False)
+    if error == 'reason_required':
+        return payload('A reason is required when changing a deadline.', 400, False)
+    if error == 'tasks_exceed_deadline':
+        return payload(
+            'Some tasks would fall after the new deadline.', 409, False,
+            {'blocking_tasks': [
+                {'id': str(task.id), 'title': task.title, 'deadline': task.deadline.isoformat()}
+                for task in result
+            ]},
+        )
+    return payload('Project deadline changed.', 200, True, {'project': await project_data(result)})
 
 
 # --------------------------------------------------------------------------

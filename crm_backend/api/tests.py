@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from ai_agent.models import AIAssistantQuery, AIGeneratedTask, AIGeneration, AIProjectHealthSummary
+from audit.models import AuditAction, AuditEvent
 from company.models import Company, Sector
 from departments_and_teams.models import Department, Team
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -19,7 +20,7 @@ from django.test import TestCase
 from django.utils import timezone
 from notifications_and_activity.models import Notification
 from pages.models import Page, PageFolder
-from projects_and_tasks.models import Project, Task
+from projects_and_tasks.models import Project, Task, TaskApproval
 from rest_framework_simplejwt.tokens import RefreshToken
 from users.models import CompanyUserProfile, PendingInvite, User
 
@@ -832,14 +833,25 @@ class TaskApprovalWorkflowTests(TwoCompanyTestCase):
         response = self.submit(task['id'])
         self.assertEqual(response.status_code, 400)
 
-    def test_submit_rejected_once_deadline_has_passed(self):
+    def test_submit_is_allowed_once_the_deadline_has_passed_and_is_flagged(self):
+        """Reversed deliberately. Refusing a late submission meant a task that
+        ran a day over could never reach Done by any route -- a dead end rather
+        than a guardrail, and one whose only workaround was backdating the
+        deadline to close out work that had genuinely been done.
+
+        Lateness is now recorded on the submission for the reviewer to weigh.
+        """
         project, task = self._project_and_assigned_task()
         # Bypasses create/update_task's deadline-vs-project validation --
         # deliberately simulating a task whose deadline has simply elapsed
         # since creation, not testing creation-time validation here.
-        Task.objects.filter(id=task['id']).update(deadline=timezone.now() - timedelta(minutes=1))
+        Task.objects.filter(id=task['id']).update(deadline=timezone.now() - timedelta(minutes=90))
         response = self.submit(task['id'])
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 202)
+
+        approval = TaskApproval.objects.get(task_id=task['id'])
+        self.assertTrue(approval.submitted_late)
+        self.assertGreater(approval.late_by, timedelta(hours=1))
 
     def test_submit_rejected_with_no_evidence(self):
         project, task = self._project_and_assigned_task()
@@ -985,87 +997,126 @@ class TaskApprovalWorkflowTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.json()['data']['results'][0]['rejection_comment'])
 
-    # -- deadline extension -----------------------------------------------
+    # -- deadline changes --------------------------------------------------
+    #
+    # These rules were reversed deliberately. Deadline changes used to belong
+    # to project.created_by alone and could only ever move outwards, which
+    # meant a departed creator froze a project's dates permanently and the
+    # most common real correction -- "this was scheduled optimistically, pull
+    # it in" -- had no route through the product at all. They now belong to
+    # whoever can manage the project, go in either direction, require a stated
+    # reason, and are audited.
 
-    def test_creator_can_extend_task_deadline(self):
-        project, task = self._project_and_assigned_task()
-        new_deadline = timezone.now() + timedelta(days=60)
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
+    def change_task_deadline(self, task, deadline, actor, reason='Scope changed'):
+        body = {'deadline': deadline.isoformat()}
+        if reason is not None:
+            body['reason'] = reason
+        return self.client.post(
+            f"/api/v1/tasks/{task['id']}/change-deadline/", json.dumps(body),
+            content_type='application/json', **auth_header(actor),
         )
+
+    def change_project_deadline(self, project, deadline, actor, reason='Scope changed'):
+        body = {'deadline': deadline.isoformat()}
+        if reason is not None:
+            body['reason'] = reason
+        return self.client.post(
+            f"/api/v1/projects/{project['id']}/change-deadline/", json.dumps(body),
+            content_type='application/json', **auth_header(actor),
+        )
+
+    def test_a_project_manager_can_change_a_task_deadline(self):
+        project, task = self._project_and_assigned_task()
+        response = self.change_task_deadline(task, timezone.now() + timedelta(days=60), self.owner_a)
         self.assertEqual(response.status_code, 200)
 
-    def test_current_owner_cannot_extend_deadline_if_not_creator(self):
+    def test_the_current_owner_can_change_a_deadline_they_did_not_create(self):
+        """The case the old rule got wrong: transferring a project handed over
+        accountability for delivery without the ability to move the dates."""
         project, task = self._project_and_assigned_task()
         self.client.patch(
             f"/api/v1/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.member_a.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
-        new_deadline = timezone.now() + timedelta(days=60)
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
-            content_type='application/json', **auth_header(self.member_a),
-        )
-        self.assertEqual(response.status_code, 403)
-
-    def test_extend_task_deadline_rejects_a_non_later_deadline(self):
-        project, task = self._project_and_assigned_task()
-        earlier = timezone.now() + timedelta(days=1)
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': earlier.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
-        )
-        self.assertEqual(response.status_code, 400)
-
-    def test_extend_task_deadline_rejects_a_deadline_at_or_past_the_project_deadline(self):
-        project, task = self._project_and_assigned_task()
-        past_project_deadline = datetime.fromisoformat(project['deadline'])
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': past_project_deadline.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
-        )
-        self.assertEqual(response.status_code, 400)
-
-    def test_creator_can_extend_project_deadline(self):
-        project = self.create_project(owner=self.owner_a)
-        new_deadline = timezone.now() + timedelta(days=1000)
-        response = self.client.post(
-            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
-        )
+        response = self.change_task_deadline(task, timezone.now() + timedelta(days=60), self.member_a)
         self.assertEqual(response.status_code, 200)
 
-    def test_extend_project_deadline_rejects_a_non_later_deadline(self):
-        project = self.create_project(owner=self.owner_a)
-        earlier = timezone.now()
-        response = self.client.post(
-            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': earlier.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
+    def test_a_company_manager_can_change_a_project_deadline(self):
+        """Previously refused: a CM qualified for every other management action
+        on a project but not for its dates."""
+        manager = User.objects.create_user(
+            email='manager-a2@example.com', username='manager-a2', password='Kx9#mQ2vLp8Z',
         )
-        self.assertEqual(response.status_code, 400)
+        CompanyUserProfile.objects.create(
+            user=manager, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER,
+        )
+        project = self.create_project(owner=self.owner_a)
+        response = self.change_project_deadline(project, timezone.now() + timedelta(days=1000), manager)
+        self.assertEqual(response.status_code, 200)
 
-    def test_company_manager_cannot_extend_project_deadline(self):
-        """Deadline extension is narrower than general project management --
-        a Company Manager qualifies for user_can_manage_project but not for
-        user_can_extend_deadline."""
-        manager = User.objects.create_user(email='manager-a2@example.com', username='manager-a2', password='Kx9#mQ2vLp8Z')
-        CompanyUserProfile.objects.create(user=manager, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER)
-        project = self.create_project(owner=self.owner_a)
-        new_deadline = timezone.now() + timedelta(days=1000)
-        response = self.client.post(
-            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
-            content_type='application/json', **auth_header(manager),
-        )
+    def test_a_member_with_no_relationship_to_the_project_cannot(self):
+        project = self.create_project(owner=self.owner_a, visibility='company')
+        response = self.change_project_deadline(project, timezone.now() + timedelta(days=1000), self.member_a)
         self.assertEqual(response.status_code, 403)
 
-    def test_extend_deadline_is_scoped_to_the_callers_own_company(self):
+    def test_a_reason_is_required(self):
         project, task = self._project_and_assigned_task()
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/",
-            json.dumps({'deadline': (timezone.now() + timedelta(days=60)).isoformat()}),
-            content_type='application/json', **auth_header(self.owner_b),
+        for reason in ('', '   '):
+            response = self.change_task_deadline(
+                task, timezone.now() + timedelta(days=60), self.owner_a, reason=reason,
+            )
+            self.assertEqual(response.status_code, 400, f'blank reason {reason!r} was accepted')
+
+    def test_a_deadline_can_be_pulled_in(self):
+        project, task = self._project_and_assigned_task()
+        response = self.change_task_deadline(task, timezone.now() + timedelta(days=1), self.owner_a)
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_task_deadline_may_equal_the_project_deadline(self):
+        """The inclusive invariant. The strict version is what forced the AI
+        generator to subtract an hour from every task it produced."""
+        project, task = self._project_and_assigned_task()
+        response = self.change_task_deadline(task, datetime.fromisoformat(project['deadline']), self.owner_a)
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_task_deadline_may_not_fall_after_the_project_deadline(self):
+        project, task = self._project_and_assigned_task()
+        past_project_deadline = datetime.fromisoformat(project['deadline']) + timedelta(seconds=1)
+        response = self.change_task_deadline(task, past_project_deadline, self.owner_a)
+        self.assertEqual(response.status_code, 400)
+
+    def test_shortening_a_project_deadline_returns_the_tasks_that_block_it(self):
+        """Blocked, but not with a bare error: the caller gets the offending
+        tasks back so the UI can list them and let someone fix them inline."""
+        project, task = self._project_and_assigned_task()
+        response = self.change_project_deadline(project, timezone.now() + timedelta(days=1), self.owner_a)
+        self.assertEqual(response.status_code, 409)
+        blocking = response.json()['data']['blocking_tasks']
+        self.assertEqual([entry['id'] for entry in blocking], [task['id']])
+
+    def test_a_deadline_change_is_audited_with_its_reason(self):
+        project, task = self._project_and_assigned_task()
+        self.change_task_deadline(task, timezone.now() + timedelta(days=60), self.owner_a, reason='Client moved')
+        event = AuditEvent.objects.get(action=AuditAction.TASK_DEADLINE_CHANGED)
+        self.assertEqual(event.reason, 'Client moved')
+        self.assertNotEqual(event.before['deadline'], event.after['deadline'])
+
+    def test_changing_a_project_deadline_notifies_everyone_holding_a_task(self):
+        """Notifying only the owner was wrong: a project deadline moving is
+        exactly the event that changes what the people doing the work must do."""
+        project, task = self._project_and_assigned_task()
+        Notification.objects.all().delete()
+        response = self.change_project_deadline(project, timezone.now() + timedelta(days=1000), self.owner_a)
+        self.assertEqual(response.status_code, 200)
+        notified = set(
+            Notification.objects.filter(type=Notification.Type.DEADLINE_EXTENDED)
+            .values_list('recipient_id', flat=True)
         )
+        self.assertIn(self.member_a.id, notified)
+
+    def test_changing_a_deadline_is_scoped_to_the_callers_own_company(self):
+        project, task = self._project_and_assigned_task()
+        response = self.change_task_deadline(task, timezone.now() + timedelta(days=60), self.owner_b)
         self.assertEqual(response.status_code, 403)
 
 

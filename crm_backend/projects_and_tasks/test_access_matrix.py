@@ -364,50 +364,133 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
         self.assertFalse(async_to_sync(services.user_can_manage_project)(self.dm, self.project))
         self.assertTrue(async_to_sync(services.user_can_manage_task)(self.dm, task))
 
-    def test_only_the_project_creator_can_move_a_deadline(self):
-        """KNOWN DEFECT (decision sec.2): deadline changes are creator-only, so
-        the current owner, the company Owner, a CM and the department's own
-        leader are all locked out, and a creator who leaves the company freezes
-        the deadline permanently. Replaced by "anyone who can MANAGE, with a
-        required reason, audited"."""
+    def test_moving_a_deadline_belongs_to_whoever_manages_the_project(self):
+        """FIXED (was D3): deadline changes were created_by-only, which locked
+        out the current owner, the company Owner, a CM and the department's own
+        leader -- and meant a creator who left the company froze the project's
+        dates permanently. They now follow MANAGE."""
+        self.project.current_owner = self.dm
+        self.project.save(update_fields=['current_owner'])
         for actor in (self.owner, self.cm, self.dl, self.dm):
-            self.assertFalse(
-                async_to_sync(services.user_can_extend_deadline)(actor, self.project),
-                f'{actor.email} unexpectedly allowed to change the deadline',
+            updated, error = async_to_sync(services.change_project_deadline)(
+                actor, self.project, self.project.deadline + timedelta(days=1), reason='Scope changed',
             )
-        self.project.created_by = self.dm
-        self.assertTrue(async_to_sync(services.user_can_extend_deadline)(self.dm, self.project))
+            self.assertIsNone(error, f'{actor.email} was refused')
+            self.assertIsNotNone(updated)
 
-    def test_deadline_changes_are_extend_only(self):
-        """KNOWN DEFECT (decision sec.2): a deadline can only ever move
-        forwards. Shortening becomes allowed, blocked only when it would break
-        the task invariant."""
-        self.project.created_by = self.dm
-        self.project.save(update_fields=['created_by'])
+    def test_moving_a_deadline_requires_a_reason(self):
+        """The counterweight to widening who may do it. A date moving under the
+        people doing the work is what makes a deadline feel arbitrary."""
+        for reason in ('', '   ', None):
+            _, error = async_to_sync(services.change_project_deadline)(
+                self.owner, self.project, self.project.deadline + timedelta(days=1), reason=reason,
+            )
+            self.assertEqual(error, 'reason_required', f'blank reason {reason!r} was accepted')
+
+    def test_a_deadline_can_now_be_pulled_in(self):
+        """FIXED (was D4): deadlines could only ever move outwards, so the most
+        common real correction had no route through the product."""
         earlier = self.project.deadline - timedelta(days=1)
-        _, error = async_to_sync(services.extend_project_deadline)(self.dm, self.project, earlier)
-        self.assertEqual(error, 'not_an_extension')
+        updated, error = async_to_sync(services.change_project_deadline)(
+            self.owner, self.project, earlier, reason='Client pulled the date in',
+        )
+        self.assertIsNone(error)
+        self.assertEqual(updated.deadline, earlier)
 
-    def test_a_task_deadline_must_fall_strictly_before_the_project_deadline(self):
-        """KNOWN DEFECT (decision sec.2): the strict inequality is what forces
-        the AI generator's one-hour buffer. Becomes ``<=``."""
-        _, error = async_to_sync(services.create_task)(
+    def test_shortening_is_blocked_by_the_tasks_it_would_strand(self):
+        """Blocked by the invariant, not by direction -- and the caller gets the
+        offending tasks back rather than a bare refusal."""
+        task = Task.objects.create(
+            project=self.project, title='Runs to the end', created_by=self.other,
+            deadline=self.project.deadline,
+        )
+        result, error = async_to_sync(services.change_project_deadline)(
+            self.owner, self.project, self.project.deadline - timedelta(days=1), reason='Pull in',
+        )
+        self.assertEqual(error, 'tasks_exceed_deadline')
+        self.assertEqual([t.id for t in result], [task.id])
+
+    def test_a_task_deadline_may_equal_the_project_deadline(self):
+        """FIXED (was D5): the strict inequality is what forced the AI
+        generator to subtract an hour from every task it produced."""
+        task, error = async_to_sync(services.create_task)(
             self.other, self.project, title='On the boundary', description='x',
             priority='medium', deadline=self.project.deadline,
         )
+        self.assertIsNone(error)
+        self.assertEqual(task.deadline, self.project.deadline)
+
+    def test_a_task_deadline_still_cannot_fall_after_the_project_deadline(self):
+        _, error = async_to_sync(services.create_task)(
+            self.other, self.project, title='One second too far', description='x',
+            priority='medium', deadline=self.project.deadline + timedelta(seconds=1),
+        )
         self.assertEqual(error, 'invalid_deadline')
 
-    def test_a_task_cannot_be_submitted_once_its_deadline_has_passed(self):
-        """KNOWN DEFECT (decision sec.2): a task that goes one minute late can
-        never reach Done. Late submission becomes allowed and flagged."""
+    def test_a_task_deadline_defaults_to_the_project_deadline(self):
+        """A task that runs to the end of its project is the common case, and
+        making people retype the project's own date to say so was friction."""
+        task, error = async_to_sync(services.create_task)(
+            self.other, self.project, title='No deadline given', description='x',
+            priority='medium', deadline=None,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(task.deadline, self.project.deadline)
+
+    def test_a_late_task_can_still_be_submitted_and_is_flagged(self):
+        """FIXED (was D6): refusing a late submission meant a task that ran a
+        day over could never reach Done by any route -- a dead end rather than
+        a guardrail, and one that pushed people into backdating deadlines to
+        close out real work."""
         task = Task.objects.create(
             project=self.project, title='Late', created_by=self.other, assigned_to=self.dm,
+            status=Task.STATUS.IN_PROGRESS, deadline=timezone.now() - timedelta(hours=3),
+        )
+        approval, error = async_to_sync(services.submit_task_for_approval)(
+            self.dm, task, links=['https://example.com/evidence'],
+        )
+        self.assertIsNone(error)
+        self.assertTrue(approval.submitted_late)
+        self.assertGreater(approval.late_by, timedelta(hours=2))
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.STATUS.IN_REVIEW)
+
+    def test_an_on_time_submission_is_not_flagged(self):
+        task = Task.objects.create(
+            project=self.project, title='On time', created_by=self.other, assigned_to=self.dm,
+            status=Task.STATUS.IN_PROGRESS, deadline=timezone.now() + timedelta(days=1),
+        )
+        approval, error = async_to_sync(services.submit_task_for_approval)(
+            self.dm, task, links=['https://example.com/evidence'],
+        )
+        self.assertIsNone(error)
+        self.assertFalse(approval.submitted_late)
+        self.assertIsNone(approval.late_by)
+
+    def test_every_other_submission_guard_still_refuses(self):
+        """Allowing late submission removed one guard and must not have
+        loosened any of the others."""
+        task = Task.objects.create(
+            project=self.project, title='Guarded', created_by=self.other, assigned_to=self.dm,
             status=Task.STATUS.IN_PROGRESS, deadline=timezone.now() - timedelta(hours=1),
         )
         _, error = async_to_sync(services.submit_task_for_approval)(
-            self.dm, task, links=['https://example.com/evidence'],
+            self.other, task, links=['https://example.com/x'],
         )
-        self.assertEqual(error, 'deadline_passed')
+        self.assertEqual(error, 'forbidden', 'a non-assignee was allowed to submit')
+
+        _, error = async_to_sync(services.submit_task_for_approval)(self.dm, task)
+        self.assertEqual(error, 'no_evidence')
+
+        async_to_sync(services.submit_task_for_approval)(self.dm, task, links=['https://example.com/x'])
+        # Re-fetched rather than refresh_from_db()'d: refreshing clears cached
+        # relations, and the async service layer expects its task to arrive
+        # with project__company already selected, exactly as the router
+        # supplies it. Traversing the FK inside the event loop is a
+        # SynchronousOnlyOperation, not a slow query.
+        task = Task.objects.select_related('project', 'project__company').get(id=task.id)
+        _, error = async_to_sync(services.submit_task_for_approval)(self.dm, task, links=['https://example.com/y'])
+        self.assertEqual(error, 'invalid_status', 'a task already In Review was submitted again')
 
     def test_a_public_project_is_readable_by_a_member_of_another_company(self):
         """KNOWN DEFECT (decision sec.1): ``public`` short-circuits the company

@@ -224,6 +224,12 @@ class TaskApproval(UUIDModel):
     task = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='approvals')
     submitted_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='submitted_approvals', null=True)
     submitted_at = models.DateTimeField(auto_now_add=True)
+    # Lateness is recorded on the submission, not on the task: a task may be
+    # submitted late, rejected, and resubmitted on time, and both facts are
+    # true of their own attempt. Overdue remains a derived state everywhere
+    # else -- there is no "late" status and no extra Kanban column.
+    submitted_late = models.BooleanField(default=False)
+    late_by = models.DurationField(null=True, blank=True)
     status = models.CharField(max_length=10, choices=STATUS.choices, default=STATUS.PENDING)
     decided_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='decided_approvals', null=True, blank=True)
     decided_at = models.DateTimeField(null=True, blank=True)

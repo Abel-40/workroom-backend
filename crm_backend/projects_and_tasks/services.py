@@ -23,12 +23,12 @@ from notifications_and_activity.services import (
     log_project_reopened,
     notify_project_auto_completed,
     notify_project_completed,
-    notify_project_deadline_extended,
+    notify_project_deadline_changed,
     notify_project_ownership_transferred,
     notify_project_reopened,
     notify_task_approved,
     notify_task_assigned,
-    notify_task_deadline_extended,
+    notify_task_deadline_changed,
     notify_task_rejected,
     notify_task_submitted_for_approval,
     notify_visibility_approved,
@@ -637,9 +637,17 @@ async def create_task(user, project, *, title, description, priority, deadline, 
         # update_project's creator-only revert-from-Done restriction (B5).
         # Reopening has to stay that explicit, creator-only action.
         return None, 'project_completed'
+    if deadline is None:
+        # A task that runs to the end of its project is the common case, and
+        # making people retype the project's own deadline to express it was
+        # friction with no purpose.
+        deadline = project.deadline
     if deadline < timezone.now() - PAST_DATE_GRACE:
         return None, 'invalid_deadline'
-    if deadline >= project.deadline:
+    if deadline > project.deadline:
+        # Inclusive: a task may land exactly on the project deadline. The
+        # strict version is what forced the AI generator to subtract an hour
+        # from every generated task so its output would validate.
         return None, 'invalid_deadline'
     department, error = await _resolve_department(project.company, department_id)
     if error:
@@ -673,7 +681,7 @@ async def create_task(user, project, *, title, description, priority, deadline, 
 async def update_task(user, task, updates: dict):
     if not await user_can_manage_task(user, task):
         return None, 'forbidden'
-    if 'deadline' in updates and updates['deadline'] >= task.project.deadline:
+    if 'deadline' in updates and updates['deadline'] > task.project.deadline:
         return None, 'invalid_deadline'
     if 'department_id' in updates:
         department, error = await _resolve_department(task.project.company, updates.pop('department_id'))
@@ -869,8 +877,15 @@ async def submit_task_for_approval(user, task, *, files=None, links=None, page_i
     links, and Info Portal pages) for the task's approver to review. Moves
     the task to In Review. Returns (approval, error) where error is one of
     'forbidden', 'invalid_status' (task isn't In Progress), 'already_pending'
-    (an unresolved approval already exists), 'deadline_passed', 'no_evidence',
-    'invalid_content_type', 'too_large', 'invalid_page', or None."""
+    (an unresolved approval already exists), 'no_evidence',
+    'invalid_content_type', 'too_large', 'invalid_page', or None.
+
+    A submission after the task's deadline is allowed and flagged, not
+    refused. Refusing it made a task that ran a day late unable to reach Done
+    by any route -- a dead end rather than a guardrail, and one that pushed
+    people into backdating deadlines to close out real work. Lateness is
+    recorded on the approval (``submitted_late``/``late_by``) for the reviewer
+    to weigh."""
     # Assignee-only, and an active member of the company -- same rule as
     # user_can_update_task_status, for the same reason: a task reference left
     # pointing at somebody who is no longer here authorizes nothing.
@@ -880,8 +895,6 @@ async def submit_task_for_approval(user, task, *, files=None, links=None, page_i
         return None, 'invalid_status'
     if await TaskApproval.objects.filter(task=task, status=TaskApproval.STATUS.PENDING).aexists():
         return None, 'already_pending'
-    if task.deadline < timezone.now():
-        return None, 'deadline_passed'
 
     files = files or []
     links = links or []
@@ -906,7 +919,11 @@ async def submit_task_for_approval(user, task, *, files=None, links=None, page_i
         if len(pages) != len(set(page_ids)):
             return None, 'invalid_page'
 
-    approval = await TaskApproval.objects.acreate(task=task, submitted_by=user)
+    now = timezone.now()
+    late_by = now - task.deadline if now > task.deadline else None
+    approval = await TaskApproval.objects.acreate(
+        task=task, submitted_by=user, submitted_late=late_by is not None, late_by=late_by,
+    )
     to_create = []
     for uploaded_file in files:
         to_create.append(Attachment(
@@ -1001,38 +1018,76 @@ async def reject_task_approval(user, task, comment: str):
     return task, None
 
 
-async def extend_task_deadline(user, task, new_deadline):
-    """Project-creator-only (narrower than general project management -- see
-    user_can_extend_deadline), extend-only: the new deadline must be later
-    than the task's current one, and must still land strictly before the
-    project's own deadline (the same invariant enforced at task creation).
-    Returns (task, error) where error is 'forbidden', 'not_an_extension',
-    'exceeds_project_deadline', or None."""
-    if not await user_can_extend_deadline(user, task.project):
+async def change_task_deadline(user, task, new_deadline, *, reason):
+    """Move a task's deadline, in either direction.
+
+    Belongs to whoever can manage the project rather than to whoever created
+    it, requires a stated reason, is audited, and notifies the assignee.
+    Returns (task, error) where error is 'forbidden', 'reason_required',
+    'exceeds_project_deadline', or None.
+
+    Shortening is allowed. The old rule only let a deadline move outwards,
+    which meant the single most common real correction -- "this was scheduled
+    optimistically, pull it in" -- had no route through the product at all.
+    """
+    if not await user_can_manage_project(user, task.project):
         return None, 'forbidden'
-    if new_deadline <= task.deadline:
-        return None, 'not_an_extension'
-    if new_deadline >= task.project.deadline:
+    if not reason or not reason.strip():
+        return None, 'reason_required'
+    if new_deadline > task.project.deadline:
         return None, 'exceeds_project_deadline'
+    if new_deadline == task.deadline:
+        return task, None
+
     old_deadline = task.deadline
     task.deadline = new_deadline
     await task.asave(update_fields=['deadline', 'updated_at'])
-    await sync_to_async(notify_task_deadline_extended, thread_sensitive=True)(task, old_deadline, new_deadline)
+    await arecord_event(
+        company=task.project.company, actor=user, action=AuditAction.TASK_DEADLINE_CHANGED, target=task,
+        before={'deadline': old_deadline}, after={'deadline': new_deadline}, reason=reason.strip(),
+    )
+    await sync_to_async(notify_task_deadline_changed, thread_sensitive=True)(
+        task, old_deadline, new_deadline, reason.strip(),
+    )
     return task, None
 
 
-async def extend_project_deadline(user, project, new_deadline):
-    """Project-creator-only, extend-only -- see extend_task_deadline above
-    for the matching task-level action. Returns (project, error) where
-    error is 'forbidden', 'not_an_extension', or None."""
-    if not await user_can_extend_deadline(user, project):
+async def change_project_deadline(user, project, new_deadline, *, reason):
+    """Move a project's deadline, in either direction.
+
+    Returns (result, error). On 'tasks_exceed_deadline' the result is the list
+    of tasks that would be left past the new date, so the caller can show them
+    and let someone fix them inline -- the same shape remove_member uses for
+    its blockers. Otherwise the result is the project. Other errors are
+    'forbidden' and 'reason_required'.
+
+    Shortening is blocked only by the task invariant, never by direction.
+    """
+    if not await user_can_manage_project(user, project):
         return None, 'forbidden'
-    if new_deadline <= project.deadline:
-        return None, 'not_an_extension'
+    if not reason or not reason.strip():
+        return None, 'reason_required'
+    if new_deadline == project.deadline:
+        return project, None
+
+    if new_deadline < project.deadline:
+        offending = [
+            task async for task in
+            project.tasks.filter(is_deleted=False, deadline__gt=new_deadline).order_by('deadline')
+        ]
+        if offending:
+            return offending, 'tasks_exceed_deadline'
+
     old_deadline = project.deadline
     project.deadline = new_deadline
     await project.asave(update_fields=['deadline', 'updated_at'])
-    await sync_to_async(notify_project_deadline_extended, thread_sensitive=True)(project, old_deadline, new_deadline)
+    await arecord_event(
+        company=project.company, actor=user, action=AuditAction.PROJECT_DEADLINE_CHANGED, target=project,
+        before={'deadline': old_deadline}, after={'deadline': new_deadline}, reason=reason.strip(),
+    )
+    await sync_to_async(notify_project_deadline_changed, thread_sensitive=True)(
+        project, old_deadline, new_deadline, reason.strip(),
+    )
     return project, None
 
 
@@ -1119,11 +1174,10 @@ def persist_ai_generated_tasks(generation):
             title=row.title, description=row.description, priority=row.priority, sequence=row.sequence,
             estimated_time=_parse_estimated_effort(row.estimated_effort), assigned_to=assignee,
             created_by=generation.requested_by, source=Task.SOURCE.AI_GENERATED,
-            # Must be strictly before the project's own deadline (see
-            # create_task/update_task's matching validation for
-            # manually-created tasks) -- an hour's buffer is a safe default
-            # a human can extend later via extend_task_deadline.
-            deadline=project.deadline - timedelta(hours=1),
+            # The project's own deadline. The invariant is inclusive, so a
+            # generated task may land exactly on it -- no buffer, and nothing
+            # for a human to correct afterwards.
+            deadline=project.deadline,
         ))
 
     with transaction.atomic():

@@ -61,8 +61,12 @@ class TaskRejectIn(Schema):
     comment: str = Field(min_length=1, max_length=2000)
 
 
-class DeadlineExtendIn(Schema):
+class DeadlineChangeIn(Schema):
     deadline: datetime
+    # Required, and validated as non-blank server-side too. A deadline moving
+    # under the people doing the work is exactly the change that needs to
+    # carry an explanation with it.
+    reason: str
 
 
 class TimeLogIn(Schema):
@@ -416,23 +420,25 @@ async def list_task_approvals(request, task_id: UUID):
 
 
 @router.post(
-    '/tasks/{task_id}/extend-deadline/', auth=auth,
+    '/tasks/{task_id}/change-deadline/', auth=auth,
     response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
 )
-async def extend_task_deadline(request, task_id: UUID, data: DeadlineExtendIn):
+async def change_task_deadline(request, task_id: UUID, data: DeadlineChangeIn):
     task, error = await services.get_task_for_user(request.auth, task_id)
     if error == 'not_found':
         return payload('Task not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this task.', 403, False)
-    updated, error = await services.extend_task_deadline(request.auth, task, data.deadline)
+    updated, error = await services.change_task_deadline(
+        request.auth, task, data.deadline, reason=data.reason,
+    )
     if error == 'forbidden':
-        return payload('Only the project creator can extend a task deadline.', 403, False)
-    if error == 'not_an_extension':
-        return payload('The new deadline must be later than the current one.', 400, False)
+        return payload('You do not have permission to change this deadline.', 403, False)
+    if error == 'reason_required':
+        return payload('A reason is required when changing a deadline.', 400, False)
     if error == 'exceeds_project_deadline':
-        return payload("The task's deadline must remain before the project's deadline.", 400, False)
-    return payload('Task deadline extended.', 200, True, {'task': await task_data(updated)})
+        return payload("A task's deadline cannot fall after the project's deadline.", 400, False)
+    return payload('Task deadline changed.', 200, True, {'task': await task_data(updated)})
 
 
 # --------------------------------------------------------------------------

@@ -15,9 +15,9 @@ it, and the audit log has to exist before the mutations that record through it.
 |---|---|---|
 | WP1 | Characterization suite + permission inventory (§10, prerequisite) | **done** |
 | WP2 | `AuditEvent` + `record_event()` (§10) | **done** |
-| WP3 | `resolve_project_access`, `ProjectMembership`, collaborator migration (§10) | |
-| WP4 | Company context returns a membership; Owner backfill (§10) | |
-| WP5 | Deadlines: `<=`, AI buffer removal, MANAGE + reason + audit; late submission (§2) | |
+| WP3 | `resolve_project_access` extracted, behaviour-preserving (§10) | **done** |
+| WP4 | ProjectMembership and the four access levels (§10) | **done** |
+| WP5 | Deadlines: `<=`, AI buffer removal, MANAGE + reason + audit; late submission (§2) | **done** |
 | WP6 | `ApprovalRequest`; visibility escalation and the public gate (§1, §10) | |
 | WP7 | Task field-level authority; task proposals; break-into-steps (§2) | |
 | WP8 | Task dependencies — `blocks` / `relates_to` (§2) | |
@@ -31,7 +31,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP16 | To-dos: timezone, eligibility, supersede semantics (§9) | |
 | WP17 | Plans, `Entitlements`, `UsageCounter`, enforcement (§11) | |
 | WP18 | Integration seams (§12) | |
-| WP19 | `docs/DECISIONS.md` (§13) | |
+| WP19 | `docs/DECISIONS.md` (§13) | **done** |
 | WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | |
 
 ---
@@ -236,6 +236,113 @@ other predicates that newly touch `.company` (`user_can_approve_task`,
 
 This is the argument for the resolver in one paragraph: eight predicates each
 deciding independently what they need loaded is how that class of bug gets in.
+
+---
+
+## WP4 — ProjectMembership and the four access levels
+
+**What changed.** Visibility now grants discovery and nothing else. Anything
+beyond VIEW is named explicitly, per person, on a `ProjectMembership` row
+(viewer / contributor / manager, one per person per project, DB-constrained).
+
+The resolver implements the full model: Owner/CM, a DL of the project's own
+department, `current_owner` and a manager membership grant MANAGE; a
+contributor membership or **being assigned a live task** grants CONTRIBUTE; a
+viewer membership, a visibility match, or `created_by` grants VIEW.
+
+**Judgment calls.**
+
+1. **`created_by` drops from MANAGE to VIEW.** It is permanent, immutable
+   provenance — it records who started the project, which is worth keeping
+   forever, but it is not a claim on the project and could never be taken away
+   from someone who should no longer have it. Nothing in the suite broke,
+   because `create_project` also sets `current_owner`; what actually changes is
+   that transferring ownership away now genuinely removes the old creator's
+   grip.
+2. **An assignment is itself a grant.** Somebody with MANAGE decided this
+   person should do this task, and they cannot do it without reaching the
+   project. Live tasks only.
+3. **The backfill has two halves and the second is the important one.**
+   Collaborators become contributor rows. But every project's `created_by` also
+   gets an explicit manager membership — without it, every project run by the
+   person who created it would silently lose its manager the moment this ships.
+   Idempotent; the reverse only removes rows it could have created.
+4. **`Project.collaborators` is deprecated, not dropped.** Kept for one
+   release, dual-written by a single transactional function so the two stores
+   cannot drift. Only contributor rows are touched: a viewer or manager grant
+   was made deliberately and is not the collaborator field's to remove.
+5. **The matrix fixture was restructured.** A membership row and a task
+   assignment live in the database and cannot be simulated by mutating an
+   instance. Now 1440 rows over membership role × relation × assignee.
+
+**Deferred.** The members panel (frontend) and the endpoints to grant and
+revoke memberships — WP7 and WP20. The backfill plus dual-write means nothing
+regresses in the meantime.
+
+---
+
+## WP5 — Deadlines and late submission
+
+**What changed.** §2's deadline decisions, in one package because they are one
+story: the deadline rules were built around protecting a date rather than
+recording what happened to it.
+
+- The task/project invariant is now **inclusive** (`<=`). A task may land
+  exactly on the project deadline.
+- **The AI's one-hour buffer is deleted.** It existed only so generated tasks
+  would satisfy the strict inequality; they now land on the real date with
+  nothing for a human to correct afterwards.
+- A new task's deadline **defaults to the project deadline** instead of being
+  required.
+- Deadline changes belong to **whoever can manage the project**, move in either
+  direction, **require a stated reason**, and are audited through
+  `record_event`.
+- Shortening is blocked only by the task invariant, and returns **409 with the
+  offending tasks** so the UI can list them and let someone fix them inline.
+- **Late submission is allowed and flagged** (`TaskApproval.submitted_late` /
+  `late_by`); every other submission guard is unchanged.
+- A project deadline change now notifies **everyone holding a live task**, not
+  only the current owner.
+
+**Judgment calls.**
+
+1. **Lateness is recorded on the approval, not the task.** A task can be
+   submitted late, rejected, and resubmitted on time; both facts are true of
+   their own attempt. Overdue stays a derived state — no status value, no extra
+   Kanban column.
+2. **The reason is required, and it travels.** Widening who may move a deadline
+   needs a counterweight; a date changing under the people doing the work with
+   no explanation is what makes a deadline feel arbitrary. The reason goes into
+   the audit row *and* into the notification.
+3. **`extend-deadline` became `change-deadline`.** A breaking API change, taken
+   rather than keeping a name that describes half of what the endpoint does.
+   The frontend needs the new path plus a required `reason` field.
+4. **`Notification.Type.DEADLINE_EXTENDED` keeps its stored value.** The label
+   now reads "Deadline Changed" and the message says which way it moved.
+   Changing the stored value would need a data migration over existing
+   notifications for no user-visible benefit.
+5. **Shortening returns the blockers, following `remove_member`'s existing
+   convention** of returning a blockers payload alongside its error rather than
+   inventing a new response shape.
+
+**Tests.** The old deadline test class encoded the rules this reverses, so it
+was rewritten rather than patched: manager-can, current-owner-can (the case the
+old rule got wrong), CM-can, unrelated-member-cannot, reason required, pulling
+in allowed, equality allowed, one second past refused, shortening returns the
+blocking tasks, the change is audited with its reason, and assignees are
+notified. Four characterization expectations moved from `KNOWN DEFECT` to
+`FIXED`, each with the reasoning in its docstring.
+
+Also added a test that re-checks the submission guards this package did **not**
+touch. Removing one guard is exactly the moment another quietly goes.
+
+**One test artifact worth recording.** `refresh_from_db()` clears cached
+relations, so a later `task.project` lazy-loaded inside the event loop and
+raised `SynchronousOnlyOperation` — the same class of failure as WP3a's, in a
+test this time. Fixed by re-fetching with `select_related`, not by making the
+service defensively prefetch: the async service layer expects its objects to
+arrive loaded, exactly as the routers supply them, and hiding that requirement
+would just move the failure somewhere less obvious.
 
 ---
 

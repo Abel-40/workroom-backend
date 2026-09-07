@@ -213,29 +213,57 @@ def notify_task_rejected(approval):
     )
 
 
-def notify_task_deadline_extended(task, old_deadline, new_deadline):
-    """Tells the assignee their task's deadline moved."""
+def _deadline_direction(old_deadline, new_deadline):
+    return 'moved out' if new_deadline > old_deadline else 'pulled in'
+
+
+def notify_task_deadline_changed(task, old_deadline, new_deadline, reason=''):
+    """Tells the assignee their task's deadline moved, which way, and why.
+
+    The reason is included deliberately. A date changing under someone with no
+    explanation is the thing that makes a deadline feel arbitrary, and the
+    reason is now required at the point of change.
+    """
     if task.assigned_to_id is None:
         return
+    direction = _deadline_direction(old_deadline, new_deadline)
+    message = f"New deadline: {new_deadline.isoformat()}."
+    if reason:
+        message = f"{message} Reason: {reason}"
     _create(
         task.assigned_to, Notification.Type.DEADLINE_EXTENDED,
-        f"Deadline extended for '{task.title}'",
-        message=f"New deadline: {new_deadline.isoformat()}.",
+        f"Deadline {direction} for '{task.title}'",
+        message=message,
         related_object_type='task', related_object_id=task.id,
     )
 
 
-def notify_project_deadline_extended(project, old_deadline, new_deadline):
-    """Tells the project's current owner (the person accountable for
-    delivery day-to-day) its deadline moved."""
-    if project.current_owner_id is None:
-        return
-    _create(
-        project.current_owner, Notification.Type.DEADLINE_EXTENDED,
-        f"Deadline extended for '{project.title}'",
-        message=f"New deadline: {new_deadline.isoformat()}.",
-        related_object_type='project', related_object_id=project.id,
-    )
+def notify_project_deadline_changed(project, old_deadline, new_deadline, reason=''):
+    """Tells the project's current owner and everyone holding a live task on
+    it that the project's deadline moved.
+
+    Notifying only the owner was wrong: a project deadline moving is precisely
+    the event that changes what the people doing the work have to do, and they
+    were the ones not being told.
+    """
+    direction = _deadline_direction(old_deadline, new_deadline)
+    message = f"New deadline: {new_deadline.isoformat()}."
+    if reason:
+        message = f"{message} Reason: {reason}"
+
+    recipients = {}
+    if project.current_owner_id is not None:
+        recipients[project.current_owner_id] = project.current_owner
+    for task in project.tasks.filter(is_deleted=False, assigned_to__isnull=False).select_related('assigned_to'):
+        recipients.setdefault(task.assigned_to_id, task.assigned_to)
+
+    for recipient in recipients.values():
+        _create(
+            recipient, Notification.Type.DEADLINE_EXTENDED,
+            f"Deadline {direction} for '{project.title}'",
+            message=message,
+            related_object_type='project', related_object_id=project.id,
+        )
 
 
 def notify_project_auto_completed(project):
