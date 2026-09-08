@@ -137,14 +137,95 @@ class ProjectMembership(UUIDModel):
         return f'{self.user_id} on {self.project_id} ({self.role})'
 
 
+class ApprovalRequest(UUIDModel):
+    """One person asks, one person decides -- for any kind of ask.
+
+    Workroom kept growing one-off request models, starting with
+    ``ProjectVisibilityRequest``. Each brought its own status field, its own
+    reviewer resolution, its own pending-uniqueness rule and its own
+    notifications, and each had to be found and understood separately. This is
+    the single shape: what is being asked (``kind``), about what (``target``),
+    by whom, for whose decision, and what came of it.
+
+    The payload is a JSON field rather than columns because the *ask* differs
+    per kind while the workflow does not -- a visibility escalation carries a
+    target visibility, a workload override carries the limit being exceeded.
+    What is deliberately **not** in the payload is the decision's effect: when
+    a request is approved, a service applies it through the same validated path
+    a direct action would take. Approving never writes state straight from the
+    payload, so a stale or malformed one cannot become a change nobody checked.
+    """
+
+    class Kind(models.TextChoices):
+        PROJECT_VISIBILITY = 'project_visibility', 'Project visibility change'
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        DENIED = 'denied', 'Denied'
+
+    company = models.ForeignKey('company.Company', on_delete=models.CASCADE, related_name='approval_requests')
+    kind = models.CharField(max_length=32, choices=Kind.choices)
+    # Loose reference, same convention as AuditEvent and Notification: the
+    # target may be archived or deleted, and the request should still read.
+    target_type = models.CharField(max_length=64)
+    target_id = models.UUIDField()
+    payload = models.JSONField(default=dict, blank=True)
+
+    requested_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='approval_requests', null=True)
+    # Resolved once, at creation, using each kind's own fallback chain, so a
+    # request is never left with nobody able to act on it. Advisory rather than
+    # exclusive: anyone with authority over the target may decide it, which is
+    # what stops a request dying because one named person is on holiday.
+    reviewer = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name='approval_requests_to_review', null=True, blank=True,
+    )
+
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    decided_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name='decided_approval_requests', null=True, blank=True,
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_comment = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        constraints = [
+            # One open ask per (kind, target). Two pending requests to publish
+            # the same project is not a state anyone can reason about, and
+            # letting them accumulate is how a reviewer ends up approving one
+            # that a second, later request already superseded.
+            models.UniqueConstraint(
+                fields=['kind', 'target_type', 'target_id'],
+                condition=models.Q(status='pending'),
+                name='one_pending_approval_request_per_target',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'status', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.kind} on {self.target_type}:{self.target_id} ({self.status})'
+
+
 class ProjectVisibilityRequest(UUIDModel):
-    """A Department Member's request to raise a private project to
-    department visibility -- see projects_and_tasks.services
+    """DEPRECATED -- superseded by ApprovalRequest(kind="project_visibility").
+
+    A Department Member's request to raise a private project to department
+    visibility -- see projects_and_tasks.services
     .request_visibility_change/approve_visibility_request/deny_visibility_request.
     Company-level visibility is deliberately out of a DM's reach through this
     workflow: only a Department Leader (or Owner/CM) may raise a project to
     company visibility, done directly via the ordinary project-update
-    endpoint, not through a request/approval cycle."""
+    endpoint, not through a request/approval cycle.
+
+    Rows were copied onto ApprovalRequest in migration 0014. The table is kept
+    for one release rather than dropped -- dropping a populated table is not a
+    reversible operation and this one is still written by the endpoints above.
+    Move those endpoints onto ApprovalRequest, then remove this model.
+    """
 
     class STATUS(models.TextChoices):
         PENDING = 'pending', 'Pending'

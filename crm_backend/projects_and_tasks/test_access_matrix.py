@@ -493,38 +493,76 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
         self.assertEqual(error, 'invalid_status', 'a task already In Review was submitted again')
 
     def test_a_public_project_is_readable_by_a_member_of_another_company(self):
-        """KNOWN DEFECT (decision sec.1): ``public`` short-circuits the company
-        check entirely, so any authenticated user of any tenant can read the
-        project by id -- and a Department Member can set that visibility. The
-        transition moves behind Owner/CM plus a company flag."""
+        """STANDS BY DESIGN (was the reading half of D7): ``public`` still
+        short-circuits the company check, because that is what ``public`` means.
+        What changed is who can put a project into that state -- see
+        ``test_managing_a_project_no_longer_lets_you_publish_it``. Pinned here so
+        that if the read path ever narrows, it narrows deliberately."""
         self.project.visibility = Project.VISIBILITY.PUBLIC
         self.assertTrue(async_to_sync(services.user_can_view_project)(self.stranger, self.project))
 
-    def test_a_department_member_can_publish_a_project_they_manage(self):
-        """KNOWN DEFECT (decision sec.1): the only thing stopping a DM here is
-        update_project's visibility lock; a DM who owns the project through any
-        other route is not blocked from ``public`` by anything else."""
+    def test_managing_a_project_no_longer_lets_you_publish_it(self):
+        """FIXED (was D7, the setting half): being able to manage a project used
+        to be the whole test for publishing it, so anyone who reached MANAGE by
+        any route could put it outside the tenant boundary.
+
+        A Department Leader still manages this project -- that is unchanged, and
+        asserted here so the refusal is known to come from the visibility gate
+        rather than from a loss of access. ``public`` now needs the company to
+        allow it at all, which is checked before the caller's role."""
         self.assertTrue(async_to_sync(services.user_can_manage_project)(self.dl, self.project))
-        updated, error = async_to_sync(services.update_project)(
+        _, error = async_to_sync(services.update_project)(
             self.dl, self.project, {'visibility': Project.VISIBILITY.PUBLIC},
         )
-        self.assertIsNone(error)
-        self.assertEqual(updated.visibility, Project.VISIBILITY.PUBLIC)
+        self.assertEqual(error, 'public_projects_disabled')
+        self.project.refresh_from_db()
+        self.assertNotEqual(self.project.visibility, Project.VISIBILITY.PUBLIC)
+
+    def test_even_with_the_company_flag_on_a_department_leader_cannot_publish(self):
+        """The second half of the same gate. With the flag on, the role check is
+        reached -- and stops at Owner/CM, so a DL managing the project is still
+        refused. Both halves have to hold or the gate is only advisory."""
+        self.company.allow_public_projects = True
+        self.company.save(update_fields=['allow_public_projects'])
+        # can_set_visibility reads the flag off the project's company, so the
+        # project has to be re-fetched rather than carrying a stale cached one.
+        project = Project.objects.select_related('company', 'department').get(id=self.project.id)
+        _, error = async_to_sync(services.update_project)(
+            self.dl, project, {'visibility': Project.VISIBILITY.PUBLIC},
+        )
+        self.assertEqual(error, 'visibility_locked')
 
     def grant(self, user, role):
         return ProjectMembership.objects.create(project=self.project, user=user, role=role)
 
-    def test_a_department_member_cannot_change_visibility_even_when_they_manage(self):
-        """The DM visibility lock lives inline in update_project rather than in
-        a predicate, so it is invisible to the generated matrix.
+    def test_a_department_member_who_manages_may_now_move_it_inside_the_department(self):
+        """FIXED (decision sec.1): the old blanket lock refused a Department
+        Member every visibility change, in either direction. ``private`` and
+        ``department`` both keep the project inside the department that already
+        owns the work, so there is nothing there for a higher role to decide,
+        and refusing it meant a DM could not even reduce the exposure of a
+        project they were accountable for.
 
-        The membership is what makes this test meaningful now. It used to reach
-        the lock by making the DM ``created_by``, which granted MANAGE; that
-        route is gone, so without an explicit manager grant the DM is refused
-        earlier with ``forbidden`` and the lock itself is never exercised."""
+        The membership is what makes this test meaningful. It used to reach the
+        lock by making the DM ``created_by``, which granted MANAGE; that route
+        is gone, so without an explicit manager grant the DM is refused earlier
+        with ``forbidden`` and the visibility rule is never exercised."""
         self.grant(self.dm, ProjectMembership.Role.MANAGER)
         _, error = async_to_sync(services.update_project)(
             self.dm, self.project, {'visibility': Project.VISIBILITY.PRIVATE},
+        )
+        self.assertIsNone(error)
+
+    def test_a_department_member_still_cannot_take_it_company_wide(self):
+        """What the blanket lock was actually protecting, kept as its own rule:
+        leaving the department is a Department Leader's call at minimum."""
+        self.grant(self.dm, ProjectMembership.Role.MANAGER)
+        # The fixture project starts company-wide, and a no-op is not a
+        # transition -- it has to come back down before the escalation is real.
+        self.project.visibility = Project.VISIBILITY.DEPARTMENT
+        self.project.save(update_fields=['visibility'])
+        _, error = async_to_sync(services.update_project)(
+            self.dm, self.project, {'visibility': Project.VISIBILITY.COMPANY},
         )
         self.assertEqual(error, 'visibility_locked')
 

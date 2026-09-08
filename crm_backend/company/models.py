@@ -38,6 +38,14 @@ class Company(UUIDModel):
         related_name='companies',
     )
     
+    # Whether anyone in this company may set a project to `public`, which puts
+    # it outside the tenant boundary and readable by any authenticated user.
+    # Off by default, and deliberately a company-level switch rather than a
+    # per-project permission: publishing is a decision about the company's own
+    # exposure, so it should be made once, by someone who owns that risk,
+    # rather than implicitly by whoever happens to manage a project.
+    allow_public_projects = models.BooleanField(default=False)
+
     # Subscription-related fields
     plan = models.ForeignKey(Plan, on_delete=models.SET_NULL, null=True, blank=True)
     stripe_customer_id = models.CharField(max_length=255, blank=True, null=True)

@@ -290,6 +290,19 @@ async def create_project(user, *, title, description, visibility, priority, star
         # afterward through request_visibility_change (department) or a
         # Department Leader/Owner/CM raising it directly (company). See A7.
         visibility = Project.VISIBILITY.PRIVATE
+    elif visibility == Project.VISIBILITY.PUBLIC:
+        # Creation is the other way into `public`, and it has to answer to the
+        # same gate as the transition. Checked against the company here since
+        # there is no project yet to check against.
+        if not company.allow_public_projects:
+            return None, 'public_projects_disabled'
+        if role not in VISIBILITY_ESCALATION_ROLES[Project.VISIBILITY.PUBLIC]:
+            return None, 'visibility_locked'
+    elif visibility == Project.VISIBILITY.DEPARTMENT and department_id is None:
+        # Same rule as the transition: department visibility with no department
+        # is visible to nobody. Refused here too so the two ways into the state
+        # cannot disagree.
+        return None, 'department_required'
     department, error = await _resolve_department(company, department_id)
     if error:
         return None, error
@@ -319,14 +332,12 @@ async def update_project(user, project, updates: dict):
         # and stays fixed afterward too -- only Owner/CM may move a project
         # to a different department post-creation.
         return None, 'department_locked'
-    if (
-        'visibility' in updates and role == CompanyUserProfile.Role.DEPARTMENT_MEMBER
-        and updates['visibility'] != project.visibility
-    ):
-        # A DM can't change visibility directly at all, even downward --
-        # only request_visibility_change (department) or a Department
-        # Leader/Owner/CM acting directly (company) may move it. See A7.
-        return None, 'visibility_locked'
+    visibility_change = None
+    if 'visibility' in updates and updates['visibility'] != project.visibility:
+        allowed, error = await can_set_visibility(user, project, updates['visibility'])
+        if not allowed:
+            return None, error
+        visibility_change = (project.visibility, updates['visibility'])
     was_done = project.status == Project.STATUS.DONE
     if 'status' in updates:
         new_status = updates['status']
@@ -357,6 +368,12 @@ async def update_project(user, project, updates: dict):
         if field in PROJECT_UPDATABLE_FIELDS:
             setattr(project, field, value)
     await project.asave()
+    if visibility_change is not None:
+        before, after = visibility_change
+        await arecord_event(
+            company=project.company, actor=user, action=AuditAction.PROJECT_VISIBILITY_CHANGED, target=project,
+            before={'visibility': before}, after={'visibility': after},
+        )
     if collaborators is not None:
         await _set_collaborators(project, collaborators, actor=user)
     if project.status == Project.STATUS.DONE and not was_done:
@@ -399,6 +416,73 @@ async def _can_review_visibility_request(user, project) -> bool:
         own_department_id = await get_member_department_id(user, project.company)
         return own_department_id == project.department_id
     return False
+
+
+# --------------------------------------------------------------------------
+# Visibility transitions
+# --------------------------------------------------------------------------
+# Visibility decides who can *find* a project. Three of the four levels keep
+# it inside the company; `public` does not, which is why it is the only one
+# with a gate of its own.
+
+VISIBILITY_ESCALATION_ROLES = {
+    # Anyone who can manage the project may move it between private and
+    # department: both stay inside the department that already owns the work.
+    Project.VISIBILITY.PRIVATE: None,
+    Project.VISIBILITY.DEPARTMENT: None,
+    # Company-wide exposure is a department leader's call at minimum.
+    Project.VISIBILITY.COMPANY: (
+        CompanyUserProfile.Role.Owner,
+        CompanyUserProfile.Role.COMPANY_MANAGER,
+        CompanyUserProfile.Role.DEPARTMENT_LEADER,
+    ),
+    # Outside the tenant boundary. Owner or CM only, and only when the company
+    # has switched it on.
+    Project.VISIBILITY.PUBLIC: (
+        CompanyUserProfile.Role.Owner,
+        CompanyUserProfile.Role.COMPANY_MANAGER,
+    ),
+}
+
+
+async def can_set_visibility(user, project, target_visibility) -> tuple[bool, str | None]:
+    """Whether ``user`` may move ``project`` to ``target_visibility``.
+
+    Returns ``(allowed, error)``. Separate from ``user_can_manage_project``
+    because managing a project and deciding how far outside itself that
+    project is visible are genuinely different questions: the second is about
+    the company's exposure, not the project's work.
+    """
+    if target_visibility == project.visibility:
+        return True, None
+
+    if target_visibility == Project.VISIBILITY.PUBLIC and not project.company.allow_public_projects:
+        # Checked before the role, so the message a Department Member sees is
+        # "this company does not publish projects" rather than "you personally
+        # may not" -- the first is true and actionable, the second implies
+        # asking someone more senior would help when it would not.
+        return False, 'public_projects_disabled'
+
+    if target_visibility == Project.VISIBILITY.DEPARTMENT and not project.department_id:
+        # `department` visibility resolves through the project's own department
+        # (see access.resolve_project_access). With none set it grants view to
+        # nobody, so the project would read as shared to everyone looking at it
+        # while behaving exactly like `private`. Refuse rather than create a
+        # state whose label and behaviour disagree.
+        return False, 'department_required'
+
+    allowed_roles = VISIBILITY_ESCALATION_ROLES.get(target_visibility)
+    if allowed_roles is None:
+        return True, None
+
+    role = await get_company_role(user, project.company)
+    if role not in allowed_roles:
+        return False, 'visibility_locked'
+    if role == CompanyUserProfile.Role.DEPARTMENT_LEADER:
+        own_department_id = await get_member_department_id(user, project.company)
+        if not project.department_id or own_department_id != project.department_id:
+            return False, 'visibility_locked'
+    return True, None
 
 
 async def request_visibility_change(user, project, target_visibility):
@@ -470,12 +554,26 @@ async def approve_visibility_request(user, request):
     project = request.project
     if not await _can_review_visibility_request(user, project):
         return None, 'forbidden'
+    # The reviewer's own authority is re-checked against the target, not
+    # inherited from the request. A request records what someone asked for; it
+    # never authorizes the change on its own, so a request created when the
+    # rules were looser cannot be approved into a state the rules now forbid.
+    allowed, error = await can_set_visibility(user, project, request.requested_visibility)
+    if not allowed:
+        return None, error
+
     request.status = ProjectVisibilityRequest.STATUS.APPROVED
     request.decided_by = user
     request.decided_at = timezone.now()
     await request.asave(update_fields=['status', 'decided_by', 'decided_at'])
+    previous_visibility = project.visibility
     project.visibility = request.requested_visibility
     await project.asave(update_fields=['visibility'])
+    await arecord_event(
+        company=project.company, actor=user, action=AuditAction.PROJECT_VISIBILITY_CHANGED, target=project,
+        before={'visibility': previous_visibility}, after={'visibility': project.visibility},
+        reason=f'Approved request {request.id}',
+    )
     await sync_to_async(notify_visibility_approved, thread_sensitive=True)(request)
     return request, None
 

@@ -127,10 +127,12 @@ a named characterization test.
 | Location | Rule |
 |---|---|
 | `update_project` (`services.py:275`) | DL/DM may never change `department_id` — `department_locked` |
-| `update_project` (`services.py:281`) | DM may never change `visibility`, even downward — `visibility_locked` |
+| ~~`update_project` (`services.py:281`)~~ | ~~DM may never change `visibility`, even downward — `visibility_locked`~~ **Replaced in WP6** by `can_set_visibility`, which is a named function rather than an inline gate: `private` ↔ `department` needs only MANAGE (and a department), `company` needs a DL of that department at minimum, `public` needs Owner/CM plus `Company.allow_public_projects`. |
 | `update_project` (`services.py:295`) | only `created_by` may reopen a `Done` project — `forbidden_revert` |
 | `create_project` (`services.py:246`) | DL/DM are locked to their own department |
 | `create_project` (`services.py:251`) | a DM's project is forced to `private` regardless of the requested visibility |
+| `create_project` / `can_set_visibility` (WP6) | `public` needs `Company.allow_public_projects` **and** Owner/CM; `company` needs a DL of that department at minimum; `department` needs the project to have one — `public_projects_disabled`, `visibility_locked`, `department_required` |
+| `update_company_settings` (`company/services.py`) | Owner only — resolved through `get_owned_company`, deliberately narrower than `get_managed_company` |
 | `create_task` (`services.py:589`) | no new tasks on a `Done` project |
 | `create_task`/`assign_task` (`services.py:611,724`) | DL/DM assignment is restricted to `list_eligible_assignees` |
 | `submit_task_for_approval` (`services.py:829`) | assignee only, `In Progress` only, no pending approval, evidence required, **deadline not passed** |
@@ -213,7 +215,7 @@ it. None are fixed by the extraction itself.
 | D4 | Deadline changes are extend-only | §2: shortening allowed unless it breaks the task invariant |
 | D5 | `task.deadline` must fall **strictly** before `project.deadline` — the reason the AI generator carries a one-hour buffer hack | §2: `<=`, buffer deleted |
 | D6 | A task cannot be submitted for approval once its deadline has passed, so a late task can never reach Done | §2: allow late, flag with `submitted_late`/`late_by` |
-| D7 | `public` visibility short-circuits the company check, so any authenticated user of any tenant can read the project by id — and any manager, including a DM managing their own project, can set it | §1: Owner/CM only, behind `allow_public_projects`, audited |
+| D7 | `public` visibility short-circuits the company check, so any authenticated user of any tenant can read the project by id — and ~~any manager, including a DM managing their own project, can set it~~ | **FIXED in WP6** (the setting half). `can_set_visibility` gates `public` on `Company.allow_public_projects` *and* Owner/CM, from both the create and the update path, and audits the change. The reading half is not a defect and is left: `public` short-circuiting the company check is what `public` means. Existing public projects stay public — the gate applies to new transitions, and migration 0014 logs the affected rows for review. |
 | D8 | Anyone who can view a project can read — and a project manager can delete — another user's AI Assistant conversation | §5: private by default, explicit sharing, delete-others endpoint removed |
 | D9 | `list_projects_for_user` and `user_can_view_project` disagree: a creator sees a project by id that never appears in their list | §10: one resolver, one queryset derived from it |
 | D10 | ~~Neither `user_can_manage_task` (on `created_by`) nor `user_can_manage_project` (on `current_owner`) performs any company check before granting rights~~ | **FIXED in WP3a.** Every predicate resolves membership before consulting any per-project reference. The case that made it more than theoretical: removal from a company leaves `created_by` intact as provenance, so a removed member kept view over projects they had created. `public` is still checked before membership, deliberately. |

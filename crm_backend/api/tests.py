@@ -536,9 +536,29 @@ class ProjectSecurityTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_public_project_visible_across_companies(self):
+        """What `public` means is unchanged -- it is the one visibility that
+        crosses the tenant boundary. What changed is getting there: the company
+        has to allow public projects at all before an Owner or CM can create
+        one, so the flag is switched on here rather than the creation being
+        silently refused."""
+        self.company_a.allow_public_projects = True
+        self.company_a.save(update_fields=['allow_public_projects'])
         project = self.create_project(owner=self.owner_a, visibility='public')
         response = self.client.get(f"/api/v1/projects/{project['id']}/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 200)
+
+    def test_a_public_project_cannot_be_created_while_the_company_disallows_it(self):
+        """The other half of the same rule, kept next to it: without the flag
+        the creation is refused outright rather than quietly downgraded."""
+        response = self.client.post(
+            '/api/v1/projects/',
+            json.dumps({
+                'title': 'Website Revamp', 'visibility': 'public',
+                'deadline': (timezone.now() + timedelta(days=365)).isoformat(),
+            }),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 403, response.content)
 
     def test_only_manager_can_update_project(self):
         project = self.create_project(owner=self.owner_a)

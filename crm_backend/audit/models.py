@@ -49,6 +49,7 @@ class AuditAction(models.TextChoices):
     MEMBER_DEACTIVATED = 'member.deactivated', 'Member deactivated'
     MEMBER_REACTIVATED = 'member.reactivated', 'Member reactivated'
     MEMBER_REMOVED = 'member.removed', 'Member removed'
+    COMPANY_SETTINGS_CHANGED = 'company.settings_changed', 'Company settings changed'
 
 
 class AppendOnly(Exception):

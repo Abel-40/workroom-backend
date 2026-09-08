@@ -106,7 +106,7 @@ async def project_data(project: Project) -> dict:
     }
 
 
-@router.post('/', auth=auth, response={201: ApiResponse, 400: ApiResponse})
+@router.post('/', auth=auth, response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse})
 async def create_project(request, data: ProjectIn):
     project, error = await services.create_project(
         request.auth,
@@ -141,6 +141,22 @@ async def create_project(request, data: ProjectIn):
         return payload(
             "Your department is fixed to your own -- you can't create a project in another department.", 400, False,
             errors={'department_id': ['Must be your own department']},
+        )
+    if error == 'public_projects_disabled':
+        return payload(
+            'This company does not allow public projects. Public projects are readable by anyone with the '
+            'link, including people outside the company, so the Owner has to switch it on first.',
+            403, False,
+        )
+    if error == 'visibility_locked':
+        return payload(
+            'Only a Company Manager or the Owner can create a public project.', 403, False,
+        )
+    if error == 'department_required':
+        return payload(
+            'A project with no department cannot use department visibility -- nobody would be able to '
+            'see it. Give the project a department first.', 400, False,
+            errors={'visibility': ['Project has no department']},
         )
     return payload('Project created successfully.', 201, True, {'project': await project_data(project)})
 
@@ -208,8 +224,21 @@ async def update_project(request, project_id: UUID, data: ProjectUpdateIn):
         )
     if error == 'visibility_locked':
         return payload(
-            'Department Members cannot change project visibility directly -- request department visibility '
-            'instead, or ask your Department Leader to raise it.', 403, False,
+            'You do not have permission to set that visibility. Company-wide visibility is set by a '
+            'Department Leader, Company Manager or the Owner; public visibility by a Company Manager or '
+            'the Owner.', 403, False,
+        )
+    if error == 'public_projects_disabled':
+        return payload(
+            'This company does not allow public projects. Public projects are readable by anyone with the '
+            'link, including people outside the company, so the Owner has to switch it on first.',
+            403, False,
+        )
+    if error == 'department_required':
+        return payload(
+            'A project with no department cannot use department visibility -- nobody would be able to '
+            'see it. Give the project a department first.', 400, False,
+            errors={'visibility': ['Project has no department']},
         )
     return payload('Project updated successfully.', 200, True, {'project': await project_data(updated)})
 
@@ -465,6 +494,21 @@ async def approve_visibility_request(request, request_id: UUID):
         return payload('Only this project\'s department leader (or Owner/CM) may review this request.', 403, False)
     if error == 'not_pending':
         return payload('This request has already been decided.', 400, False)
+    # approve_visibility_request re-checks the reviewer against the target, so it
+    # can refuse a request that was legal when it was filed -- a project whose
+    # department was cleared since, or a visibility the current rules no longer
+    # let this reviewer set. Without these branches the refusal fell through to
+    # the success line and returned 200 with a None request.
+    if error in ('visibility_locked', 'public_projects_disabled'):
+        return payload(
+            'You can no longer approve this request: the visibility it asks for is not one you may '
+            'set on this project today. Deny it instead.', 403, False,
+        )
+    if error == 'department_required':
+        return payload(
+            'This project no longer has a department, so it cannot be given department visibility. '
+            'Give it a department, or deny the request.', 400, False,
+        )
     return payload('Visibility request approved.', 200, True, {'request': _visibility_request_data(updated)})
 
 

@@ -6,6 +6,7 @@ from a client-supplied ``company_id``. Centralized here so every endpoint
 that needs "which company may this user manage" resolves it the same way.
 """
 
+from audit.services import AuditAction, arecord_event
 from users.models import CompanyUserProfile
 
 from company.models import Company
@@ -129,3 +130,68 @@ def is_company_member_sync(user, company: Company) -> bool:
     if company.owner_id == user.id:
         return True
     return CompanyUserProfile.objects.filter(user=user, company=company, is_active=True).exists()
+
+
+# --------------------------------------------------------------------------
+# Company settings
+# --------------------------------------------------------------------------
+# Settings that change what the company as a whole permits, as opposed to the
+# per-resource permissions in projects_and_tasks.access. There is one so far.
+
+COMPANY_SETTINGS_FIELDS = ('allow_public_projects',)
+
+
+async def get_company_settings(user):
+    """Returns (company, error) where error is 'not_found' or None.
+
+    Readable by any active member, not just the Owner: the project form has to
+    know whether `public` is on the menu before it offers it, and a member who
+    could not read the setting would meet the refusal only after filling the
+    form in.
+    """
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'not_found'
+    return company, None
+
+
+async def update_company_settings(user, updates: dict):
+    """Returns (company, error) where error is 'forbidden' or None.
+
+    Owner-only, and deliberately narrower than :func:`get_managed_company`,
+    which also admits Company Managers and department leaders.
+    ``allow_public_projects`` decides whether this company's work can leave the
+    tenant boundary at all -- that is a statement about the company's own
+    exposure, so it belongs to the one person accountable for it rather than to
+    everyone who can administer the company.
+    """
+    company = await get_owned_company(user)
+    if company is None:
+        return None, 'forbidden'
+
+    before, after = {}, {}
+    for field in COMPANY_SETTINGS_FIELDS:
+        if updates.get(field) is None:
+            # Absent and explicitly null both mean "not being set". The schema
+            # types these as optional so a PATCH naming one setting does not
+            # reset the others, and `None` is that absence -- writing it would
+            # put a null in a non-nullable column.
+            continue
+        current = getattr(company, field)
+        if updates[field] == current:
+            continue
+        before[field] = current
+        after[field] = updates[field]
+        setattr(company, field, updates[field])
+
+    if not after:
+        # A no-op write is not a change, and recording one would put rows in the
+        # audit log that say nothing happened.
+        return company, None
+
+    await company.asave(update_fields=list(after))
+    await arecord_event(
+        company=company, actor=user, action=AuditAction.COMPANY_SETTINGS_CHANGED, target=company,
+        before=before, after=after,
+    )
+    return company, None

@@ -18,7 +18,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP3 | `resolve_project_access` extracted, behaviour-preserving (§10) | **done** |
 | WP4 | ProjectMembership and the four access levels (§10) | **done** |
 | WP5 | Deadlines: `<=`, AI buffer removal, MANAGE + reason + audit; late submission (§2) | **done** |
-| WP6 | `ApprovalRequest`; visibility escalation and the public gate (§1, §10) | |
+| WP6 | `ApprovalRequest`; visibility escalation and the public gate (§1, §10) | **done** |
 | WP7 | Task field-level authority; task proposals; break-into-steps (§2) | |
 | WP8 | Task dependencies — `blocks` / `relates_to` (§2) | |
 | WP9 | `ProjectBrief` and brief-assisted creation (§1) | |
@@ -343,6 +343,159 @@ test this time. Fixed by re-fetching with `select_related`, not by making the
 service defensively prefetch: the async service layer expects its objects to
 arrive loaded, exactly as the routers supply them, and hiding that requirement
 would just move the failure somewhere less obvious.
+
+---
+
+## WP6 — Visibility escalation, the public gate, and one shape for approvals
+
+**What changed.** §1's visibility decisions. Visibility decides who can *find*
+a project; three of its four levels keep the project inside the company and one
+does not, and until now all four were guarded by the same rule.
+
+- **`can_set_visibility` is the one place a visibility transition is decided.**
+  `update_project` no longer carries an inline role check, and both the direct
+  path and the approval path go through it.
+- **`public` is gated twice**: `Company.allow_public_projects` must be on, and
+  the caller must be Owner or Company Manager. Off by default.
+- **`company` visibility needs a Department Leader at minimum**, and a DL only
+  for a project in their *own* department.
+- **`private` ↔ `department` is ungated** beyond ordinary project management.
+- **Creation answers to the same gate.** Asking for `public` in the create call
+  is checked against the company, since there is no project yet to check.
+- **`department` visibility requires the project to have a department**, on both
+  the create and the update path.
+- **Every visibility change is audited** through `record_event`, from both
+  paths, with before and after.
+- **`ApprovalRequest`** replaces the pattern `ProjectVisibilityRequest` started.
+  Rows are migrated (0014); the old model is marked deprecated and its table
+  kept.
+- **`GET`/`PATCH /company/settings/`** — the Owner's switch for
+  `allow_public_projects`. Readable by any member, writable only by the Owner,
+  audited under a new `company.settings_changed` action.
+
+**Judgment calls.**
+
+1. **The public gate is a company switch, not a permission.** Publishing is a
+   decision about the company's own exposure, so it is made once by someone who
+   owns that risk rather than implicitly by whoever happens to manage a project.
+   A per-project permission would have put the decision in the hands of the
+   person with the least context about it.
+2. **The flag is checked before the role**, so a Department Member sees "this
+   company does not publish projects" rather than "you personally may not". The
+   first is true and actionable; the second implies that asking someone more
+   senior would help, when it would not.
+3. **Lowering visibility is never gated.** Gating it would mean a project could
+   get stuck published — the failure mode worth avoiding is the one where
+   reducing exposure requires a meeting.
+4. **Existing public projects stay public.** `allow_public_projects` defaults to
+   off, but silently unpublishing a project someone is actively sharing would be
+   a worse surprise than leaving it. The gate applies to *new* transitions; 0014
+   logs the affected rows at WARNING for review at deploy time.
+5. **Approving re-checks the reviewer against the target.** A request records
+   what someone asked for; it never authorizes the change on its own. A request
+   created when the rules were looser cannot be approved into a state the rules
+   now forbid.
+6. **`ApprovalRequest.payload` is JSON, and never applied directly.** The *ask*
+   differs per kind while the workflow does not. Approving runs the same
+   validated service a direct action would, so a stale or malformed payload
+   cannot become a change nobody checked.
+7. **The reviewer is advisory, not exclusive.** Resolved once at creation so a
+   request is never left with nobody able to act on it, but anyone with
+   authority over the target may decide it — which is what stops a request dying
+   because one named person is on holiday.
+8. **The Owner's switch is narrower than every other admin endpoint.**
+   `update_company_settings` resolves through `get_owned_company`, not
+   `get_managed_company` — the latter also admits Company Managers and
+   department leaders. Publishing decides whether the company's work can leave
+   the company, so it stops at the one person accountable for that. Reading the
+   setting is open to any member, because the project form has to know whether
+   `public` is on the menu before it offers it.
+
+**Three gaps found while finishing the package.** All three were in the code as
+first written, and each is the kind that a green test suite does not catch:
+
+1. **The gate had no key.** `allow_public_projects` was read by
+   `can_set_visibility` and written by nothing — no endpoint, no admin path. The
+   403 told the user "the Owner has to switch it on first" while `public` was in
+   fact unreachable for every company, permanently. Hence
+   `/company/settings/`, and `test_switching_it_on_is_what_makes_a_project_publishable`,
+   which asserts the whole loop rather than either end of it.
+2. **`department` visibility with no department.** `VISIBILITY_ESCALATION_ROLES`
+   maps `department` to `None`, meaning ungated, so a project with no department
+   could be moved there — and `resolve_project_access` guards on
+   `project.department_id`, so the result granted view to nobody. The project
+   read as shared while behaving exactly like `private`. The prompt says
+   "must have a department"; now both paths enforce it.
+3. **The approval refusal returned 200.** Judgment call 5 added error returns to
+   `approve_visibility_request`, but the router mapped only `forbidden` and
+   `not_pending`. The new refusals fell through to the success line and rendered
+   a `None` request. Reachable: an Owner can clear a project's department while a
+   request against it is pending. Both refusals are now mapped, with a test that
+   drives exactly that sequence.
+
+**A rule this deliberately reverses.** A Department Member could previously
+never change visibility directly, even downward. They now can, for
+`private` ↔ `department`, when they manage the project — and since
+`create_project` sets `current_owner=user`, a DM managing their own project is
+the common case. That makes `request_visibility_change` largely redundant for
+the case it was written for. It is retained and still correct: it serves a DM
+who *created* a project but does not manage it, which after WP4 is a real state
+(`created_by` grants VIEW, not MANAGE).
+
+**Deferred.** The visibility-request endpoints still write
+`ProjectVisibilityRequest`, not `ApprovalRequest`. Moving them is a router and
+service change with its own tests, and doing it in this package would have mixed
+a data-model migration with an API change. The model docstring records the order:
+move the endpoints, then drop the table.
+
+**Also worth recording.** 0014's `already` guard compares `(target_id,
+created_at)`, but `ApprovalRequest.created_at` is `auto_now_add`, so a backfilled
+row never carries the original timestamp and the guard cannot match. It is
+unreachable in practice — Django records migration completion, and `backwards`
+deletes what `forwards` wrote — but it reads as protection it does not provide.
+Left as-is rather than churning an already-tested migration; noted so it is not
+trusted later.
+
+**Tests.** `projects_and_tasks/test_visibility.py`, 23: the flag refuses
+`public` while off; Owner and CM can publish once on; a DL cannot publish even
+when allowed; a DM cannot publish a project they manage; the refusal message
+names the company rule, not the caller's rank; creating as `public` answers to
+the same gate; a DL can take their own department's project company-wide but not
+another's; a DM cannot; `private` ↔ `department` needs only management; lowering
+is never gated; every change is audited; a refused change and a no-op change
+each write no audit row; another company cannot touch visibility; the flag is
+read from the project's company, not the caller's; approval re-checks authority;
+approval is audited; a departmentless project is refused `department` visibility
+on both paths and writes no audit row; and approving a request whose project lost
+its department is a clean 400 rather than a 200 over a `None`.
+
+`company/test_settings.py`, 11: any member reads, only the Owner writes — a
+Company Manager and a Department Member are both refused; someone with no
+company gets a 404; another company's Owner writes only their own company; an
+absent field and an explicit `null` both leave the setting alone; the change is
+audited with both sides and a no-op records nothing; and the end-to-end loop —
+refused, switched on, accepted.
+
+**Two characterization expectations moved from `KNOWN DEFECT` to `FIXED`**, each
+rewritten with the reasoning rather than deleted, and each split in two because
+the new rule is two rules:
+`test_a_department_member_can_publish_a_project_they_manage` became "managing no
+longer lets you publish" plus "even with the flag on, a DL still cannot"; and
+`test_a_department_member_cannot_change_visibility_even_when_they_manage` became
+"a DM who manages may now move it inside the department" plus "still cannot take
+it company-wide". `test_a_public_project_is_readable_by_a_member_of_another_company`
+keeps its assertion and gets a new docstring: the read half of D7 stands by
+design, and is pinned so that narrowing it would be deliberate.
+
+`api/tests.py::test_public_project_visible_across_companies` needed the same
+treatment for a different reason: it asserts what `public` *means*, which is
+unchanged, but it got there by creating a public project — now refused while the
+company disallows it. The flag is switched on in the test, and the refusal it
+used to depend on implicitly is now asserted on purpose in a test beside it.
+
+Full suite: **609 passed, 1 failed** — `AIHealthSummarySecurityTests::
+test_rate_limit_boundary`, which needs a real Redis and fails identically on
+`main`. That is the known baseline, not a regression.
 
 ---
 

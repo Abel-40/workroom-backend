@@ -39,6 +39,7 @@ from .routers.activity import router as activity_router
 from .routers.ai import router as ai_router
 from .routers.analytics import router as analytics_router
 from .routers.company_config import router as company_config_router
+from .routers.company_settings import router as company_settings_router
 from .routers.departments import router as departments_router
 from .routers.documents import router as documents_router
 from .routers.event_types import router as event_types_router
@@ -89,6 +90,7 @@ api.add_router('/event-types', event_types_router)
 api.add_router('/company/members', members_router)
 api.add_router('/activity', activity_router)
 api.add_router('/company/default-config', company_config_router)
+api.add_router('/company/settings', company_settings_router)
 
 payload = api_response
 logger = logging.getLogger(__name__)
