@@ -35,7 +35,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP19 | `docs/DECISIONS.md` (§13) | **done** |
 | WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | |
 | WP21 | Owner-with-no-membership backfill, then delete every "owner might have no profile" branch (§10) | **done** |
-| WP22 | Company context returns the membership, accepts an explicit company id (§10) | |
+| WP22 | Company context returns the membership, accepts an explicit company id (§10) | **done** |
 | WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | |
 
 Three rows were added to this table on 2026-09-08, after a read-back against
@@ -812,6 +812,60 @@ true of the synthesized placeholder row. All four rewritten with the history in
 their docstrings.
 
 Full suite: **696 passed, 1 failed** in 8m39s -- the Redis one.
+
+---
+
+## WP22 — Company context resolves to a membership
+
+Every resolver in `company/services.py` answered "which company", which quietly
+assumed the answer was unique. It is today -- nothing in the product joins a
+second company -- but the assumption sat in every call site rather than in one,
+and the `User`/`CompanyUserProfile` split exists precisely so it would not have
+to hold forever (§13).
+
+`resolve_company_context(user, company_id=None) -> CompanyContext | None` states
+it once, and returns the membership row alongside the company.
+
+### The id is a selector, not a grant
+
+This is the part worth being careful about, because taking a `company_id` from
+a caller looks exactly like the thing NON-NEGOTIABLE RULE 1 forbids.
+
+It is not the same thing: the id chooses **among the caller's own
+memberships**, and resolves to `None` for anything else. A company the caller
+does not belong to, a deactivated membership, and an id matching nothing all
+produce the same answer -- indistinguishable, so the parameter cannot be used
+to probe which companies exist. Four tests pin exactly that.
+
+Nothing passes an id today, so this changes no behaviour. It means a future
+company switcher does not require touching every call site again.
+
+### `membership`, not just `role`
+
+Callers that have the context almost always want more from it than the role:
+the department now, the notification preference already, capacity when §3
+lands. WP21 is what makes this clean -- every owner holds a membership row, so
+the context can always carry one rather than having a hole in it exactly where
+the most privileged user is.
+
+`department_id` is the one derived field, and it returns `None` for the owner
+whatever their profile says, matching `get_member_department_id`.
+
+### One fallback implementation, and it is now deterministic
+
+`get_member_company` delegates rather than keeping a second copy of the
+ownership-first-then-membership rule. Its contract is unchanged and a test
+pins all three cases.
+
+One quiet fix on the way through: the old `.afirst()` had no `order_by`, so a
+user holding two memberships got whichever row the database chose. Not
+reachable through the product, but it would have been the first thing to go
+wrong the day it was. The fallback is now the oldest membership, explicitly.
+
+**20 tests** in `company/test_company_context.py`.
+
+Full suite: **716 passed, 1 failed** in 8m10s -- the Redis one. No stale
+expectations, which is the result a behaviour-preserving change should have.
 
 ---
 
