@@ -48,21 +48,17 @@ async def get_company_stats(company) -> dict:
     task_count = await tasks.acount()
     completed_tasks = await tasks.filter(status=Task.STATUS.DONE).acount()
 
-    # A company registered since register_company started creating an Owner
-    # profile row has the owner counted in profile_count already; a company
-    # that predates that (no CompanyUserProfile row for its owner) needs the
-    # +1 so the owner still gets counted. See get_company_workload below for
-    # the same fallback applied to the actual member list.
-    profile_count = await CompanyUserProfile.objects.filter(company=company).acount()
-    owner_has_profile = await CompanyUserProfile.objects.filter(
-        company=company, user_id=company.owner_id,
-    ).aexists()
+    # Every company has a profile row for its owner -- created with the
+    # company at registration, and backfilled for older ones in users
+    # migration 0008 -- so the roster is simply the profile count. This used
+    # to carry a +1 for owners who had no row.
+    member_count = await CompanyUserProfile.objects.filter(company=company).acount()
 
     return {
         'project_count': project_count,
         'active_projects': active_projects,
         'completed_projects': completed_projects,
-        'member_count': profile_count if owner_has_profile else profile_count + 1,
+        'member_count': member_count,
         'task_count': task_count,
         'completed_tasks': completed_tasks,
     }
@@ -108,31 +104,12 @@ async def get_company_workload(company) -> list[dict]:
             'in_review_count': in_review,
         }
 
-    owner = await User.objects.aget(id=company.owner_id)
-    owner_has_profile = await CompanyUserProfile.objects.filter(
-        company=company, user_id=owner.id,
-    ).aexists()
-
+    # The owner is in here like everybody else: their profile row is created
+    # with the company, and backfilled for older companies in users migration
+    # 0008. This used to synthesize a placeholder row for owners who had none,
+    # which meant the one person who could not be left off the roster was the
+    # one assembled by different code from everyone else.
     members = []
-    if not owner_has_profile:
-        # Legacy company that predates register_company always creating an
-        # Owner profile row -- synthesize a placeholder so it still shows up.
-        # A company registered since then has a real row and is picked up
-        # naturally by the loop below instead.
-        members.append({
-            'id': str(owner.id),
-            'first_name': owner.first_name,
-            'last_name': owner.last_name,
-            'username': owner.username,
-            'email': owner.email,
-            'role': CompanyUserProfile.Role.Owner,
-            'department': None,
-            'profession': None,
-            'profile_picture_url': None,
-            'is_active': True,
-            **workload_fields(str(owner.id)),
-        })
-
     profiles = CompanyUserProfile.objects.filter(company=company).select_related('user', 'department')
     async for profile in profiles:
         profile_picture_url = (
@@ -157,8 +134,10 @@ async def get_company_workload(company) -> list[dict]:
             **workload_fields(str(profile.user_id)),
         })
 
-    # Owner listed first regardless of which branch produced their row.
-    members.sort(key=lambda m: m['id'] != str(owner.id))
+    # Owner listed first. Read straight off the company rather than fetching
+    # the User -- the row itself now comes from the same loop as everyone
+    # else's, so all this needs is the id to sort by.
+    members.sort(key=lambda m: m['id'] != str(company.owner_id))
     return members
 
 

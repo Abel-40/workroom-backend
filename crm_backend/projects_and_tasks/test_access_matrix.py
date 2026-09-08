@@ -86,12 +86,16 @@ class AccessWorldMixin:
     def build_world(cls):
         sector = Sector.objects.create(name='Software')
 
-        # The company owner deliberately has no CompanyUserProfile row: that
-        # is the legacy shape the codebase still special-cases in several
-        # places, and the matrix has to record how it behaves before any
-        # backfill changes it.
+        # The owner holds an Owner-role profile like every other member.
+        # This world originally withheld it on purpose, to characterize the
+        # legacy shape before the backfill; users migration 0008 removed that
+        # shape, so keeping it here would pin behaviour the system can no
+        # longer reach.
         cls.owner = User.objects.create_user(email='owner@example.com', username='owner', password=PASSWORD)
         cls.company = Company.objects.create(name='Company A', owner=cls.owner, sector=sector)
+        CompanyUserProfile.objects.create(
+            user=cls.owner, company=cls.company, role=CompanyUserProfile.Role.Owner,
+        )
         cls.dept_match = Department.objects.create(name='Engineering', company=cls.company)
         cls.dept_other = Department.objects.create(name='Marketing', company=cls.company)
 
@@ -107,7 +111,10 @@ class AccessWorldMixin:
         cls.stranger = User.objects.create_user(
             email='stranger@example.com', username='stranger', password=PASSWORD,
         )
-        Company.objects.create(name='Company B', owner=cls.stranger, sector=sector)
+        other_company = Company.objects.create(name='Company B', owner=cls.stranger, sector=sector)
+        CompanyUserProfile.objects.create(
+            user=cls.stranger, company=other_company, role=CompanyUserProfile.Role.Owner,
+        )
 
     @classmethod
     def _member(cls, name, role, department):

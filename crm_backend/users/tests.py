@@ -367,7 +367,9 @@ class MemberDetailTests(TwoCompanyTestCase):
         data = response.json()['data']['member']
         self.assertEqual(data['role'], CompanyUserProfile.Role.Owner)
         self.assertIsNone(data['department_name'])
-        self.assertIsNone(data['profession'])
+        # The owner holds a real profile now (users migration 0008), so this
+        # reads the model default rather than the None of having no row at all.
+        self.assertEqual(data['profession'], 'Not provided')
 
     def test_outsider_cannot_view_member_detail(self):
         outsider = User.objects.create_user(email='outsider@example.com', username='outsider', password='Kx9#mQ2vLp8Z')

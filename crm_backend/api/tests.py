@@ -40,6 +40,14 @@ class TwoCompanyTestCase(TestCase):
             email='owner-a@example.com', username='owner-a', password='Kx9#mQ2vLp8Z',
         )
         self.company_a = Company.objects.create(name='Company A', owner=self.owner_a, sector=sector)
+        # Every company has an Owner-role profile for its owner: created with
+        # the company at registration, and backfilled for older companies in
+        # users migration 0008. Fixtures that omitted it were building a shape
+        # the system no longer produces, and the code that used to paper over
+        # it -- a synthesized roster row, a +1 on the member count -- is gone.
+        CompanyUserProfile.objects.create(
+            user=self.owner_a, company=self.company_a, role=CompanyUserProfile.Role.Owner,
+        )
         self.department_a = Department.objects.create(name='Engineering', company=self.company_a)
         self.member_a = User.objects.create_user(
             email='member-a@example.com', username='member-a', password='Kx9#mQ2vLp8Z',
@@ -53,6 +61,9 @@ class TwoCompanyTestCase(TestCase):
             email='owner-b@example.com', username='owner-b', password='Kx9#mQ2vLp8Z',
         )
         self.company_b = Company.objects.create(name='Company B', owner=self.owner_b, sector=sector)
+        CompanyUserProfile.objects.create(
+            user=self.owner_b, company=self.company_b, role=CompanyUserProfile.Role.Owner,
+        )
 
     def create_project(self, owner=None, **overrides):
         # Deadline defaults far in the future so any reasonably-future task
@@ -2049,10 +2060,19 @@ class SelfServiceProfileTests(TwoCompanyTestCase):
         db_profile = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
         self.assertEqual(db_profile.phone_number, 'Not provided')
 
-    def test_owner_with_no_profile_row_gets_no_profile_error(self):
+    def test_the_owner_has_a_profile_like_everybody_else(self):
+        """This used to assert the opposite -- that fetching your own profile
+        as the company owner returned a 400, because the owner existed as
+        Company.owner and nowhere else. That was the defect, not the contract:
+        it also kept the owner off the member roster, out of the assignable
+        pool, and without a notification preference."""
         response = self.client.get('/api/v1/company/members/me/profile/', **auth_header(self.owner_a))
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()['message'], 'The company owner has no profile.')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertIn('profession', response.json()['data']['profile'])
+        self.assertEqual(
+            CompanyUserProfile.objects.get(user=self.owner_a, company=self.company_a).role,
+            CompanyUserProfile.Role.Owner,
+        )
 
     def test_upload_resume_accepts_pdf(self):
         resume = SimpleUploadedFile('cv.pdf', b'%PDF-1.4 fake', content_type='application/pdf')

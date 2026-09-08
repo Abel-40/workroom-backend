@@ -34,7 +34,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP18 | Integration seams (§12) | |
 | WP19 | `docs/DECISIONS.md` (§13) | **done** |
 | WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | |
-| WP21 | Owner-with-no-membership backfill, then delete every "owner might have no profile" branch (§10) | |
+| WP21 | Owner-with-no-membership backfill, then delete every "owner might have no profile" branch (§10) | **done** |
 | WP22 | Company context returns the membership, accepts an explicit company id (§10) | |
 | WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | |
 
@@ -90,7 +90,10 @@ Two artifacts:
 4. **The matrix world gives the company owner no `CompanyUserProfile`.** That
    is the legacy shape the Owner-backfill work removes, so the baseline has to
    record how it behaves first. Expect this baseline to move when the backfill
-   lands.
+   lands. **It did not** -- see WP21. `company_standing()` short-circuits on
+   ownership before reading any profile row, so the access layer never depended
+   on the row existing. The prediction was wrong in a useful way: it located the
+   defect as a roster problem rather than a permission one.
 
 **Deferred.** Nothing.
 
@@ -722,6 +725,93 @@ person who filed it. The 400 says to create it directly.
 Full suite: **685 passed, 1 failed** in 7m48s -- the failure is the Redis
 one. Only one stale expectation turned up, and it was the D1 KNOWN DEFECT
 test, rewritten to assert the opposite as D2 was in WP7a.
+
+---
+
+## WP21 — Every owner is a member
+
+Companies created before `register_company_in_transaction` started writing an
+Owner-role `CompanyUserProfile` had their owner exist as `Company.owner` and
+nowhere else. Everything that built a list of people from `CompanyUserProfile`
+therefore omitted the one person who could not be omitted, and each place grew
+its own compensation:
+
+- `get_company_stats` added `+1` to the member count when the owner had no row.
+- `get_company_workload` **synthesized a placeholder roster entry** for them --
+  the one person guaranteed to be in every company was assembled by different
+  code from everybody else.
+- `_should_email` read `None` for their notification preference and defaulted
+  to enabled, so an owner could not turn company email off.
+- Four member endpoints returned "The company owner has no profile."
+
+Users migration `0008` backfills the missing rows and all of that goes.
+
+### The migration adds, never edits
+
+It inserts only for companies with no row for their owner. An owner who already
+holds a profile at an unexpected role -- reachable through ownership transfer --
+is left alone and logged at WARNING. Demoting or promoting somebody is a
+decision, not a data fix, and a migration is the worst possible place to make
+one silently.
+
+`backwards` is deliberately a no-op: the rows it creates are indistinguishable
+from the ones registration writes, and deleting an owner's membership would
+strip their notification preferences and take them off the roster -- exactly the
+breakage this exists to fix.
+
+### The fixtures were building an impossible world
+
+`TwoCompanyTestCase` and the access-matrix world both created companies with
+`Company.objects.create()` and no owner profile. After this migration that shape
+cannot occur, so every test standing on those fixtures was exercising a state
+the system no longer produces. Both now create the Owner profile.
+
+`test_owner_with_no_profile_row_gets_no_profile_error` asserted the defect
+directly -- that an owner fetching their own profile got a 400. It now asserts
+they get a 200, with the history in its docstring.
+
+### The baseline did not move, and that is the interesting part
+
+WP1 predicted this backfill would shift the access matrix, because the matrix
+world deliberately withheld the owner's profile. Regenerating produced **a zero
+diff**.
+
+The reason is worth recording: `company_standing()` short-circuits on
+`company.owner_id == user.id` before it ever reads a profile row, so the
+permission layer never depended on the row existing. Only the *consumer* sites
+did -- roster, count, pool, preference. The defect was never an access defect;
+it was a "the owner is missing from lists" defect, which is why it showed up as
+four unrelated-looking branches rather than as a permission bug.
+
+### Deliberate deviation: the permission short-circuits stay
+
+§10 says to delete every branch handling "owner might have no profile". The four
+consumer branches are gone. The `company.owner_id == user.id` short-circuits in
+`company/services.py` and `access.py` are **kept**, which is a deviation and is
+deliberate.
+
+They are no longer load-bearing -- with the backfill, resolving through the
+profile row would give the same answer. But they are the only thing standing
+between a missing or inactive owner row and an owner locked out of their own
+company, which is the most destructive failure this system has. Trading a
+guaranteed-correct code path for one guaranteed by data is not a trade worth
+making for the sake of deleting four lines, especially when the same rule
+appears under PRESERVE EXACTLY as "Owner never a valid removal/demotion target".
+
+If they should go, that is a separate decision with its own test pass, not a
+side effect of a backfill.
+
+**11 tests** in `users/test_owner_profile_backfill.py`, covering the backfill
+against a legacy fixture, its idempotency, that it never edits an existing row,
+and each of the four consumer sites now that its branch is gone.
+
+Four stale expectations, all of them pinning the defect rather than a contract:
+an owner fetching their own profile got a 400; an owner had no notification
+preference to set; and two asserted `profession is None`, which was only ever
+true of the synthesized placeholder row. All four rewritten with the history in
+their docstrings.
+
+Full suite: **696 passed, 1 failed** in 8m39s -- the Redis one.
 
 ---
 

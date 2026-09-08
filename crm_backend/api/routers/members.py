@@ -219,10 +219,7 @@ async def update_notification_preference(request, data: NotificationPreferenceIn
     if error == 'forbidden':
         return payload('You do not belong to a company.', 400, False)
     if error == 'no_profile':
-        return payload(
-            'The company owner has no notification preference to update -- critical '
-            'notifications are always delivered.', 400, False,
-        )
+        return payload('You have no membership record in this company.', 400, False)
     return payload(
         'Notification preference updated successfully.', 200, True,
         {'email_notifications_enabled': profile.email_notifications_enabled},
@@ -277,7 +274,7 @@ async def get_own_profile(request):
     if error == 'forbidden':
         return payload('You do not belong to a company.', 400, False)
     if error == 'no_profile':
-        return payload('The company owner has no profile.', 400, False)
+        return payload('You have no membership record in this company.', 400, False)
     return payload('Profile retrieved successfully.', 200, True, {'profile': _profile_fields_data(profile)})
 
 
@@ -290,7 +287,7 @@ async def update_own_profile(request, data: MemberProfileUpdateIn):
     if error == 'forbidden':
         return payload('You do not belong to a company.', 400, False)
     if error == 'no_profile':
-        return payload('The company owner has no profile to update.', 400, False)
+        return payload('You have no membership record in this company.', 400, False)
     return payload('Profile updated successfully.', 200, True, {'profile': _profile_fields_data(profile)})
 
 
@@ -303,7 +300,7 @@ async def upload_own_resume(request, resume: UploadedFile = File(...)):
     if error == 'forbidden':
         return payload('You do not belong to a company.', 400, False)
     if error == 'no_profile':
-        return payload('The company owner has no profile to attach a resume to.', 400, False)
+        return payload('You have no membership record in this company.', 400, False)
     if error == 'too_large':
         return payload('Resume exceeds the maximum allowed size (5MB).', 400, False)
     if error == 'invalid_content_type':

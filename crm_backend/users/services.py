@@ -487,10 +487,13 @@ def remove_member(requester, target_user_id, *, reassign_to_user_id=None):
 async def update_notification_preference(user, email_notifications_enabled: bool):
     """Self-service: a member updates their own email-notification
     preference. Returns (profile, error) where error is 'forbidden' (no
-    company) or 'no_profile' (only reachable for a legacy company whose
-    owner predates register_company always creating an Owner profile row --
-    they always get critical-only behavior, see
-    notifications_and_activity.services._should_email)."""
+    company) or 'no_profile'.
+
+    ``no_profile`` is no longer the company owner: every owner has a profile
+    row, created with the company at registration and backfilled for older
+    companies in users migration 0008. It now means only what it says -- the
+    caller resolves to a company but holds no membership row in it, which
+    should not happen and is reported as a 400 rather than crashed on."""
     company = await get_member_company(user)
     if company is None:
         return None, 'forbidden'
@@ -551,8 +554,8 @@ ALLOWED_RESUME_CONTENT_TYPES = {
 async def get_own_profile(user):
     """Self-service: fetch the caller's own CompanyUserProfile fields, e.g.
     to hydrate a profile-edit form. Returns (profile, error) where error is
-    'forbidden' (no company) or 'no_profile' (the company owner has no
-    profile row), or None."""
+    'forbidden' (no company) or 'no_profile' -- see
+    update_notification_preference for what that now means."""
     company = await get_member_company(user)
     if company is None:
         return None, 'forbidden'
@@ -565,7 +568,8 @@ async def get_own_profile(user):
 async def update_own_profile(user, updates: dict):
     """Self-service: a member updates their own CompanyUserProfile fields.
     Returns (profile, error) where error is 'forbidden' (no company) or
-    'no_profile' (the company owner has no profile row), or None."""
+    'no_profile' -- see update_notification_preference for what that now
+    means."""
     company = await get_member_company(user)
     if company is None:
         return None, 'forbidden'

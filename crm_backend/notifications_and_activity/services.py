@@ -61,7 +61,11 @@ def _should_email(recipient, category: str) -> bool:
     enabled = CompanyUserProfile.objects.filter(user=recipient).values_list(
         'email_notifications_enabled', flat=True,
     ).first()
-    # No profile row -- e.g. the company owner -- defaults to enabled.
+    # None here no longer means "the company owner, who has no row" -- every
+    # owner has one (users migration 0008). It now means the recipient holds no
+    # membership anywhere, which is a user who has been removed from every
+    # company. Defaulting them to enabled is deliberate: the alternative is
+    # silently dropping mail to somebody mid-offboarding.
     return True if enabled is None else enabled
 
 

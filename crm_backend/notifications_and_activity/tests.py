@@ -318,9 +318,17 @@ class NotificationPreferenceTests(TwoCompanyTestCase):
             CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a).email_notifications_enabled,
         )
 
-    def test_owner_has_no_profile_to_update(self):
+    def test_the_owner_can_set_their_own_preference(self):
+        """This asserted a 400 -- the owner had no profile row, so there was
+        nothing to store a preference on and they were permanently opted in to
+        every company email. Every owner has a row now (users migration 0008),
+        so the preference is a real stored value like anyone else's."""
         response = self.set_preference(False, user=self.owner_a)
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertFalse(
+            CompanyUserProfile.objects.get(user=self.owner_a, company=self.company_a)
+            .email_notifications_enabled,
+        )
 
     def test_requires_authentication(self):
         response = self.client.patch(
