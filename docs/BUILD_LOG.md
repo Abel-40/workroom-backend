@@ -20,7 +20,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP5 | Deadlines: `<=`, AI buffer removal, MANAGE + reason + audit; late submission (§2) | **done** |
 | WP6 | `ApprovalRequest`; visibility escalation and the public gate (§1, §10) | **done** |
 | WP7a | Task field-level authority; `created_by` stops granting MANAGE (§2) | **done** |
-| WP7b | Task creation behind MANAGE; task proposals; break-into-steps (§2) | |
+| WP7b | Task creation behind MANAGE; task proposals; break-into-steps (§2) | **done** |
 | WP8 | Task dependencies — `blocks` / `relates_to` (§2) | |
 | WP9 | `ProjectBrief` and brief-assisted creation (§1) | |
 | WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | |
@@ -613,6 +613,101 @@ rejection would tell the recipient something untrue about it.
 Full suite: **635 passed, 1 failed** in 8m41s -- the failure is
 `AIHealthSummarySecurityTests::test_rate_limit_boundary`, which needs a real
 Redis. Known baseline, not a regression.
+
+---
+
+## WP7b — Task creation behind MANAGE, and the route that replaces it
+
+D1 was the last place visibility still conferred a capability. `create_task`
+was gated on `user_can_view_project`, so `company` visibility -- meant to grant
+discovery and nothing else -- let any member of the company add work to any
+project they could find, and choose who it was assigned to.
+
+Fixing it alone would have been a regression, not a fix: contributors would
+have had no way to raise work at all. Creation moving behind MANAGE and the
+"Propose task" flow that replaces it are two halves of one rule, so they land
+in one commit. That is why WP7 was split -- WP7a could stand alone, this
+could not.
+
+### A proposal is an ApprovalRequest, not a draft Task
+
+The tempting shortcut is a `Task` with `status="proposed"`. It does not
+survive contact with the rest of the system: an unaccepted proposal would
+appear on the board, count toward project progress, be assignable, and be
+reachable by every query that already filters tasks by project. Every one of
+those would need a new exclusion, and the first one anybody forgot would be a
+bug nobody noticed.
+
+`ApprovalRequest(kind="task_proposal")` was already the right shape from WP6.
+
+### The pending-uniqueness constraint had to be scoped per kind
+
+WP6 wrote `one_pending_approval_request_per_target` over
+`(kind, target_type, target_id)` where status is pending. Correct for
+visibility -- a project has one visibility, and two pending requests to change
+it is not a state anyone can reason about.
+
+Applied to task proposals it would have been badly wrong: the target is the
+*project*, so exactly one person could hold exactly one proposal open at a
+time, per project. The condition now names the kind it applies to. Whether two
+open asks may coexist is a property of the kind, not of the workflow.
+
+### created_by is the accepting manager, not the proposer
+
+This looks like it loses provenance and does the opposite of WP7a. It is the
+one place the two rules meet.
+
+`created_by` still heads the approval fallback chain in
+`user_can_approve_task`. Setting it to the proposer would make a contributor
+the approver of work they suggested and may well be assigned -- inventing a
+fresh self-approval path in the same package that is trying to close one
+(R5). The proposer is recorded permanently as `requested_by` on the request,
+which is where a proposal's provenance actually belongs.
+
+### Accepting re-validates, and does not trust the payload
+
+`accept_task_proposal` calls `create_task` with the accepting manager as the
+actor rather than writing the payload into the tasks table. This is the rule
+`ApprovalRequest` was designed around and it is load-bearing here: a proposal
+written against one project deadline must not become a task that violates the
+deadline the project has now. Two tests pin it -- one moves the deadline under
+a pending proposal, one writes `assigned_to_id` and `status: Done` directly
+into a stored payload and checks neither reaches the task.
+
+The payload is allow-listed on the way in *and* on the way out. A payload
+written by an older release must not be able to reach `create_task` carrying a
+field this one does not understand.
+
+### Break this into steps
+
+`POST /todos/tasks/{id}/steps/`, capped at 20. This is where most of the
+pressure to let anybody create tasks was actually coming from: "I need to
+track the three things this task breaks into" is a real need, and answering it
+by widening task creation would have put somebody's private working notes on
+the company board.
+
+To-dos were already the right home -- private to one person, invisible to
+every role including the company Owner, outside analytics -- so this is a thin
+batch endpoint over `get_assignable_task` and `create_todo`, and it inherits
+every privacy rule those already have, including the revoked-link behaviour
+when the task is reassigned away.
+
+Steps default to the task's own deadline rather than today, falling back to
+today when that has passed. Today is only the right answer on the last day,
+and a to-do dated in the past sorts above everything and reads as overdue the
+moment it is created.
+
+### Judgment call: a manager proposing gets a 400, not a queued proposal
+
+Accepting it silently would leave a manager's proposal queued for the very
+person who filed it. The 400 says to create it directly.
+
+**34 tests** in `projects_and_tasks/test_task_proposals.py`, **16** in
+`todos/test_task_steps.py`.
+
+Full suite: **685 passed, 1 failed** in 7m48s -- the failure is the Redis
+one. Only one stale expectation turned up, and it was the D1 KNOWN DEFECT
+test, rewritten to assert the opposite as D2 was in WP7a.
 
 ---
 

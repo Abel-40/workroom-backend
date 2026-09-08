@@ -1,0 +1,23 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-amber{% endblock %}
+{% block eyebrow %}Not taken forward{% endblock %}
+{% block heading %}Your proposal was declined{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-amber"><span>&#128172;</span></div>
+
+    <div class="wr-highlight wr-highlight-amber">{{ title }}</div>
+    {# The reviewer's reason, shown in full. A declined proposal whose reason
+       is withheld reads as being ignored, and the proposer is the only
+       audience for this message. #}
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-amber">Open the project</a>
+    </div>
+{% endblock %}

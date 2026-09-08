@@ -27,6 +27,11 @@ TYPE_CATEGORY = {
     # Work you submitted will now never be read, and the task has left your
     # hands -- you would otherwise wait on a review that is not coming.
     Notification.Type.TASK_SUBMISSION_VOIDED: Notification.Category.CRITICAL,
+    # A proposal sitting unreviewed blocks somebody who is trying to raise
+    # work; learning the outcome does not block anything.
+    Notification.Type.TASK_PROPOSED: Notification.Category.CRITICAL,
+    Notification.Type.TASK_PROPOSAL_ACCEPTED: Notification.Category.OPTIONAL,
+    Notification.Type.TASK_PROPOSAL_DECLINED: Notification.Category.OPTIONAL,
     Notification.Type.DEADLINE_EXTENDED: Notification.Category.OPTIONAL,
     Notification.Type.PROJECT_AUTO_COMPLETED: Notification.Category.OPTIONAL,
     # A pending request blocking someone else's work is actionable/time-sensitive;
@@ -234,6 +239,63 @@ def notify_task_submission_voided(approval, recipient, actor):
         f"Your submission for '{task.title}' was closed without review",
         message=f'{actor_name} reassigned the task, so it is no longer waiting on your submission.',
         related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_task_proposed(request, project):
+    """Tells the named reviewer that somebody has suggested a piece of work.
+
+    Only the named reviewer is told, not everyone who could decide it. Anyone
+    with MANAGE may accept a proposal -- that is what stops one person's
+    absence stalling the queue -- but notifying all of them would make a
+    routine suggestion feel like an escalation to the whole management chain.
+    """
+    if request.reviewer_id is None:
+        return
+    from users.models import User
+
+    reviewer = User.objects.filter(id=request.reviewer_id).first()
+    proposer = request.requested_by
+    proposer_name = (proposer.get_full_name() or proposer.email) if proposer else 'Someone'
+    title = request.payload.get('title') or 'a task'
+    _create(
+        reviewer, Notification.Type.TASK_PROPOSED,
+        f"{proposer_name} proposed '{title}' on {project.title}",
+        message='Review it and turn it into a task, or decline it with a reason.',
+        related_object_type='project', related_object_id=project.id,
+    )
+
+
+def notify_task_proposal_accepted(request, task):
+    """Tells the proposer their suggestion is now real work."""
+    if request.requested_by_id is None:
+        return
+    _create(
+        request.requested_by, Notification.Type.TASK_PROPOSAL_ACCEPTED,
+        f"Your proposal '{task.title}' was accepted",
+        message='It is now a task on the board.',
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_task_proposal_declined(request):
+    """Tells the proposer their suggestion was declined.
+
+    The reviewer's comment is included. Unlike a rejected task submission --
+    where the comment is private to the submitter and deliberately withheld
+    from every other read path -- a declined proposal has exactly one audience,
+    the person who wrote it, and withholding the reason would leave them
+    guessing about work they still think needs doing.
+    """
+    if request.requested_by_id is None:
+        return
+    title = request.payload.get('title') or 'your proposal'
+    message = request.decision_comment or 'No reason was given.'
+    _create(
+        request.requested_by, Notification.Type.TASK_PROPOSAL_DECLINED,
+        f"Your proposal '{title}' was declined",
+        message=message,
+        related_object_type='project', related_object_id=request.target_id,
     )
 
 

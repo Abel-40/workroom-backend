@@ -158,6 +158,7 @@ class ApprovalRequest(UUIDModel):
 
     class Kind(models.TextChoices):
         PROJECT_VISIBILITY = 'project_visibility', 'Project visibility change'
+        TASK_PROPOSAL = 'task_proposal', 'Task proposal'
 
     class Status(models.TextChoices):
         PENDING = 'pending', 'Pending'
@@ -192,13 +193,22 @@ class ApprovalRequest(UUIDModel):
     class Meta:
         ordering = ['-created_at']
         constraints = [
-            # One open ask per (kind, target). Two pending requests to publish
-            # the same project is not a state anyone can reason about, and
-            # letting them accumulate is how a reviewer ends up approving one
-            # that a second, later request already superseded.
+            # Whether two open asks may coexist is a property of the *kind*,
+            # not of the workflow, so the condition names the kinds it applies
+            # to rather than covering everything.
+            #
+            # A project has one visibility, so two pending requests to change
+            # it is not a state anyone can reason about, and letting them
+            # accumulate is how a reviewer approves one that a second, later
+            # request already superseded.
+            #
+            # Task proposals are the opposite: the whole point is that several
+            # contributors may each suggest several pieces of work on the same
+            # project at once. A blanket constraint would have let exactly one
+            # person hold a proposal open at a time.
             models.UniqueConstraint(
                 fields=['kind', 'target_type', 'target_id'],
-                condition=models.Q(status='pending'),
+                condition=models.Q(status='pending', kind='project_visibility'),
                 name='one_pending_approval_request_per_target',
             ),
         ]

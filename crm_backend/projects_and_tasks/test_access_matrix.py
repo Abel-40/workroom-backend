@@ -345,14 +345,19 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
             content_type='application/json', **auth_header(actor),
         )
 
-    def test_project_view_is_all_it_takes_to_create_a_task(self):
-        """KNOWN DEFECT (decision sec.2): task creation is gated on
-        user_can_view_project, so company-wide visibility -- which is meant to
-        be discovery only -- hands every member of the company the ability to
-        add work to any project. Task creation moves behind project MANAGE."""
+    def test_creating_a_task_takes_more_than_being_able_to_see_the_project(self):
+        """FIXED (was D1): task creation was gated on user_can_view_project, so
+        company-wide visibility -- meant to be discovery only -- handed every
+        member of the company the ability to add work to any project they could
+        find, and to choose who it was assigned to. It was the last place
+        visibility still conferred a capability.
+
+        The DM here can see this project and cannot manage it, so the 403 is
+        the whole rule in one call. The route that does work for them is
+        POST /projects/{id}/task-proposals/ -- see test_task_proposals.py."""
         response = self.create_task_via_api(self.dm)
-        self.assertEqual(response.status_code, 201)
-        self.assertTrue(Task.objects.filter(project=self.project, created_by=self.dm).exists())
+        self.assertEqual(response.status_code, 403, response.content)
+        self.assertFalse(Task.objects.filter(project=self.project, created_by=self.dm).exists())
 
     def test_managing_a_task_comes_from_the_project_not_from_having_created_it(self):
         """FIXED (was D2): user_can_manage_task short-circuited on

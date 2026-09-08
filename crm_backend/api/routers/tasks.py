@@ -78,6 +78,40 @@ class DeadlineChangeIn(Schema):
     reason: str
 
 
+class TaskProposalIn(Schema):
+    """What a contributor may suggest. Deliberately narrower than TaskIn:
+    there is no `assigned_to_id`, because deciding who does a piece of work is
+    a management act and a proposal is not the place to pre-empt it."""
+
+    title: str = Field(min_length=1, max_length=255)
+    description: str = Field(default='No description provided', max_length=10_000)
+    department_id: UUID | None = None
+    task_type_id: UUID | None = None
+    priority: PriorityLiteral = 'medium'
+    # Optional here, unlike TaskIn: a proposer often knows what needs doing
+    # without knowing when it has to land. Defaults to the project deadline.
+    deadline: datetime | None = None
+    estimated_time_hours: float | None = Field(default=None, gt=0, le=1000)
+
+
+class TaskProposalAcceptIn(Schema):
+    """Corrections a reviewer may apply as they accept. Every field optional:
+    the common case is accepting as proposed, and making a reviewer restate
+    the whole thing to fix one priority is how a queue stops being used."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=10_000)
+    department_id: UUID | None = None
+    task_type_id: UUID | None = None
+    priority: PriorityLiteral | None = None
+    deadline: datetime | None = None
+    estimated_time_hours: float | None = Field(default=None, gt=0, le=1000)
+
+
+class TaskProposalDeclineIn(Schema):
+    comment: str = Field(default='', max_length=2000)
+
+
 class TimeLogIn(Schema):
     hours: float = Field(gt=0, le=24)
     work_date: date | None = None
@@ -147,7 +181,10 @@ async def create_task(request, project_id: UUID, data: TaskIn):
         department_id=data.department_id, task_type_id=data.task_type_id, assigned_to_id=data.assigned_to_id,
     )
     if error == 'forbidden':
-        return payload('You do not have permission to add tasks to this project.', 403, False)
+        return payload(
+            'Adding a task to this project requires permission to manage it. You can propose one instead: '
+            'POST /projects/{id}/task-proposals/.', 403, False,
+        )
     if error == 'invalid_deadline':
         return payload(
             "The task deadline must be before the project's deadline.", 400, False,
@@ -525,3 +562,128 @@ async def list_my_time_logs(
     return payload('Time logs retrieved successfully.', 200, True, {
         'results': [my_time_log_data(log) for log in items], 'meta': meta,
     })
+
+
+# --------------------------------------------------------------------------
+# Task proposals
+# --------------------------------------------------------------------------
+
+def _proposal_data(request) -> dict:
+    proposer = request.requested_by
+    return {
+        'id': str(request.id),
+        'project_id': str(request.target_id),
+        'status': request.status,
+        'payload': request.payload,
+        'requested_by': {
+            'id': str(proposer.id),
+            'name': proposer.get_full_name() or proposer.email,
+        } if proposer else None,
+        'decision_comment': request.decision_comment,
+        'created_at': request.created_at.isoformat(),
+        'decided_at': request.decided_at.isoformat() if request.decided_at else None,
+    }
+
+
+@router.post(
+    '/projects/{project_id}/task-proposals/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def propose_task(request, project_id: UUID, data: TaskProposalIn):
+    """Suggest a task on a project you can contribute to but not manage."""
+    project, error = await services.get_viewable_project(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+
+    fields = data.model_dump(exclude_unset=True)
+    if 'estimated_time_hours' in fields:
+        fields['estimated_time'] = _hours_to_duration(fields.pop('estimated_time_hours'))
+    proposal, error = await services.propose_task(request.auth, project, **fields)
+    if error == 'forbidden':
+        return payload('You do not have permission to propose work on this project.', 403, False)
+    if error == 'can_create_directly':
+        return payload(
+            'You can manage this project, so create the task directly instead of proposing it.', 400, False,
+        )
+    if error == 'project_completed':
+        return payload('This project is marked Done -- reopen it before proposing new work.', 400, False)
+    if error == 'invalid_deadline':
+        return payload(
+            "The proposed deadline must fall on or before the project's deadline.", 400, False,
+            errors={'deadline': ['Must be on or before the project deadline']},
+        )
+    return payload('Task proposed successfully.', 201, True, {'proposal': _proposal_data(proposal)})
+
+
+@router.get(
+    '/projects/{project_id}/task-proposals/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def list_task_proposals(request, project_id: UUID):
+    """Pending proposals. Whoever can manage the project sees all of them;
+    anyone else sees only the ones they filed themselves."""
+    project, error = await services.get_viewable_project(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    queryset, error = await services.list_task_proposals_for_user(request.auth, project)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    proposals = [_proposal_data(item) async for item in queryset]
+    return payload('Task proposals retrieved successfully.', 200, True, {'results': proposals})
+
+
+@router.post(
+    '/task-proposals/{proposal_id}/accept/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def accept_task_proposal(request, proposal_id: UUID, data: TaskProposalAcceptIn):
+    """Turn a proposal into a real task, optionally correcting it first."""
+    proposal, error = await services.get_task_proposal_for_user(request.auth, proposal_id)
+    if error == 'not_found':
+        return payload('Task proposal not found.', 404, False)
+
+    overrides = data.model_dump(exclude_unset=True)
+    if 'estimated_time_hours' in overrides:
+        overrides['estimated_time'] = _hours_to_duration(overrides.pop('estimated_time_hours'))
+    task, error = await services.accept_task_proposal(request.auth, proposal, overrides)
+    if error == 'forbidden':
+        return payload('Only someone who can manage this project may decide its proposals.', 403, False)
+    if error == 'not_pending':
+        return payload('This proposal has already been decided.', 400, False)
+    if error == 'project_gone':
+        return payload('The project this proposal belongs to no longer exists.', 404, False)
+    if error == 'invalid_deadline':
+        return payload(
+            "The proposed deadline no longer fits the project's deadline -- set a new one as you accept.",
+            400, False, errors={'deadline': ['Must be on or before the project deadline']},
+        )
+    if error == 'project_completed':
+        return payload('This project is marked Done -- reopen it before adding new tasks.', 400, False)
+    if error:
+        return payload(
+            'Invalid department or task type for this company.', 400, False,
+            errors={error: ['Invalid value']},
+        )
+    return payload('Task proposal accepted.', 201, True, {'task': await task_data(task)})
+
+
+@router.post(
+    '/task-proposals/{proposal_id}/decline/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def decline_task_proposal(request, proposal_id: UUID, data: TaskProposalDeclineIn):
+    proposal, error = await services.get_task_proposal_for_user(request.auth, proposal_id)
+    if error == 'not_found':
+        return payload('Task proposal not found.', 404, False)
+    declined, error = await services.decline_task_proposal(request.auth, proposal, data.comment)
+    if error == 'forbidden':
+        return payload('Only someone who can manage this project may decide its proposals.', 403, False)
+    if error == 'not_pending':
+        return payload('This proposal has already been decided.', 400, False)
+    if error == 'project_gone':
+        return payload('The project this proposal belongs to no longer exists.', 404, False)
+    return payload('Task proposal declined.', 200, True, {'proposal': _proposal_data(declined)})

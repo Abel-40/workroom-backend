@@ -90,6 +90,66 @@ def list_assigned_tasks(user, company, *, open_only: bool = True):
     return queryset.order_by('deadline', 'created_at')
 
 
+# A single "break this into steps" action. Bounded because this is a private
+# checklist, not a work-breakdown structure: somebody pasting forty lines into
+# it wants a project plan, and the answer to that is a task per item proposed
+# through projects_and_tasks, not forty private notes nobody else can see.
+MAX_STEPS_PER_TASK = 20
+
+
+async def create_steps_for_task(user, company, task, steps, due_date=None):
+    """Break a task the caller is assigned to into private to-dos.
+
+    Returns (todos, error) where error is 'no_steps', 'too_many_steps', or a
+    due-date error code.
+
+    This exists because it is where most of the pressure to let anybody create
+    tasks was actually coming from. "I need to track the three things this
+    task breaks into" is a real need, and answering it by widening task
+    creation would have put somebody's personal working notes on the company
+    board, counted them toward project progress, and made them assignable.
+    To-dos are already the right private home for it.
+
+    The caller is resolved as the assignee by ``get_assignable_task`` before
+    this runs, so no permission check is repeated here. Every row is created
+    for ``user`` -- there is no route to make a to-do for somebody else, and
+    adding one would break the single boundary this app has.
+    """
+    cleaned = [step.strip() for step in steps if step and step.strip()]
+    if not cleaned:
+        return None, 'no_steps'
+    if len(cleaned) > MAX_STEPS_PER_TASK:
+        return None, 'too_many_steps'
+
+    if due_date is None:
+        # The task's own deadline, read in the owner's timezone, is a better
+        # default than "today": the steps are for finishing this task, and
+        # today is only right on the last day. Falls back to today for a task
+        # whose deadline has already passed, since a to-do dated in the past
+        # would sort above everything and read as overdue on arrival.
+        task_day = timezone.localtime(task.deadline).date() if task.deadline else None
+        today = user_today(user)
+        due_date = task_day if task_day and task_day >= today else today
+
+    error = validate_due_date(user, due_date)
+    if error:
+        return None, error
+
+    position = await _next_position(user, due_date)
+    rows = [
+        TodoItem(
+            user=user, company=company, task=task, task_title_snapshot=task.title,
+            title=title[:255], due_date=due_date, position=position + offset,
+            source=TodoItem.SOURCE.MANUAL,
+        )
+        for offset, title in enumerate(cleaned)
+    ]
+    # One statement, so a half-written checklist is not a state the caller can
+    # land in. Ordering within the day is preserved by the position offsets.
+    await TodoItem.objects.abulk_create(rows)
+    return rows, None
+
+
 def task_link_is_live(todo, user) -> bool:
     """Whether the todo's task link should still be exposed.
 

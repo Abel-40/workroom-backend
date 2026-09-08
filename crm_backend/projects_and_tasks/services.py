@@ -7,6 +7,7 @@ any client-supplied company/project/department id at face value.
 
 import re
 from datetime import timedelta
+from uuid import UUID
 
 from asgiref.sync import sync_to_async
 from audit.services import AuditAction, arecord_event
@@ -16,6 +17,7 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from notifications_and_activity.services import (
     log_ownership_transferred,
     log_project_completed,
@@ -29,6 +31,9 @@ from notifications_and_activity.services import (
     notify_task_approved,
     notify_task_assigned,
     notify_task_deadline_changed,
+    notify_task_proposal_accepted,
+    notify_task_proposal_declined,
+    notify_task_proposed,
     notify_task_rejected,
     notify_task_submission_voided,
     notify_task_submitted_for_approval,
@@ -40,8 +45,8 @@ from users.models import CompanyUserProfile
 
 from .access import AccessLevel, resolve_project_access
 from .models import (
-    Attachment, DefaultTaskType, Project, ProjectMembership, ProjectVisibilityRequest, Task, TaskApproval,
-    TaskTimeLog, TaskType,
+    ApprovalRequest, Attachment, DefaultTaskType, Project, ProjectMembership, ProjectVisibilityRequest, Task,
+    TaskApproval, TaskTimeLog, TaskType,
 )
 
 User = get_user_model()
@@ -767,17 +772,25 @@ async def _resolve_assignee(company, assignee_id):
 
 async def create_task(user, project, *, title, description, priority, deadline, estimated_time=None,
                        department_id=None, task_type_id=None, assigned_to_id=None):
-    """Any user who can view the project may add tasks to it (matches a
-    typical shared-project workflow); editing/archiving the task later still
-    requires management rights via user_can_manage_task."""
-    if not await user_can_view_project(user, project):
+    """Add a task to a project. Requires MANAGE.
+
+    Project *view* used to be enough, which meant company visibility -- meant
+    to grant discovery and nothing else -- let any member of the company add
+    work to any project they could find, and decide who it was assigned to.
+    That is D1, and it is the last place visibility still conferred a
+    capability.
+
+    Contributors are not left without a route: propose_task creates an
+    ApprovalRequest that somebody with MANAGE turns into a real task. The two
+    landed together deliberately, because tightening this without the
+    replacement would have removed the ability to raise work at all.
+    """
+    if not await user_can_manage_project(user, project):
         return None, 'forbidden'
     if project.status == Project.STATUS.DONE:
         # A new (necessarily not-Done) task would silently break the "all
-        # tasks Done" invariant Done itself represents, and letting anyone
-        # who can merely view the project add one would be a backdoor around
-        # update_project's creator-only revert-from-Done restriction (B5).
-        # Reopening has to stay that explicit, creator-only action.
+        # tasks Done" invariant Done itself represents. Reopening has to stay
+        # the explicit, creator-only action in update_project (B5).
         return None, 'project_completed'
     if deadline is None:
         # A task that runs to the end of its project is the common case, and
@@ -1035,6 +1048,257 @@ async def archive_task(user, task) -> bool:
     task.is_deleted = True
     await task.asave(update_fields=['is_deleted'])
     return True
+
+
+# --------------------------------------------------------------------------
+# Task proposals
+# --------------------------------------------------------------------------
+# Creating a task requires MANAGE. Everyone else proposes one, and somebody
+# with MANAGE turns the proposal into real work. A proposal is an
+# ApprovalRequest, not a second half-built Task: an unaccepted proposal must
+# not appear on the board, count toward progress, or be assignable, and
+# anything stored in the tasks table eventually does all three.
+
+TASK_PROPOSAL_TARGET_TYPE = 'projects_and_tasks.project'
+
+# What a proposer may put in the payload. Anything else in a submitted payload
+# is dropped rather than stored, so a field that later becomes meaningful
+# cannot be smuggled in early by a client that guessed its name.
+TASK_PROPOSAL_FIELDS = frozenset({
+    'title', 'description', 'priority', 'deadline', 'department_id', 'task_type_id', 'estimated_time',
+})
+
+
+async def _resolve_task_proposal_reviewer(project):
+    """Who is told about a proposal on this project.
+
+    Advisory only -- anyone with MANAGE may decide it. The chain exists so a
+    request is never created with nobody named on it: the accountable owner
+    first, then whoever created the project, then the company owner.
+    """
+    if project.current_owner_id:
+        return await User.objects.filter(id=project.current_owner_id).afirst()
+    if project.created_by_id:
+        return await User.objects.filter(id=project.created_by_id).afirst()
+    return await User.objects.filter(id=project.company.owner_id).afirst()
+
+
+def _serialize_proposal_payload(payload: dict) -> dict:
+    """Reduce a proposal payload to JSON-safe primitives.
+
+    ``deadline`` arrives as a datetime and ``estimated_time`` as a timedelta;
+    both have to survive a round trip through a JSONField and come back as the
+    types create_task expects.
+    """
+    clean = {}
+    for field, value in payload.items():
+        if field not in TASK_PROPOSAL_FIELDS or value is None:
+            continue
+        if isinstance(value, timedelta):
+            clean[field] = value.total_seconds()
+        elif hasattr(value, 'isoformat'):
+            clean[field] = value.isoformat()
+        elif isinstance(value, UUID):
+            clean[field] = str(value)
+        else:
+            clean[field] = value
+    return clean
+
+
+def _deserialize_proposal_payload(payload: dict) -> dict:
+    """The inverse. Unknown keys are dropped here too -- a payload written by
+    an older release must not be able to reach create_task carrying a field
+    this one does not understand."""
+    clean = {}
+    for field, value in payload.items():
+        if field not in TASK_PROPOSAL_FIELDS or value is None:
+            continue
+        if field == 'deadline':
+            parsed = parse_datetime(value) if isinstance(value, str) else value
+            if parsed is not None:
+                clean[field] = parsed
+        elif field == 'estimated_time':
+            clean[field] = timedelta(seconds=float(value))
+        else:
+            clean[field] = value
+    return clean
+
+
+async def propose_task(user, project, **fields):
+    """Suggest a task on a project you can contribute to but not manage.
+
+    Returns (request, error) where error is 'forbidden', 'can_create_directly',
+    'project_completed', 'invalid_deadline', or None.
+
+    Validation happens twice on purpose: here, so a proposal that could never
+    be accepted is refused where somebody can still fix it; and again in
+    accept_task_proposal, because the project may have moved underneath it in
+    the meantime.
+    """
+    access = await resolve_project_access(user, project)
+    if access is None or access < AccessLevel.CONTRIBUTE:
+        return None, 'forbidden'
+    if access >= AccessLevel.MANAGE:
+        # Not a permission failure -- the opposite. Accepting it silently
+        # would leave a manager's proposal queued for the very person who
+        # filed it.
+        return None, 'can_create_directly'
+    if project.status == Project.STATUS.DONE:
+        return None, 'project_completed'
+
+    deadline = fields.get('deadline') or project.deadline
+    if deadline < timezone.now() - PAST_DATE_GRACE or deadline > project.deadline:
+        return None, 'invalid_deadline'
+    fields['deadline'] = deadline
+
+    request = await ApprovalRequest.objects.acreate(
+        company=project.company,
+        kind=ApprovalRequest.Kind.TASK_PROPOSAL,
+        target_type=TASK_PROPOSAL_TARGET_TYPE,
+        target_id=project.id,
+        payload=_serialize_proposal_payload(fields),
+        requested_by=user,
+        reviewer=await _resolve_task_proposal_reviewer(project),
+    )
+    await sync_to_async(notify_task_proposed, thread_sensitive=True)(request, project)
+    return request, None
+
+
+async def get_task_proposal_for_user(user, request_id):
+    """Tenant scoping only -- authority to decide is checked in accept/decline,
+    so a 403 there stays distinguishable from a 404 for something outside the
+    caller's company entirely. Same split as get_visibility_request_for_user."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'not_found'
+    request = await ApprovalRequest.objects.select_related('requested_by').filter(
+        id=request_id, company=company, kind=ApprovalRequest.Kind.TASK_PROPOSAL,
+    ).afirst()
+    if request is None:
+        return None, 'not_found'
+    return request, None
+
+
+async def _proposal_project(request):
+    """The project a proposal targets, loaded the way every access decision
+    needs it. None if it has since been archived or deleted."""
+    return await Project.objects.select_related('company', 'department', 'created_by', 'current_owner').filter(
+        id=request.target_id, is_deleted=False,
+    ).afirst()
+
+
+async def list_task_proposals_for_user(user, project):
+    """Pending proposals on this project, for whoever can manage it.
+
+    A proposer sees their own regardless of access level. They filed it, and
+    not being able to see what you asked for is how people ask twice.
+    """
+    access = await resolve_project_access(user, project)
+    if access is None:
+        return None, 'forbidden'
+    queryset = ApprovalRequest.objects.filter(
+        kind=ApprovalRequest.Kind.TASK_PROPOSAL,
+        target_type=TASK_PROPOSAL_TARGET_TYPE,
+        target_id=project.id,
+        status=ApprovalRequest.Status.PENDING,
+    ).select_related('requested_by')
+    if access < AccessLevel.MANAGE:
+        queryset = queryset.filter(requested_by=user)
+    return queryset.order_by('-created_at'), None
+
+
+async def accept_task_proposal(user, request, overrides=None):
+    """Turn a proposal into a real task. Requires MANAGE on its project.
+
+    Returns (task, error) where error is 'forbidden', 'not_pending',
+    'project_gone', or anything create_task itself returns.
+
+    The task is built by calling create_task with the accepting manager as the
+    actor, never by writing the payload into the tasks table. That is the rule
+    ApprovalRequest was designed around: approving applies a change through the
+    same validated path a direct action takes, so a payload written when the
+    rules were looser -- or against a project whose deadline has since moved --
+    cannot become a task nobody checked.
+
+    ``created_by`` is therefore the accepting manager, and the proposer stays
+    recorded as ``requested_by`` on this request. That split is deliberate:
+    created_by heads the approval fallback chain in user_can_approve_task, and
+    pointing it at a contributor would make them the approver of work they
+    proposed and may well be assigned.
+    """
+    if request.status != ApprovalRequest.Status.PENDING:
+        return None, 'not_pending'
+    project = await _proposal_project(request)
+    if project is None:
+        return None, 'project_gone'
+    if not await user_can_manage_project(user, project):
+        return None, 'forbidden'
+
+    fields = _deserialize_proposal_payload(request.payload)
+    if overrides:
+        # A reviewer may correct a proposal as they accept it. Making them
+        # retype the whole thing to fix one priority is how a queue stops
+        # being used.
+        fields.update({k: v for k, v in overrides.items() if k in TASK_PROPOSAL_FIELDS and v is not None})
+
+    task, error = await create_task(
+        user, project,
+        title=fields.get('title') or 'Untitled task',
+        description=fields.get('description') or 'No description provided',
+        priority=fields.get('priority') or Task.PRIORITY.MEDIUM,
+        deadline=fields.get('deadline'),
+        estimated_time=fields.get('estimated_time'),
+        department_id=fields.get('department_id'),
+        task_type_id=fields.get('task_type_id'),
+    )
+    if error:
+        return None, error
+
+    request.status = ApprovalRequest.Status.APPROVED
+    request.decided_by = user
+    request.decided_at = timezone.now()
+    await request.asave(update_fields=['status', 'decided_by', 'decided_at'])
+    await arecord_event(
+        company=project.company, actor=user, action=AuditAction.TASK_PROPOSAL_DECIDED, target=task,
+        before={'status': ApprovalRequest.Status.PENDING},
+        after={'status': ApprovalRequest.Status.APPROVED, 'task': str(task.id)},
+        reason=f'Accepted proposal {request.id}',
+    )
+    await sync_to_async(notify_task_proposal_accepted, thread_sensitive=True)(request, task)
+    return task, None
+
+
+async def decline_task_proposal(user, request, comment=''):
+    """Refuse a proposal. Requires MANAGE on its project.
+
+    The comment is optional. A declined proposal with no reason reads as being
+    ignored, so the product should push hard for one -- but a reviewer clearing
+    an obvious duplicate should not be blocked from doing so, and the
+    notification names who declined it, which is enough to start the
+    conversation.
+    """
+    if request.status != ApprovalRequest.Status.PENDING:
+        return None, 'not_pending'
+    project = await _proposal_project(request)
+    if project is None:
+        return None, 'project_gone'
+    if not await user_can_manage_project(user, project):
+        return None, 'forbidden'
+
+    request.status = ApprovalRequest.Status.DENIED
+    request.decided_by = user
+    request.decided_at = timezone.now()
+    request.decision_comment = (comment or '').strip()
+    await request.asave(update_fields=['status', 'decided_by', 'decided_at', 'decision_comment'])
+    await arecord_event(
+        company=project.company, actor=user, action=AuditAction.TASK_PROPOSAL_DECIDED, target=project,
+        before={'status': ApprovalRequest.Status.PENDING},
+        after={'status': ApprovalRequest.Status.DENIED},
+        reason=f'Declined proposal {request.id}',
+    )
+    await sync_to_async(notify_task_proposal_declined, thread_sensitive=True)(request)
+    return request, None
+
 
 
 # --------------------------------------------------------------------------
