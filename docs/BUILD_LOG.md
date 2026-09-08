@@ -21,7 +21,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP6 | `ApprovalRequest`; visibility escalation and the public gate (§1, §10) | **done** |
 | WP7a | Task field-level authority; `created_by` stops granting MANAGE (§2) | **done** |
 | WP7b | Task creation behind MANAGE; task proposals; break-into-steps (§2) | **done** |
-| WP8 | Task dependencies — `blocks` / `relates_to` (§2) | |
+| WP8 | Task dependencies — `blocks` / `relates_to` (§2) | **done** |
 | WP9 | `ProjectBrief` and brief-assisted creation (§1) | |
 | WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | |
 | WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | |
@@ -866,6 +866,94 @@ wrong the day it was. The fallback is now the oldest membership, explicitly.
 
 Full suite: **716 passed, 1 failed** in 8m10s -- the Redis one. No stale
 expectations, which is the result a behaviour-preserving change should have.
+
+---
+
+## WP8 — Task dependencies
+
+One model, two kinds, one project. `blocks` is hard and has exactly one
+observable consequence: the successor cannot leave To Do until the predecessor
+is Done. `relates_to` is informational and gates nothing.
+
+Explicitly not built, per §2: SS/FF/SF, lag, critical path, cross-project
+edges. Two kinds can be explained in a sentence, and only one of them does
+anything.
+
+### The block is checked at the transition, never cached
+
+There is no `is_blocked` flag on `Task`, deliberately. A cached one is wrong
+from the instant a predecessor moves, and while it is wrong it either strands
+somebody on work that is ready or waves through work that is not. The check
+runs in `update_task_status`, on the To Do -> anything transition, against the
+predecessors' current state.
+
+The service returns the unfinished predecessors rather than a bare error, and
+the endpoint renders their titles. A block with no explanation is
+indistinguishable from a bug.
+
+An archived predecessor blocks nothing -- there is no route left to complete
+it, so leaving it in the way would strand the successor permanently.
+
+### The cycle race is real corruption, so it gets a lock
+
+This is the decision the package turns on.
+
+Adding an edge is a read-then-write: walk the graph, conclude the edge is
+safe, insert. Two people adding A->B and B->A at the same moment each read a
+graph without the other's edge, each conclude they are safe, and both insert.
+The result is two tasks permanently blocking each other, from data that was
+valid when each request checked it, with no route out through the product.
+
+Most races in this codebase leave an inconsistency something later resolves --
+see "The void is not transactional" under WP7a, where that was the reason to
+leave a gap open. This one does not. So the check-and-insert runs inside one
+transaction holding `pg_advisory_xact_lock` keyed on the project.
+
+**Django transactions are sync-only, so the guarded part is a sync function
+called through `sync_to_async`** -- the shape `persist_ai_generated_tasks` and
+`users.services.update_member_role` already use. Following the existing
+convention beat inventing a second one, which was the concern flagged when WP8
+was queued.
+
+Authorization is deliberately **outside** the transaction. It is a property of
+`(user, project)` and is not racing with anything in the block, so it stays in
+the async caller where `resolve_project_access` lives. Pulling it in would have
+meant writing a sync copy of the access resolver -- duplicating the one place
+the access model is defined, to serve a lock that does not need it.
+
+The lock is keyed per project, derived from the project id with blake2b, since
+Postgres advisory locks share one flat integer namespace across the database.
+Cycles can only form within a project, so two projects never wait on each
+other.
+
+### The concurrency test was verified by breaking the code
+
+A concurrency test that passes against broken code is worse than none. This one
+was checked by replacing the `pg_advisory_xact_lock` call with `SELECT 1` and
+re-running: both threads inserted, the assertion went from `['cycle', 'ok']` to
+`['ok', 'ok']`, and a real cycle appeared in the table. Restored, it passes.
+
+### The nightly check reports and never repairs
+
+`find_dependency_cycles` runs at 03:30 as the backstop §2 asks for. In a
+correct system it finds nothing -- the guarded path already refuses to close a
+loop. It exists because a cycle can still arrive by a path that does not go
+through that check (a data migration, a fixture load, a future bulk import, a
+bug in the check itself), and a cycle is silent: nobody reports it, two tasks
+simply never start, and the reason is invisible from either one.
+
+It logs and stops there. Breaking a cycle means deleting somebody's edge, and
+which edge is wrong is a judgment about the work -- not something a job should
+decide at 3am with no one watching.
+
+The walk is iterative rather than recursive, and a 300-task chain is tested,
+because a long chain is exactly what a sequential plan looks like.
+
+**33 tests** in `projects_and_tasks/test_dependencies.py`.
+
+Full suite: **749 passed, 1 failed** in 9m23s -- the Redis one. No stale
+expectations: dependencies are additive, and nothing existing assumed a task
+could always leave To Do.
 
 ---
 

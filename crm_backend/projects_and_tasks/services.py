@@ -5,6 +5,7 @@ server-side company/role state (see company.services) rather than trusting
 any client-supplied company/project/department id at face value.
 """
 
+import hashlib
 import re
 from datetime import timedelta
 from uuid import UUID
@@ -14,7 +15,7 @@ from audit.services import AuditAction, arecord_event
 from company.services import get_company_role, get_member_company, get_member_department_id, is_company_member
 from departments_and_teams.models import Department, Team
 from django.contrib.auth import get_user_model
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -46,7 +47,7 @@ from users.models import CompanyUserProfile
 from .access import AccessLevel, resolve_project_access
 from .models import (
     ApprovalRequest, Attachment, DefaultTaskType, Project, ProjectMembership, ProjectVisibilityRequest, Task,
-    TaskApproval, TaskTimeLog, TaskType,
+    TaskApproval, TaskDependency, TaskTimeLog, TaskType,
 )
 
 User = get_user_model()
@@ -1030,13 +1031,26 @@ async def update_task_status(user, task, status):
     """Kanban drag-and-drop transitions for To Do/In Progress only. Done and
     In Review are never reachable here -- they're only reached via the
     approval workflow (submit_task_for_approval sets In Review; approve_task
-    sets Done) so an evidence trail always exists behind a completed task."""
+    sets Done) so an evidence trail always exists behind a completed task.
+
+    Returns (task, error) where error is 'forbidden', 'invalid_status',
+    'invalid_transition', or 'blocked'. On 'blocked' the first element is the
+    list of unfinished predecessors, so the caller can name them rather than
+    saying only that something, somewhere, is not done.
+    """
     if not await user_can_update_task_status(user, task):
         return None, 'forbidden'
     if status not in Task.STATUS.values:
         return None, 'invalid_status'
     if status in (Task.STATUS.DONE, Task.STATUS.IN_REVIEW):
         return None, 'invalid_transition'
+    if task.status == Task.STATUS.TODO and status != Task.STATUS.TODO:
+        # The one thing `blocks` does. Evaluated here, at the transition,
+        # against the predecessors' current state -- never read from a flag on
+        # the task, which would be stale the instant a predecessor moved.
+        blockers = await sync_to_async(blocking_predecessors_sync, thread_sensitive=True)(task)
+        if blockers:
+            return blockers, 'blocked'
     task.status = status
     await task.asave(update_fields=['status', 'updated_at'])
     return task, None
@@ -1048,6 +1062,176 @@ async def archive_task(user, task) -> bool:
     task.is_deleted = True
     await task.asave(update_fields=['is_deleted'])
     return True
+
+
+# --------------------------------------------------------------------------
+# Task dependencies
+# --------------------------------------------------------------------------
+# Two kinds, `blocks` and `relates_to`, within one project. See the
+# TaskDependency docstring for why the list stops there.
+#
+# `blocks` has exactly one observable consequence: the successor cannot leave
+# To Do until the predecessor is Done. It is evaluated at the transition,
+# never cached. A stored "is_blocked" flag would be wrong from the instant the
+# predecessor moved, and a wrong one either strands somebody on work that is
+# ready or waves through work that is not.
+
+
+def _project_lock_key(project_id) -> int:
+    """A stable 63-bit advisory-lock key for one project.
+
+    Postgres advisory locks are a flat integer namespace shared by the whole
+    database, so the key has to be derived, not chosen. The project id is the
+    right granularity: cycles can only form within a project, so two projects
+    never need to wait on each other.
+    """
+    return int.from_bytes(hashlib.blake2b(project_id.bytes, digest_size=8).digest(), 'big') >> 1
+
+
+def _blocks_edges_sync(project_id) -> dict:
+    """The project's `blocks` graph as {predecessor_id: {successor_id, ...}},
+    live tasks only. Small enough to walk in memory -- a project has tasks in
+    the hundreds, not the millions -- and reading it in one query beats
+    recursing into the database once per edge."""
+    graph = {}
+    rows = TaskDependency.objects.filter(
+        kind=TaskDependency.Kind.BLOCKS,
+        predecessor__project_id=project_id, predecessor__is_deleted=False,
+        successor__is_deleted=False,
+    ).values_list('predecessor_id', 'successor_id')
+    for predecessor_id, successor_id in rows:
+        graph.setdefault(predecessor_id, set()).add(successor_id)
+    return graph
+
+
+def _path_exists(graph: dict, start, goal) -> bool:
+    """Whether `goal` is reachable from `start`. Iterative depth-first: a
+    recursive walk would blow the stack on a long chain, and a long chain is
+    exactly what somebody building a sequential plan produces."""
+    seen = {start}
+    stack = [start]
+    while stack:
+        node = stack.pop()
+        if node == goal:
+            return True
+        for neighbour in graph.get(node, ()):
+            if neighbour not in seen:
+                seen.add(neighbour)
+                stack.append(neighbour)
+    return False
+
+
+def _insert_dependency_checked(user, predecessor, successor, kind):
+    """Cycle-check and insert one edge, atomically. Returns (dependency, error).
+
+    **Sync, and transactional, on purpose.** This is a read-then-write: it
+    walks the existing graph, concludes the new edge is safe, and inserts.
+    Two people adding A->B and B->A at the same moment each read a graph
+    without the other's edge, each conclude they are safe, and both insert.
+
+    Most races in this codebase leave an inconsistency that something later
+    resolves. This one leaves a cycle: two tasks permanently blocking each
+    other, with no route out through the product, from data that was valid
+    when each request checked it. That is corruption, so it gets a lock.
+
+    Django transactions are sync-only, which is why this is a sync function
+    reached through sync_to_async rather than an async one -- the same shape
+    persist_ai_generated_tasks and users.services.update_member_role already
+    use. Following the existing convention beats inventing a second one.
+
+    Authorization is deliberately **not** checked here. It is a property of
+    (user, project) and is not racing with anything in this transaction, so it
+    stays in the async caller where `resolve_project_access` lives -- there is
+    no sync copy of the access resolver, and adding one to serve this would
+    duplicate the single place the access model is defined.
+    """
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            # Transaction-scoped: released on commit or rollback, so a failure
+            # inside the block cannot strand the lock.
+            cursor.execute('SELECT pg_advisory_xact_lock(%s)', [_project_lock_key(predecessor.project_id)])
+
+        if TaskDependency.objects.filter(
+            predecessor=predecessor, successor=successor, kind=kind,
+        ).exists():
+            return None, 'duplicate'
+
+        if kind == TaskDependency.Kind.BLOCKS:
+            # Adding predecessor -> successor closes a cycle exactly when the
+            # predecessor is already reachable from the successor.
+            graph = _blocks_edges_sync(predecessor.project_id)
+            if _path_exists(graph, successor.id, predecessor.id):
+                return None, 'cycle'
+
+        dependency = TaskDependency.objects.create(
+            predecessor=predecessor, successor=successor, kind=kind, created_by=user,
+        )
+    return dependency, None
+
+
+async def add_task_dependency(user, predecessor, successor, kind):
+    """Create one edge between two tasks in the same project.
+
+    Returns (dependency, error) where error is 'forbidden',
+    'different_projects', 'self_dependency', 'duplicate', or 'cycle'.
+
+    Dependencies shape the work rather than do it, so they follow MANAGE --
+    the same authority as creating the tasks they connect.
+    """
+    if predecessor.project_id != successor.project_id:
+        # Cross-project edges are out of scope, and would also make the cycle
+        # check unbounded: the graph it walks stops being one project.
+        return None, 'different_projects'
+    if predecessor.id == successor.id:
+        return None, 'self_dependency'
+    if not await user_can_manage_project(user, predecessor.project):
+        return None, 'forbidden'
+    return await sync_to_async(_insert_dependency_checked, thread_sensitive=True)(
+        user, predecessor, successor, kind,
+    )
+
+
+def blocking_predecessors_sync(task):
+    """The not-yet-Done tasks that must finish before ``task`` may start.
+
+    Live tasks only: an archived predecessor blocks nothing, because there is
+    no route left to complete it and it would strand the successor forever.
+    """
+    return list(
+        Task.objects.filter(
+            dependents__successor=task,
+            dependents__kind=TaskDependency.Kind.BLOCKS,
+            is_deleted=False,
+        ).exclude(status=Task.STATUS.DONE).distinct()
+    )
+
+
+async def list_task_dependencies(user, task):
+    """Both directions for one task: what blocks it, what it blocks, and what
+    it merely relates to. Requires view access on the project."""
+    if not await user_can_view_project(user, task.project):
+        return None, 'forbidden'
+    edges = [
+        edge async for edge in TaskDependency.objects.filter(
+            Q(predecessor=task) | Q(successor=task),
+        ).select_related('predecessor', 'successor')
+    ]
+    return edges, None
+
+
+async def remove_task_dependency(user, task, dependency_id):
+    """Delete one edge. Requires MANAGE, same as creating it."""
+    dependency = await TaskDependency.objects.select_related(
+        'predecessor', 'predecessor__project', 'predecessor__project__company',
+    ).filter(
+        Q(predecessor=task) | Q(successor=task), id=dependency_id,
+    ).afirst()
+    if dependency is None:
+        return False, 'not_found'
+    if not await user_can_manage_project(user, dependency.predecessor.project):
+        return False, 'forbidden'
+    await dependency.adelete()
+    return True, None
 
 
 # --------------------------------------------------------------------------

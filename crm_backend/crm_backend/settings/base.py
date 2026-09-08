@@ -256,6 +256,15 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'users.tasks.retry_pending_invite_emails_task',
         'schedule': crontab(minute='*/15'),
     },
+    # Backstop for the cycle check in projects_and_tasks.services
+    # .add_task_dependency, which already refuses to close a loop under an
+    # advisory lock. Nightly rather than frequent: in a correct system it
+    # finds nothing, and a cycle that does slip in is silent rather than
+    # urgent -- two tasks quietly never start. It reports and never repairs.
+    'check-task-dependency-graph': {
+        'task': 'projects_and_tasks.tasks.check_dependency_graph_integrity_task',
+        'schedule': crontab(hour=3, minute=30),
+    },
 }
 
 # utils/rate_limit.py guard on signup/signin/invite endpoints. Off by

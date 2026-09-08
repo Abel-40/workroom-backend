@@ -300,6 +300,75 @@ class Attachment(UUIDModel):
         return f"{self.name} - {self.type}"
 
 
+
+class TaskDependency(UUIDModel):
+    """One edge between two tasks in the same project.
+
+    Two kinds, and deliberately only two:
+
+    ``blocks``
+        Hard. The successor cannot leave To Do until the predecessor is Done.
+        Checked live at the transition (see services.update_task_status), never
+        cached on the task -- a cached "is blocked" flag is wrong the moment
+        the predecessor moves, and the moment it is wrong somebody is either
+        stuck on work that is ready or working on work that is not.
+    ``relates_to``
+        Soft. Informational only, and it gates nothing. Its whole job is to
+        let somebody say "these two belong together" without that becoming a
+        scheduling claim.
+
+    What is deliberately absent: start-to-start, finish-to-finish,
+    start-to-finish, lag, critical path, and cross-project edges. Those turn a
+    task board into a project-management scheduler, which is a different
+    product with a different failure mode -- one where the plan is wrong in a
+    way nobody can see. Two kinds can be explained in a sentence, and the hard
+    one has exactly one observable consequence.
+
+    Edges are stored directionally even for ``relates_to``, where the
+    direction carries no meaning. Storing it once with an arbitrary direction
+    beats storing it twice and having to keep the halves consistent; readers
+    that want both sides ask for both (see services.list_task_dependencies).
+    """
+
+    class Kind(models.TextChoices):
+        BLOCKS = 'blocks', 'Blocks'
+        RELATES_TO = 'relates_to', 'Relates to'
+
+    # CASCADE on both sides: an edge to a task that no longer exists is not a
+    # record worth keeping, and leaving one would let a deleted task go on
+    # blocking live work.
+    predecessor = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='dependents')
+    successor = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='dependencies')
+    kind = models.CharField(max_length=20, choices=Kind.choices, default=Kind.BLOCKS)
+
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='created_dependencies', null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['predecessor', 'successor', 'kind'],
+                name='one_dependency_per_pair_and_kind',
+            ),
+            # The shortest possible cycle, and the only one a database
+            # constraint can catch. Everything longer is checked in the
+            # service, under a lock -- see services.add_task_dependency.
+            models.CheckConstraint(
+                condition=~models.Q(predecessor=models.F('successor')),
+                name='no_self_dependency',
+            ),
+        ]
+        indexes = [
+            # The live block check: "what must be Done before this task may
+            # start", asked on every To Do -> In Progress transition.
+            models.Index(fields=['successor', 'kind']),
+            models.Index(fields=['predecessor', 'kind']),
+        ]
+
+    def __str__(self):
+        return f'{self.predecessor_id} {self.kind} {self.successor_id}'
+
 class TaskApproval(UUIDModel):
     """One evidence-submission review cycle for a task. A task may go through
     several of these over its lifetime (submit -> reject -> resubmit ->

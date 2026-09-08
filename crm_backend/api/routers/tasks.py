@@ -112,6 +112,18 @@ class TaskProposalDeclineIn(Schema):
     comment: str = Field(default='', max_length=2000)
 
 
+class TaskDependencyIn(Schema):
+    """One edge. `blocks` is hard and gates the successor leaving To Do;
+    `relates_to` is informational and gates nothing."""
+
+    # The other end. Which end it is depends on `direction` below, because
+    # "this task blocks that one" and "this task is blocked by that one" are
+    # both natural things for a UI to offer and neither is more primary.
+    task_id: UUID
+    kind: Literal['blocks', 'relates_to'] = 'blocks'
+    direction: Literal['blocks', 'blocked_by'] = 'blocks'
+
+
 class TimeLogIn(Schema):
     hours: float = Field(gt=0, le=24)
     work_date: date | None = None
@@ -294,6 +306,13 @@ async def update_task_status(request, task_id: UUID, data: TaskStatusIn):
     if error == 'forbidden':
         return payload('You do not have permission to view this task.', 403, False)
     updated, error = await services.update_task_status(request.auth, task, data.status)
+    if error == 'blocked':
+        # `updated` carries the unfinished predecessors -- naming them is the
+        # difference between an actionable message and a dead end.
+        return payload(
+            'This task is waiting on work that is not finished yet.', 400, False,
+            errors={'blocked_by': [blocker.title for blocker in updated]},
+        )
     if error == 'forbidden':
         return payload('You do not have permission to update this task.', 403, False)
     if error == 'invalid_status':
@@ -687,3 +706,103 @@ async def decline_task_proposal(request, proposal_id: UUID, data: TaskProposalDe
     if error == 'project_gone':
         return payload('The project this proposal belongs to no longer exists.', 404, False)
     return payload('Task proposal declined.', 200, True, {'proposal': _proposal_data(declined)})
+
+
+# --------------------------------------------------------------------------
+# Task dependencies
+# --------------------------------------------------------------------------
+
+def _dependency_data(dependency, *, task) -> dict:
+    """Rendered from the perspective of the task being asked about, so a
+    client never has to work out which end it is on."""
+    is_predecessor = dependency.predecessor_id == task.id
+    other = dependency.successor if is_predecessor else dependency.predecessor
+    return {
+        'id': str(dependency.id),
+        'kind': dependency.kind,
+        'direction': 'blocks' if is_predecessor else 'blocked_by',
+        'task': {
+            'id': str(other.id),
+            'title': other.title,
+            'status': other.status,
+        },
+        'created_at': dependency.created_at.isoformat(),
+    }
+
+
+@router.get(
+    '/tasks/{task_id}/dependencies/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def list_task_dependencies(request, task_id: UUID):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    edges, error = await services.list_task_dependencies(request.auth, task)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    return payload('Dependencies retrieved successfully.', 200, True, {
+        'results': [_dependency_data(edge, task=task) for edge in edges],
+    })
+
+
+@router.post(
+    '/tasks/{task_id}/dependencies/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def add_task_dependency(request, task_id: UUID, data: TaskDependencyIn):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    other, error = await services.get_task_for_user(request.auth, data.task_id)
+    if error:
+        # Same answer for "not found" and "you cannot see it": otherwise this
+        # endpoint reports which task ids exist to anyone who can reach any
+        # task at all.
+        return payload('The other task was not found.', 404, False)
+
+    predecessor, successor = (task, other) if data.direction == 'blocks' else (other, task)
+    dependency, error = await services.add_task_dependency(
+        request.auth, predecessor, successor, data.kind,
+    )
+    if error == 'forbidden':
+        return payload('Changing how tasks depend on each other requires permission to manage the project.', 403, False)
+    if error == 'different_projects':
+        return payload(
+            'Dependencies only exist between tasks in the same project.', 400, False,
+            errors={'task_id': ['Must be a task on the same project']},
+        )
+    if error == 'self_dependency':
+        return payload('A task cannot depend on itself.', 400, False)
+    if error == 'duplicate':
+        return payload('That dependency already exists.', 400, False)
+    if error == 'cycle':
+        return payload(
+            'That would create a loop -- the two tasks would end up waiting on each other and neither '
+            'could ever start.', 400, False,
+        )
+    return payload('Dependency created successfully.', 201, True, {
+        'dependency': _dependency_data(dependency, task=task),
+    })
+
+
+@router.delete(
+    '/tasks/{task_id}/dependencies/{dependency_id}/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def remove_task_dependency(request, task_id: UUID, dependency_id: UUID):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    _, error = await services.remove_task_dependency(request.auth, task, dependency_id)
+    if error == 'not_found':
+        return payload('Dependency not found.', 404, False)
+    if error == 'forbidden':
+        return payload('Changing how tasks depend on each other requires permission to manage the project.', 403, False)
+    return payload('Dependency removed successfully.', 200, True)
