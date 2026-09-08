@@ -40,6 +40,15 @@ class TaskIn(Schema):
 
 
 class TaskUpdateIn(Schema):
+    """Not every field here is writable by everyone who can reach the task:
+    `description` and `estimated_time_hours` belong to the assignee, the rest
+    to whoever can manage the project. See services.TASK_ASSIGNEE_FIELDS.
+
+    `deadline` is still declared, but only so it can be refused with a
+    message that says where to go instead. Dropping it from the schema would
+    have been worse than useless: Ninja ignores unknown fields, so a client
+    still sending one would get a 200 and no deadline change."""
+
     title: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=10_000)
     department_id: UUID | None = None
@@ -223,11 +232,15 @@ async def update_task(request, task_id: UUID, data: TaskUpdateIn):
         updates['estimated_time'] = _hours_to_duration(updates.pop('estimated_time_hours'))
     updated, error = await services.update_task(request.auth, task, updates)
     if error == 'forbidden':
-        return payload('You do not have permission to modify this task.', 403, False)
-    if error == 'invalid_deadline':
         return payload(
-            "The task deadline must be before the project's deadline.", 400, False,
-            errors={'deadline': ['Must be earlier than the project deadline']},
+            'You do not have permission to change those fields. The assignee may edit the description and '
+            'estimate; the title, priority, type and department belong to whoever manages the project.',
+            403, False,
+        )
+    if error == 'deadline_has_own_route':
+        return payload(
+            'Change a deadline through POST /tasks/{id}/change-deadline/, which requires a reason.',
+            400, False, errors={'deadline': ['Use the change-deadline endpoint']},
         )
     if error:
         return payload('Invalid department or task type for this company.', 400, False)

@@ -30,6 +30,7 @@ from notifications_and_activity.services import (
     notify_task_assigned,
     notify_task_deadline_changed,
     notify_task_rejected,
+    notify_task_submission_voided,
     notify_task_submitted_for_approval,
     notify_visibility_approved,
     notify_visibility_denied,
@@ -46,7 +47,22 @@ from .models import (
 User = get_user_model()
 
 PROJECT_UPDATABLE_FIELDS = {'title', 'description', 'visibility', 'priority', 'start_date', 'deadline', 'status'}
-TASK_UPDATABLE_FIELDS = {'title', 'description', 'priority', 'deadline', 'estimated_time'}
+
+# Field-level authority on a task. Which fields a person may write depends on
+# what they are to the task, not just on whether they can reach it at all.
+#
+# The assignee owns how the work gets done: the running description, and their
+# own estimate of the effort. (Status is not here -- To Do <-> In Progress has
+# its own endpoint, update_task_status, and In Review/Done are reachable only
+# through the approval workflow.)
+TASK_ASSIGNEE_FIELDS = frozenset({'description', 'estimated_time'})
+# Management owns what the work *is* and where it sits.
+TASK_MANAGE_FIELDS = frozenset({'title', 'priority', 'department_id', 'task_type_id'})
+TASK_UPDATABLE_FIELDS = TASK_ASSIGNEE_FIELDS | TASK_MANAGE_FIELDS
+# `deadline` is deliberately in neither set. It has its own endpoint, which
+# requires a stated reason, writes an audit row and notifies the assignee --
+# see change_task_deadline. Leaving it writable through the general update
+# path made all three optional by simply choosing the other endpoint.
 
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 ALLOWED_DOCUMENT_CONTENT_TYPES = {
@@ -80,12 +96,40 @@ async def user_can_manage_project(user, project) -> bool:
 
 
 async def user_can_manage_task(user, task) -> bool:
-    """The task's creator, or whoever can manage its parent project -- and in
-    either case an active member of the company. See user_can_manage_project
-    for why membership is checked before the per-task reference."""
-    if task.created_by_id == user.id and await is_company_member(user, task.project.company):
-        return True
+    """Whoever can manage the task's parent project. Nothing else.
+
+    ``task.created_by`` used to grant this on its own, and no longer does --
+    the same correction ``created_by`` got on Project, for the same reason. It
+    is provenance: it records who raised this piece of work, which is worth
+    keeping forever, and it is not a standing claim on the task.
+
+    The baseline made the cost of the old rule concrete: 240 of the 1440
+    characterized combinations granted management of a task on a project the
+    same person could not open. A Department Leader from another department
+    who created a task before the project moved away from them kept authority
+    over it indefinitely -- editing, reassigning and archiving work inside a
+    department they had since left. That is the manage-without-view shape WP3
+    removed from projects, surviving one level down.
+
+    Anyone who genuinely needs continuing authority over a task gets it the
+    way everyone else does: a manager membership on its project, which is
+    visible and revocable.
+    """
     return await user_can_manage_project(user, task.project)
+
+
+async def user_can_edit_own_task(user, task) -> bool:
+    """Whether ``user`` is the assignee doing this work, and still a member.
+
+    Separate from managing the task. The assignee owns *how the work is done*
+    -- the description they keep for themselves, their own estimate, their own
+    status between To Do and In Progress. They do not own what the work **is**:
+    title, priority, type, department, who it belongs to, and when it is due
+    stay with whoever can manage the project. See TASK_ASSIGNEE_FIELDS.
+    """
+    if task.assigned_to_id != user.id:
+        return False
+    return await is_company_member(user, task.project.company)
 
 
 async def user_can_update_task_status(user, task) -> bool:
@@ -777,10 +821,35 @@ async def create_task(user, project, *, title, description, priority, deadline, 
 
 
 async def update_task(user, task, updates: dict):
-    if not await user_can_manage_task(user, task):
-        return None, 'forbidden'
-    if 'deadline' in updates and updates['deadline'] > task.project.deadline:
-        return None, 'invalid_deadline'
+    """Apply a partial update, checked field by field.
+
+    Returns (task, error) where error is 'forbidden', 'deadline_has_own_route',
+    'invalid_department', 'invalid_task_type', or None.
+
+    Authority is decided against the fields actually being written, not
+    against the task as a whole -- otherwise an assignee editing their own
+    description would be refused merely because the same endpoint is also the
+    one that can rename the task.
+
+    The two sets are not symmetric. TASK_ASSIGNEE_FIELDS is the subset an
+    assignee may write; management may write everything, those fields
+    included. A request that mixes the sets is refused whole rather than
+    part-applied, so the outcome never depends on which fields happened to
+    travel together. Unknown fields are dropped, as before.
+    """
+    if 'deadline' in updates:
+        # An explicit refusal rather than a silent drop. Quietly ignoring it
+        # would return 200 on a request that changed nothing, and the caller
+        # would have no way to tell a no-op from a success.
+        return None, 'deadline_has_own_route'
+
+    requested = {field for field in updates if field in TASK_UPDATABLE_FIELDS}
+    can_manage = await user_can_manage_task(user, task)
+    if not can_manage:
+        if requested - TASK_ASSIGNEE_FIELDS:
+            return None, 'forbidden'
+        if not await user_can_edit_own_task(user, task):
+            return None, 'forbidden'
     if 'department_id' in updates:
         department, error = await _resolve_department(task.project.company, updates.pop('department_id'))
         if error:
@@ -857,6 +926,19 @@ async def is_eligible_assignee(user, project, candidate) -> bool:
 
 
 async def assign_task(user, task, assignee_id):
+    """Move a task to a different assignee, or to nobody.
+
+    A pending submission does not block the reassignment -- it is voided by
+    it. Blocking would be the wrong way round: the common reason to reassign
+    mid-review is that the original assignee has gone or is stuck, which is
+    exactly when their pending submission is least likely to be resolved. A
+    task would then be wedged in In Review with nobody able to move it.
+
+    So the submission is closed as VOIDED (never REJECTED -- nobody judged the
+    work), the task drops back to In Progress for the new assignee, the person
+    who submitted is told their evidence will not be read, and the whole thing
+    is audited.
+    """
     if not await user_can_manage_task(user, task):
         return None, 'forbidden'
     assignee, error = await _resolve_assignee(task.project.company, assignee_id)
@@ -871,11 +953,64 @@ async def assign_task(user, task, assignee_id):
         role = await get_company_role(user, task.project.company)
         if role in DEPARTMENT_SCOPED_ROLES and not await is_eligible_assignee(user, task.project, assignee):
             return None, 'ineligible_assignee'
+
+    previous_assignee_id = task.assigned_to_id
+    new_assignee_id = assignee.id if assignee is not None else None
+    if previous_assignee_id == new_assignee_id:
+        # Reassigning someone to the task they already hold is a no-op, not a
+        # reason to void their submission out from under them.
+        return task, None
+
     task.assigned_to = assignee
     await task.asave(update_fields=['assigned_to', 'updated_at'])
+    await arecord_event(
+        company=task.project.company, actor=user, action=AuditAction.TASK_ASSIGNEE_CHANGED, target=task,
+        before={'assigned_to': str(previous_assignee_id) if previous_assignee_id else None},
+        after={'assigned_to': str(new_assignee_id) if new_assignee_id else None},
+    )
+    await _void_pending_approval(task, actor=user)
     if assignee is not None:
         await sync_to_async(notify_task_assigned, thread_sensitive=True)(task)
     return task, None
+
+
+async def _void_pending_approval(task, *, actor):
+    """Close any pending submission on ``task`` because it was reassigned.
+
+    Returns the voided approval, or None if there was none. The task is pulled
+    back to In Progress: In Review means "somebody is waiting on a decision",
+    and after this nobody is.
+    """
+    approval = await TaskApproval.objects.select_related('submitted_by').filter(
+        task=task, status=TaskApproval.STATUS.PENDING,
+    ).afirst()
+    if approval is None:
+        return None
+
+    # Prime the cached relation: the notification helper reads approval.task,
+    # and the caller already holds it with project__company selected.
+    approval.task = task
+    approval.status = TaskApproval.STATUS.VOIDED
+    approval.decided_by = actor
+    approval.decided_at = timezone.now()
+    await approval.asave(update_fields=['status', 'decided_by', 'decided_at'])
+
+    if task.status == Task.STATUS.IN_REVIEW:
+        task.status = Task.STATUS.IN_PROGRESS
+        await task.asave(update_fields=['status', 'updated_at'])
+
+    await arecord_event(
+        company=task.project.company, actor=actor, action=AuditAction.TASK_APPROVAL_VOIDED, target=task,
+        before={'approval_status': TaskApproval.STATUS.PENDING},
+        after={'approval_status': TaskApproval.STATUS.VOIDED},
+        reason='Task reassigned while a submission was pending',
+    )
+    # submitted_by is preloaded above: by this point task.assigned_to has
+    # already moved, so the recipient cannot be read back off the task.
+    await sync_to_async(notify_task_submission_voided, thread_sensitive=True)(
+        approval, approval.submitted_by, actor,
+    )
+    return approval
 
 
 async def update_task_status(user, task, status):

@@ -301,6 +301,13 @@ class TaskApproval(UUIDModel):
         PENDING = 'pending', 'Pending'
         APPROVED = 'approved', 'Approved'
         REJECTED = 'rejected', 'Rejected'
+        # The task was reassigned while this submission was still pending.
+        # Distinct from REJECTED on purpose: nobody judged the work. Rejected
+        # means "this is not good enough" and is a fact about the submission;
+        # voided means "the question stopped applying" and is a fact about the
+        # task. Collapsing the two would put a black mark on the record of
+        # somebody whose work was never actually read.
+        VOIDED = 'voided', 'Voided'
 
     task = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='approvals')
     submitted_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='submitted_approvals', null=True)
@@ -312,6 +319,11 @@ class TaskApproval(UUIDModel):
     submitted_late = models.BooleanField(default=False)
     late_by = models.DurationField(null=True, blank=True)
     status = models.CharField(max_length=10, choices=STATUS.choices, default=STATUS.PENDING)
+    # Who closed this cycle and when -- the approver for APPROVED/REJECTED,
+    # and for VOIDED whoever reassigned the task. One pair of fields rather
+    # than a separate voided_by/voided_at: in all three cases this is "the
+    # person whose action ended this review, and when", and splitting it would
+    # mean every reader of the history had to check two places to find out.
     decided_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='decided_approvals', null=True, blank=True)
     decided_at = models.DateTimeField(null=True, blank=True)
     # Visible only to `submitted_by` -- enforced in the API serialization

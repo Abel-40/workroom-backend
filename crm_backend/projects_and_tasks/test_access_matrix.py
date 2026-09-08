@@ -354,15 +354,22 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertTrue(Task.objects.filter(project=self.project, created_by=self.dm).exists())
 
-    def test_task_creator_keeps_managing_a_task_they_cannot_otherwise_touch(self):
-        """KNOWN DEFECT (decision sec.2): user_can_manage_task short-circuits on
-        task.created_by, so a DM who created a task keeps full edit/assign/
-        archive rights over it regardless of their access to the project."""
+    def test_managing_a_task_comes_from_the_project_not_from_having_created_it(self):
+        """FIXED (was D2): user_can_manage_task short-circuited on
+        task.created_by, so whoever raised a task kept edit/assign/archive
+        rights over it regardless of their access to the project -- 240 of the
+        1440 characterized combinations granted management of a task on a
+        project the same person could not open.
+
+        created_by is now provenance only, matching Project.created_by. The
+        assertion is kept rather than deleted because the pairing is the point:
+        no project management, therefore no task management, and the two move
+        together from here on."""
         task = Task.objects.create(
             project=self.project, title='Theirs', created_by=self.dm, deadline=self.project.deadline,
         )
         self.assertFalse(async_to_sync(services.user_can_manage_project)(self.dm, self.project))
-        self.assertTrue(async_to_sync(services.user_can_manage_task)(self.dm, task))
+        self.assertFalse(async_to_sync(services.user_can_manage_task)(self.dm, task))
 
     def test_moving_a_deadline_belongs_to_whoever_manages_the_project(self):
         """FIXED (was D3): deadline changes were created_by-only, which locked

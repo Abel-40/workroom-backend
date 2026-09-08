@@ -1,0 +1,34 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-blue{% endblock %}
+{% block eyebrow %}Closed without review{% endblock %}
+{% block heading %}This task moved on without you{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-blue"><span>&#128260;</span></div>
+
+    <div class="wr-highlight wr-highlight-blue">{{ title }}</div>
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    {# Blue, not the amber "changes requested" treatment. Nobody judged
+       this work -- the task was reassigned while the submission was waiting,
+       so the review simply stopped applying. Reading like a rejection would
+       tell the recipient something untrue about their work. #}
+    <p style="font-size: 15px; color: #475569;">
+        Nothing was wrong with what you sent &mdash; it was never reviewed. The task
+        now belongs to someone else, so there is nothing further for you to do here.
+    </p>
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-blue">Go to your tasks</a>
+    </div>
+
+    <p class="wr-muted" style="margin-top: 24px;">
+        This always reaches you regardless of your notification preferences, because
+        you would otherwise be waiting on a review that is not coming.
+    </p>
+{% endblock %}

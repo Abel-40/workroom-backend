@@ -24,6 +24,9 @@ TYPE_CATEGORY = {
     Notification.Type.TASK_SUBMITTED_FOR_APPROVAL: Notification.Category.CRITICAL,
     Notification.Type.TASK_REJECTED: Notification.Category.CRITICAL,
     Notification.Type.TASK_APPROVED: Notification.Category.OPTIONAL,
+    # Work you submitted will now never be read, and the task has left your
+    # hands -- you would otherwise wait on a review that is not coming.
+    Notification.Type.TASK_SUBMISSION_VOIDED: Notification.Category.CRITICAL,
     Notification.Type.DEADLINE_EXTENDED: Notification.Category.OPTIONAL,
     Notification.Type.PROJECT_AUTO_COMPLETED: Notification.Category.OPTIONAL,
     # A pending request blocking someone else's work is actionable/time-sensitive;
@@ -209,6 +212,27 @@ def notify_task_rejected(approval):
     _create(
         approval.submitted_by, Notification.Type.TASK_REJECTED,
         f"Your submission for '{task.title}' needs changes",
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_task_submission_voided(approval, recipient, actor):
+    """Tells the person whose pending submission was voided that the task was
+    reassigned, so they stop waiting on a review that will never come.
+
+    ``recipient`` is passed in rather than read from ``approval.submitted_by``
+    because the caller already holds it and, by the time this runs, the task's
+    ``assigned_to`` has already moved to somebody else -- reading it back from
+    the task would notify the wrong person.
+    """
+    if recipient is None:
+        return
+    task = approval.task
+    actor_name = actor.get_full_name() or actor.email if actor else 'A manager'
+    _create(
+        recipient, Notification.Type.TASK_SUBMISSION_VOIDED,
+        f"Your submission for '{task.title}' was closed without review",
+        message=f'{actor_name} reassigned the task, so it is no longer waiting on your submission.',
         related_object_type='task', related_object_id=task.id,
     )
 

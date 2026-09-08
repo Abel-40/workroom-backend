@@ -12,6 +12,7 @@ TEMPLATE_MAP = {
     'task_submitted_for_approval': 'emails/notifications/task_submitted_for_approval_email.html',
     'task_approved': 'emails/notifications/task_approved_email.html',
     'task_rejected': 'emails/notifications/task_rejected_email.html',
+    'task_submission_voided': 'emails/notifications/task_submission_voided_email.html',
     'deadline_extended': 'emails/notifications/deadline_extended_email.html',
     'project_auto_completed': 'emails/notifications/project_auto_completed_email.html',
     'visibility_requested': 'emails/notifications/visibility_requested_email.html',

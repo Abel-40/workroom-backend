@@ -51,6 +51,7 @@ class Notification(UUIDModel):
         TASK_SUBMITTED_FOR_APPROVAL = 'task_submitted_for_approval', 'Task Submitted For Approval'
         TASK_APPROVED = 'task_approved', 'Task Approved'
         TASK_REJECTED = 'task_rejected', 'Task Rejected'
+        TASK_SUBMISSION_VOIDED = 'task_submission_voided', 'Task Submission Voided'
         DEADLINE_EXTENDED = 'deadline_extended', 'Deadline Extended'
         PROJECT_AUTO_COMPLETED = 'project_auto_completed', 'Project Auto-Completed'
         VISIBILITY_REQUESTED = 'visibility_requested', 'Visibility Request'

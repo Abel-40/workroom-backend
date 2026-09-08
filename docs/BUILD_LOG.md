@@ -19,7 +19,8 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP4 | ProjectMembership and the four access levels (§10) | **done** |
 | WP5 | Deadlines: `<=`, AI buffer removal, MANAGE + reason + audit; late submission (§2) | **done** |
 | WP6 | `ApprovalRequest`; visibility escalation and the public gate (§1, §10) | **done** |
-| WP7 | Task field-level authority; task proposals; break-into-steps (§2) | |
+| WP7a | Task field-level authority; `created_by` stops granting MANAGE (§2) | **done** |
+| WP7b | Task creation behind MANAGE; task proposals; break-into-steps (§2) | |
 | WP8 | Task dependencies — `blocks` / `relates_to` (§2) | |
 | WP9 | `ProjectBrief` and brief-assisted creation (§1) | |
 | WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | |
@@ -499,12 +500,154 @@ test_rate_limit_boundary`, which needs a real Redis and fails identically on
 
 ---
 
+## WP7a — Field-level authority on a task
+
+§2 asks for a task's fields to answer to different people. Before this, they
+answered to one question -- `user_can_manage_task` -- and it was the wrong one
+twice over: it granted on `task.created_by`, and it was all-or-nothing.
+
+### created_by stops being a claim
+
+`user_can_manage_task` short-circuited on `task.created_by`, so whoever raised
+a piece of work kept edit/assign/archive rights over it forever. That is D2,
+and it is the same correction `Project.created_by` got in WP4: provenance is
+worth keeping permanently and is not a standing claim.
+
+The baseline priced it before the change, which is the point of having one:
+**240 of the 1440 characterized combinations granted management of a task on a
+project the same person could not open.** All 240 were DL (96) or DM (144) --
+never Owner or CM, who hold MANAGE by role anyway. The concrete case: a
+Department Leader creates a task, the project later moves to another
+department, and they keep editing, reassigning and archiving work inside a
+department they have left.
+
+The regenerated baseline is the review artifact and its shape is the argument:
+240 rows changed, **one column** (`own_task`), **one direction** (1 -> 0), no
+other column touched. The predicted blast radius and the actual one matched
+exactly.
+
+`test_task_creator_keeps_managing_a_task_they_cannot_otherwise_touch` was a
+KNOWN DEFECT characterization test asserting the bug. It is now
+`test_managing_a_task_comes_from_the_project_not_from_having_created_it`,
+asserting the opposite, with the history in its docstring -- the same treatment
+D3 got in WP5.
+
+### Fields split two ways
+
+    TASK_ASSIGNEE_FIELDS   description, estimated_time
+    TASK_MANAGE_FIELDS     title, priority, department_id, task_type_id
+
+The assignee owns how the work gets done; management owns what the work *is*.
+Authority is decided against the fields a request actually carries, not against
+the task as a whole.
+
+A request mixing the two is refused **whole**, never half-applied. Letting the
+permitted half through would make the result of a request depend on which
+fields it happened to carry, and would apply half an edit the caller sent as
+one change.
+
+### Two routes around the rules, closed
+
+**A deadline could be moved with no reason and no audit row.** WP5 built
+`change-deadline` -- MANAGE, required reason, audit row, notification -- and
+left `deadline` writable through the ordinary PATCH, where none of those four
+applied. Choosing the other endpoint was enough to skip all of them. `deadline`
+is now in neither field set.
+
+It is still declared on `TaskUpdateIn`, which looks redundant and is not:
+Ninja ignores unknown fields, so removing it would have turned a request that
+means "move this deadline" into a silent 200 that moved nothing. It is accepted
+in order to be refused, with a message naming the endpoint to use instead.
+
+**A task with a pending submission could not be reassigned at all.** Blocking
+is the wrong way round: the usual reason to reassign mid-review is that the
+original assignee has gone or is stuck, which is precisely when their
+submission will never be resolved. The task wedged in In Review with nobody
+able to move it.
+
+Reassignment now voids the submission: `TaskApproval.STATUS.VOIDED`, the task
+drops back to In Progress, the person who submitted is told their evidence will
+not be read, and both the void and the assignee change are audited.
+
+VOIDED is a new status rather than REJECTED because rejected is a judgement on
+the work and nobody read this work. Putting a rejection on someone's record for
+a submission that was never opened would be a small injustice the data model
+would then make permanent.
+
+Reassigning to the person who already holds the task is a no-op and voids
+nothing -- otherwise a stray double-click would close a live submission.
+
+### The void is not transactional, deliberately
+
+`assign_task` writes the assignment, an audit row, the void, a second audit row
+and a notification as five separate statements. If one fails partway, the task
+can be left reassigned with the previous assignee's submission still pending.
+
+Django transactions are sync-only and this whole service layer is async, so
+there is no `atomic()` to reach for here -- `submit_task_for_approval` has the
+same shape and predates this work. Wrapping just this one path in
+`sync_to_async(transaction.atomic)` would introduce a second convention for
+multi-step writes in the same module, which is worse than one honest gap.
+
+The failure mode is recoverable rather than corrupting: a pending approval
+belonging to somebody who no longer holds the task, which the next reassignment
+or a submission by the new assignee resolves. Worth fixing properly when the
+async service layer gets a transaction convention, not before.
+
+### Deliberately not in this package
+
+Task creation still requires only VIEW (D1). Moving it behind MANAGE without
+shipping the "Propose task" flow in the same commit would leave contributors
+with no way to raise work at all, so both land together in WP7b.
+
+**26 new tests** in `projects_and_tasks/test_task_authority.py`.
+
+The suite caught one defect in this package that its own tests did not:
+`NotificationEmailTemplateMappingTests` requires every `Notification.Type` to
+map to its own email template, and `TASK_SUBMISSION_VOIDED` had none -- it would
+have silently fallen back to the generic template. That test is doing real work;
+the new template is deliberately blue rather than the amber "changes requested"
+treatment, because nobody judged the work and an email that reads like a
+rejection would tell the recipient something untrue about it.
+
+Full suite: **635 passed, 1 failed** in 8m41s -- the failure is
+`AIHealthSummarySecurityTests::test_rate_limit_boundary`, which needs a real
+Redis. Known baseline, not a regression.
+
+---
+
 ## Test gate in use
 
-The full suite takes **41 minutes** on this machine, which is not a workable
-per-commit gate. Per commit: the affected app's tests, plus
-`makemigrations --check --dry-run`, plus `ruff` on the touched files. The full
-suite runs at work-package boundaries and before any PR.
+Per commit: the affected app's tests, plus `makemigrations --check --dry-run`,
+plus `ruff` on the touched files. The full suite runs at work-package
+boundaries and before any PR.
+
+### The suite was slow for one reason, and it has been fixed
+
+Django 6.0 defaults to **1,200,000 PBKDF2 iterations**, which costs **2.6
+seconds per password** on this machine. The suite creates a user for nearly
+every actor in nearly every test -- six or seven per test in the task and
+visibility modules -- so the great majority of its wall-clock time was spent
+deliberately making hashes slow to compute. Nothing was being tested by that.
+
+`conftest.py` now sets `PASSWORD_HASHERS` to MD5 in `pytest_configure`. Measured
+on `projects_and_tasks/test_task_authority.py`, 26 tests:
+
+| | Before | After |
+|---|---|---|
+| Fresh database | 223s | 76s |
+| Reused database | — | **33s** |
+
+Per-test cost went from ~8.6s to ~0.25s. The remaining per-module time is
+database setup, not the tests.
+
+It is set in `pytest_configure` rather than as an autouse fixture on purpose: a
+function-scoped fixture runs *after* `setUpTestData`, and
+`test_access_matrix.py` builds its whole world there -- it would have gone on
+paying full price for the largest fixture in the suite.
+
+Nothing asserts on the algorithm. Password *strength* is enforced by
+`validate_password`, a separate mechanism, unaffected by this.
 
 **Pre-existing baseline, recorded before any change on this branch:
 511 passed, 1 failed.** The failure is
@@ -556,6 +699,25 @@ The prompt cites `docs/workroom-v1-reference.md`. The file in the workspace is
 `workroom-v1-reference.pdf`, one directory above the backend repo, and is not
 committed to any repo. Using it in place; not copying a 180 KB PDF into the
 repo without being asked.
+
+### R5 — A manager can approve their own submitted work
+
+Not introduced here, and not fixed here: `user_can_approve_task` resolves to
+`task.created_by` (then `current_owner`, then the project's creator) and never
+asks whether that person is the one who submitted. Anyone who can create a task,
+assign it to themselves, and submit evidence can then approve it. After WP7b
+puts creation behind MANAGE the path narrows to managers, but it does not close.
+
+It is left alone because the obvious fix has a dead end in it. "The submitter
+may not decide their own submission" is right until a project has exactly one
+manager who is also doing the work -- then the task can never reach Done by any
+route, which is the same trap WP5 removed from late submission.
+
+The version that works is "refuse self-approval when another eligible approver
+exists, and record it when one does not", which is a real decision about
+separation of duties rather than a tidy-up, and it needs its own baseline
+regeneration. Worth doing as WP7c or folding into WP10, where the fallback
+chain gets revisited anyway.
 
 ### R4 — Three repositories, one branch name
 

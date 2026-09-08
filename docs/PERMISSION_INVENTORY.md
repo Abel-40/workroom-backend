@@ -210,7 +210,7 @@ it. None are fixed by the extraction itself.
 | # | Defect | Decision |
 |---|---|---|
 | D1 | Project *view* is all it takes to create a task, so `company` visibility — meant to be discovery only — lets any member add work to any project | §2: task creation requires MANAGE |
-| D2 | `user_can_manage_task` short-circuits on `task.created_by`, so a creator keeps edit/assign/archive rights over a task on a project they cannot otherwise touch | §10: MANAGE comes from the project |
+| D2 | ~~`user_can_manage_task` short-circuits on `task.created_by`, so a creator keeps edit/assign/archive rights over a task on a project they cannot otherwise touch~~ | **FIXED in WP7a.** `user_can_manage_task` is now exactly `user_can_manage_project`. The baseline priced it first: **240 of 1440 combinations** granted management of a task on a project the same person could not open, all of them DL (96) or DM (144). The regenerated baseline moved 240 rows in one column (`own_task`), one direction (1 → 0), nothing else — predicted and actual blast radius matched. `created_by` is provenance, as on `Project`; continuing authority comes from a manager `ProjectMembership`, which is visible and revocable. |
 | D3 | Deadline changes are `created_by`-only; the current owner, Owner, CM and the department's leader are all locked out, and a departed creator freezes the deadline forever | §2: MANAGE + required reason + audit |
 | D4 | Deadline changes are extend-only | §2: shortening allowed unless it breaks the task invariant |
 | D5 | `task.deadline` must fall **strictly** before `project.deadline` — the reason the AI generator carries a one-hour buffer hack | §2: `<=`, buffer deleted |
