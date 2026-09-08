@@ -34,6 +34,20 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP18 | Integration seams (§12) | |
 | WP19 | `docs/DECISIONS.md` (§13) | **done** |
 | WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | |
+| WP21 | Owner-with-no-membership backfill, then delete every "owner might have no profile" branch (§10) | |
+| WP22 | Company context returns the membership, accepts an explicit company id (§10) | |
+| WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | |
+
+Three rows were added to this table on 2026-09-08, after a read-back against
+the prompt. WP21 and WP22 are the two tail paragraphs of §10 that are not part
+of the access resolver itself, and were missed when the table was first drawn
+because §10 was filed as "the resolver". WP23 is the two DEFINITION OF DONE
+artifacts that are not tied to any decision section. None of them were started;
+they were simply not being tracked.
+
+Note that WP21 will move the access-matrix baseline: the matrix world gives the
+company owner no `CompanyUserProfile`, which is exactly the legacy shape the
+backfill removes (see WP1, judgment call 4).
 
 ---
 
