@@ -308,3 +308,57 @@ class ReassignmentVoidsPendingSubmissionTests(TaskWorldMixin, TwoCompanyTestCase
         self.assertFalse(
             TaskApproval.objects.filter(task=self.task, status=TaskApproval.STATUS.PENDING).exists()
         )
+
+
+class ProjectDeadlineHasOneRouteTests(TaskWorldMixin, TwoCompanyTestCase):
+    """The same rule as tasks, which the project path was missing.
+
+    WP5 built change-deadline for projects -- MANAGE, required reason, audit
+    row, notifications, and a refusal if the new date would strand tasks past
+    it -- and `update_project` went on accepting `deadline` directly, making
+    all five optional by choosing the other endpoint. WP7a closed that for
+    tasks and left it open for projects.
+    """
+
+    def patch_project(self, actor, body):
+        return self.client.patch(
+            f'/api/v1/projects/{self.project.id}/', json.dumps(body),
+            content_type='application/json', **auth_header(actor),
+        )
+
+    def test_the_general_update_endpoint_refuses_a_deadline(self):
+        response = self.patch_project(
+            self.owner_a, {'deadline': (timezone.now() + timedelta(days=200)).isoformat()},
+        )
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn('change-deadline', response.json()['message'])
+
+    def test_the_deadline_is_unchanged(self):
+        original = self.project.deadline
+        self.patch_project(self.owner_a, {'deadline': (original + timedelta(days=30)).isoformat()})
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.deadline, original)
+
+    def test_no_audit_row_is_written_by_the_refusal(self):
+        before = AuditEvent.objects.filter(action=AuditAction.PROJECT_DEADLINE_CHANGED).count()
+        self.patch_project(self.owner_a, {'deadline': (timezone.now() + timedelta(days=200)).isoformat()})
+        after = AuditEvent.objects.filter(action=AuditAction.PROJECT_DEADLINE_CHANGED).count()
+        self.assertEqual(before, after)
+
+    def test_other_fields_still_update(self):
+        """The refusal is about one field, not the endpoint."""
+        response = self.patch_project(self.owner_a, {'title': 'Renamed'})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.title, 'Renamed')
+
+    def test_the_dedicated_endpoint_still_works(self):
+        response = self.client.post(
+            f'/api/v1/projects/{self.project.id}/change-deadline/',
+            json.dumps({
+                'deadline': (timezone.now() + timedelta(days=120)).isoformat(),
+                'reason': 'Client moved the launch',
+            }),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200, response.content)

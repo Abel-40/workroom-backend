@@ -57,7 +57,12 @@ from .models import (
 
 User = get_user_model()
 
-PROJECT_UPDATABLE_FIELDS = {'title', 'description', 'visibility', 'priority', 'start_date', 'deadline', 'status'}
+# `deadline` is deliberately absent, exactly as it is for tasks: moving one
+# requires a stated reason, writes an audit row, notifies everyone holding a
+# live task, and refuses to strand tasks past the new date. Leaving it
+# writable here made all four optional by choosing the other endpoint --
+# see change_project_deadline.
+PROJECT_UPDATABLE_FIELDS = {'title', 'description', 'visibility', 'priority', 'start_date', 'status'}
 
 # Field-level authority on a task. Which fields a person may write depends on
 # what they are to the task, not just on whether they can reach it at all.
@@ -216,7 +221,13 @@ async def list_projects_for_user(user):
     company = await get_member_company(user)
     if company is None:
         return Project.objects.none()
-    qs = Project.objects.filter(company=company, is_deleted=False).select_related('department', 'created_by', 'current_owner')
+    # `company` is selected because every row is now access-resolved for the
+    # caller (see api.routers.projects.project_data), and resolving reads
+    # project.company -- a lazy load there is a runtime error in the event
+    # loop, not a slow query.
+    qs = Project.objects.filter(company=company, is_deleted=False).select_related(
+        'company', 'department', 'created_by', 'current_owner',
+    )
     role = await get_company_role(user, company)
     if role in (CompanyUserProfile.Role.Owner, CompanyUserProfile.Role.COMPANY_MANAGER):
         return qs.order_by('-created_at')
@@ -380,8 +391,18 @@ async def create_project(user, *, title, description, visibility, priority, star
 
 
 async def update_project(user, project, updates: dict):
+    """Apply a partial update. Returns (project, error).
+
+    `deadline` is refused here and has its own endpoint, the same rule tasks
+    follow: a date moving under the people doing the work needs a reason, an
+    audit row, a notification, and a check that it does not strand tasks past
+    it. An explicit refusal rather than a silent drop -- ignoring the field
+    would return 200 on a request that changed nothing.
+    """
     if not await user_can_manage_project(user, project):
         return None, 'forbidden'
+    if 'deadline' in updates:
+        return None, 'deadline_has_own_route'
     role = await get_company_role(user, project.company)
     if 'department_id' in updates and role in DEPARTMENT_SCOPED_ROLES:
         # A DL/DM's own department is fixed at creation (see create_project)

@@ -33,7 +33,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP17 | Plans, `Entitlements`, `UsageCounter`, enforcement (§11) | **done** |
 | WP18 | Integration seams (§12) | **done** |
 | WP19 | `docs/DECISIONS.md` (§13) | **done** |
-| WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | |
+| WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | **partial** — composable + task panel done; remaining views outstanding |
 | WP21 | Owner-with-no-membership backfill, then delete every "owner might have no profile" branch (§10) | **done** |
 | WP22 | Company context returns the membership, accepts an explicit company id (§10) | **done** |
 | WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | **partial** — plan written, README outstanding |
@@ -1323,6 +1323,80 @@ comment explaining that `member_a` "can view the query (company-visible
 project)" -- the premise that *was* the defect.
 
 Full suite: **969 passed, 1 failed** in 9m47s -- the Redis one.
+
+---
+
+## WP20 — Frontend consolidation, and a defect it uncovered
+
+### The project deadline had the same bypass tasks did
+
+Found while auditing the frontend's API calls, not while looking for it.
+
+`PROJECT_UPDATABLE_FIELDS` still contained `deadline`, so `PATCH
+/projects/{id}/` moved a project deadline with **no reason, no audit row, no
+notification, and no check that it would strand tasks past the new date** --
+all four of which WP5 built into `change_project_deadline`. WP7a closed exactly
+this for tasks and left the project half open. Closed now, the same way, with
+the same explicit refusal rather than a silent drop.
+
+### The server states the access level; the client stops guessing
+
+The prompt asks for "a single `useProjectAccess(project)` hook replacing every
+inline role check". The obvious build is a TypeScript copy of
+`resolve_project_access`. That is precisely what `lib/projectPermissions.ts`
+already was, and it had drifted **twice**: it still granted management on
+`createdById`, which the backend stopped doing in WP4 for projects and WP7a for
+tasks. A mirrored rule set is a second source of truth, and the second one is
+always the stale one.
+
+So `project_data` now takes a `viewer` and returns `access_level`
+(`view`/`contribute`/`manage`), straight from `resolve_project_access`. The
+composable reads it. There is nothing left to drift.
+
+Names on the wire, not the stored integers: a client comparing `20 >= 10` is a
+client that breaks silently the day a level is inserted between two existing
+ones.
+
+This cost one real bug on the way in -- the project listing did not
+`select_related('company')`, and resolving access lazy-loads it inside the
+event loop. A 500, caught by the suite.
+
+### The task edit form is split by authority
+
+`TaskDetailPanel` sent title, priority, department, type, description,
+estimate **and** deadline in one request. Under WP7a that is a 400 for the
+deadline and a 403 for mixing the two authority groups.
+
+It now sends whichever group the user owns, as separate requests, and hides
+the management-only controls from an assignee rather than disabling them -- a
+greyed-out control somebody can never use is a worse answer than not offering
+it. Moving a deadline collects the reason the server requires, in the form,
+rather than discovering the requirement as an error.
+
+The store mirrors the split and refuses a mixed patch locally, turning a
+confusing 403 into a statement of the rule.
+
+### R4 was partly wrong
+
+It recorded that WP5 broke the frontend by renaming `/extend-deadline/` to
+`/change-deadline/`. The frontend never called that endpoint -- it moved
+deadlines through the general PATCH, which is the bypass described above. The
+breakage was real; the diagnosis was not.
+
+**11 tests** in `src/composables/useProjectAccess.test.ts`, and **5** for the
+project-deadline route in `projects_and_tasks/test_task_authority.py`.
+
+Backend suite: **974 passed, 1 failed** -- the Redis one. Frontend: 31 tests,
+and `vue-tsc` clean apart from one pre-existing error in `authStore.ts`.
+
+### Still outstanding in WP20
+
+The composable and the task panel are done. The remaining views still call
+`usePermissions()`/`lib/projectPermissions.ts` for project-scoped questions,
+and should move across one at a time -- each is a behaviour change worth its
+own review, not a mechanical rename. `lib/projectPermissions.ts` stays until
+they have, and its docstring should be read as describing rules the server no
+longer uses.
 
 ---
 
