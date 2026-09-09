@@ -26,7 +26,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | |
 | WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | |
 | WP12 | AI assistant privacy; health-summary anonymity (§5) | **done** |
-| WP13 | Events: audience, attendees, RRULE (§6) | |
+| WP13 | Events: audience, attendees, RRULE (§6) | **done** |
 | WP14 | Unified `Document` model with scopes (§7) | **done** |
 | WP15 | Analytics tiers (§8) | **done** |
 | WP16 | To-dos: timezone, eligibility, supersede semantics (§9) | **done** |
@@ -1397,6 +1397,163 @@ and should move across one at a time -- each is a behaviour change worth its
 own review, not a mechanical rename. `lib/projectPermissions.ts` stays until
 they have, and its docstring should be read as describing rules the server no
 longer uses.
+
+---
+
+## WP13 — Events: who an event is for
+
+§6. Before this, an event had no audience and no scheduling rule: any member
+could create one and every member could see all of them. "Book a room with two
+people" and "announce the all-hands" were the same action, with the same
+reach.
+
+### The audience is both halves of the question
+
+One field answers who may see an event and who was allowed to schedule it, and
+the two are not the same shape — scheduling widens as the audience widens,
+because an event on somebody's calendar that they did not ask for is a small
+claim on their time.
+
+| audience | who may schedule | who may see |
+|---|---|---|
+| `personal` | anyone, self only | the organizer, and **nobody else** |
+| `custom` | anyone | organizer + named attendees |
+| `team` | Owner/CM, the team's lead, or the DL of the department the event names | the team's members and lead |
+| `department` | Owner/CM, or that department's leader | that department |
+| `company` | Owner/CM only | every active member |
+
+`custom` being open to anyone is deliberate and comes straight from §6: a
+meeting with named attendees is ordinary collaboration, not a governance
+action. It is the one audience a department member can use to involve other
+people, which is why the rest can be closed off without making the calendar
+useless to them.
+
+### Two deviations from the literal text of §6, both recorded
+
+**1. `personal` has no administrative override.** §6 lists edit/delete as
+"organizer, plus Owner/CM, plus DL for their own department's events", with no
+exception. Applied to `personal` that produces an Owner who can delete an
+entry they are not allowed to read — the audience grants view to the organizer
+alone. §7 already settles this exact question for `documents.Document`'s
+`personal` scope ("no admin override, ever, including Owner-over-CM or
+CM-over-Owner"), and this follows it rather than inventing a second answer for
+the same word. Every other audience keeps the Owner/CM/DL rights §6 states.
+
+**2. Manage implies view.** §6 says view follows the audience match, and
+separately puts Owner/CM on the edit list for every audience. Taken literally,
+an Owner could delete a `custom` meeting they cannot open. The containment
+rule is applied instead: anyone who may edit or delete an event may see it.
+This is the only reason an Owner sees a `custom` meeting they are not on, and
+it is the direction the brief's own edit list points.
+
+Neither weakens an existing check: every event that exists today becomes
+`company`, which is what it already was.
+
+### The migration preserves current visibility exactly
+
+The model default is `personal` — the right default for a *new* row, and the
+wrong answer for an old one, since applying it to existing data would empty
+every company's calendar overnight. Migration `0003` sets every existing event
+to `company`, which is precisely what they already were. Nobody gains sight of
+anything and nobody loses it.
+
+The API default is a third value again: **`custom`**. A client that predates
+the field sends a title, a time and a list of attendee ids, which *is* a custom
+meeting. Reading that as `company` would hand every member a scheduling right
+the matrix just removed; reading it as `personal` would silently drop the
+attendees it named. `custom` is the only reading that neither escalates nor
+discards. All three defaults are different on purpose and each is commented
+where it is set.
+
+### `EventAttendee` replaces the bare M2M
+
+`Event.attendees` could record that somebody was invited and nothing else — an
+organizer could not tell an empty room from a full one. `EventAttendee` carries
+`response` (no_response/accepted/declined/tentative), `responded_at` and
+`invited_by`.
+
+Only the invitee may set their own response. An organizer marking somebody as
+attending would make the field describe the organizer's hope rather than the
+invitee's answer, which is the whole value of having it.
+
+Reconciling the attendee list leaves existing rows alone rather than replacing
+them, so somebody who has already accepted does not lose their answer because
+the organizer added a sixth person.
+
+Same deprecation shape as `Project.collaborators` in WP4: rows backfilled, M2M
+dual-written for one release, deprecation and removal order in the field's
+comment. `invited_by` is left NULL by the backfill — the M2M never recorded who
+added whom, and defaulting it to the organizer would be a guess written into an
+audit-adjacent field.
+
+### Recurrence is one RRULE string
+
+`recurrence_rule` (`FREQ=WEEKLY;BYDAY=MO,WE`) replaces the
+`is_recurring`/`recurrence_cadence`/`recurrence_days` trio, which could express
+"weekly on Monday and Wednesday" and nothing else — no "every other Tuesday",
+no end date, and every one of those would have been another column.
+
+**Nothing expands a rule into occurrences.** No per-occurrence rows, no series,
+no materialisation — that is on the OUT OF SCOPE list and stays there.
+
+Validated with `dateutil.rrulestr`, which is already a dependency. A rule, not
+a calendar: anything carrying `DTSTART`, `EXDATE`, `RDATE`, `EXRULE` or a
+second line is refused, because a stored value with its own start date would
+disagree with the event's `start_at`. The parser's own message is never
+returned to the client.
+
+The legacy fields are still accepted and still returned, derived from the rule
+rather than stored beside it. A rule the old shape cannot express
+(`INTERVAL=2`, `FREQ=YEARLY`) projects back as "repeats, and these fields
+decline to say how", which is the honest answer where "weekly" would be a
+wrong one. The whole shim lives in `resolve_recurrence_rule` at the HTTP
+boundary, so deleting the old contract later is a change to one function.
+
+### Judgment calls
+
+1. **A `Team` has no department**, so §6's "DL of the owning department" cannot
+   be resolved for a team event through the team. It is resolved through the
+   department the *event* names, where it names one; otherwise the team's own
+   lead is the whole rule. Recorded rather than assumed because the phrase
+   reads as though `Team.department` exists.
+2. **A `custom` event with no attendees is allowed.** Requiring at least one
+   would add a failure mode with no security benefit — its audience is already
+   organizer-only, exactly like `personal`.
+3. **`department`/`team` audiences must name their group.** An audience that
+   names none is not a narrower event, it is an event nobody can see.
+4. **Visibility is decided in the query, not per row.** The calendar is
+   paginated; filtering in Python would paginate over rows the caller cannot
+   see and return short pages for no visible reason.
+5. **One new audit action, `event.audience_changed`.** Who can see an event is
+   the only change here that cannot be inferred afterwards from the row. Title
+   and time changes are not audited — the catalog is a closed set on purpose.
+
+### Escalation is checked twice
+
+Changing the audience needs manage rights on the event as it stands *and*
+creation rights for the audience it is becoming. Otherwise a department member
+schedules a `custom` meeting and immediately widens it to `company`, which is
+the one thing the creation matrix exists to stop.
+
+### Files
+
+`event_management/recurrence.py` (new), `models.py`, `services.py`,
+`migrations/0002_*`, `migrations/0003_backfill_event_audience_attendees.py`,
+`api/routers/events.py`, `audit/models.py` + `audit/migrations/0005_*`.
+
+**56 tests** across `event_management/test_audience.py` (creation matrix,
+visibility, escalation, attendee responses, the backfill against a legacy
+fixture) and `event_management/test_recurrence.py` (rule validation, the legacy
+translation both ways, the API shim).
+
+### Frontend break to add to R4
+
+`POST /api/v1/events/` now takes `audience`, and omitting it yields a `custom`
+meeting rather than a company-wide one — so the existing "add event" modal
+silently stops broadcasting. `AddEventModal.vue` needs an audience selector
+that offers only what the caller's role permits, and `EventDetailView.vue`
+should render the attendee responses and offer accept/decline. The recurrence
+UI keeps working untouched through the shim.
 
 ---
 
