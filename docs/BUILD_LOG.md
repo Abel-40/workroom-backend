@@ -25,7 +25,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP9 | `ProjectBrief` and brief-assisted creation (§1) | |
 | WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | |
 | WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | |
-| WP12 | AI assistant privacy; health-summary anonymity (§5) | |
+| WP12 | AI assistant privacy; health-summary anonymity (§5) | **done** |
 | WP13 | Events: audience, attendees, RRULE (§6) | |
 | WP14 | Unified `Document` model with scopes (§7) | **done** |
 | WP15 | Analytics tiers (§8) | **done** |
@@ -1238,6 +1238,91 @@ processed twice is how one merged pull request becomes two of something.
 Written. It states the plans, how a limit resolves, how usage is counted, the
 over-limit rules, what is deliberately not built, and the five steps to turn
 enforcement on. The README half of WP23 is still outstanding.
+
+---
+
+## WP12 — AI conversation privacy, and health-summary anonymity
+
+Two rules from §5 that pull in opposite directions, which is the point: an
+assistant query is a personal question and a health summary is not.
+
+### D8, closed
+
+`get_assistant_query_for_user` gated reads on `user_can_view_project`. Every
+colleague who could open a project could read **every question anyone had ever
+asked about it**, and the project listing returned all of them. A project
+manager could also delete somebody else's.
+
+Queries are now private to `requested_by`, with no project-manager override and
+no company-owner override, in either direction. §5 is absolute about this and
+the reason is worth stating: what somebody asks an assistant is a record of
+what they did not know, and a manager able to read their reports' questions
+changes what people are willing to ask -- which makes the feature worse for
+everyone, the manager included.
+
+A query the caller may not read answers **404, not 403**. "You may not read
+Alice's conversation" already tells you Alice asked something.
+
+The listing filters in the query rather than after it, so it cannot leak
+through a forgotten check and pagination counts what the caller can actually
+see.
+
+### Deletion is a removed path, not a tightened check
+
+§5 asks for the ability to delete another person's conversation to be removed
+rather than guarded. `delete_assistant_query` no longer takes any argument that
+permits it -- the manager branch is gone, not gated -- and a test asserts that
+four different privileged actors all get `forbidden`, so re-adding the branch
+has to break something.
+
+Self-deletion stays. That is the same right the privacy rule exists to
+protect; removing it would make your own question a permanent record you
+cannot withdraw.
+
+### Sharing
+
+`visibility` is `private` by default, which is also the correct historical
+answer, so the migration needs no backfill -- every pre-existing conversation
+became private by adding a column.
+
+The owner can share one answer with everyone who has project VIEW, and take it
+back. Two things it deliberately does not do: reading a shared answer does not
+let you share it onward (that decision stays with the person who asked), and
+unsharing stops future reads without pretending to unsee what somebody already
+read. Saving an answer to the Info Portal already existed and already follows
+folder permissions from then on.
+
+### A health summary must never name an individual
+
+The counterpart. A summary is generated from analytics and is readable by
+anyone with project VIEW -- which is exactly why naming somebody turns it into
+a broadcast performance statement about a named person, written by a model that
+was guessing. §8 forbids building per-person performance metrics deliberately;
+this is the same prohibition arriving by accident, through prose.
+
+Checked in `health_anonymity.py` against the company's member list, **before
+the row is written**. Once it is in the table it has been readable, so a
+summary that names anyone is regenerated rather than saved and tidied up
+afterwards. If regeneration is exhausted the summary fails closed -- not
+redacted and saved, because a summary stripped of names is a summary whose
+meaning nobody checked.
+
+Matching details that earn their place: names are compared accent-folded, so
+"Jose" catches "José"; separators are flexible, so `alice-nguyen` and
+`j.smith` are caught; matching is on word boundaries, so "Rob" does not fire
+on "robust"; and names under three characters are skipped, because initials
+appear inside ordinary words and a validator that rejects every summary is one
+somebody switches off. The warning log records the *count* of names found, not
+the names -- logging them would recreate the leak somewhere with weaker access
+controls than the table it was kept out of.
+
+**40 tests** in `ai_agent/test_assistant_privacy.py`.
+
+Three stale expectations, all asserting the old 403. One of them carried a
+comment explaining that `member_a` "can view the query (company-visible
+project)" -- the premise that *was* the defect.
+
+Full suite: **969 passed, 1 failed** in 9m47s -- the Redis one.
 
 ---
 

@@ -338,6 +338,8 @@ async def assistant_query_data(query: AIAssistantQuery) -> dict:
         'model': query.model,
         'answer': query.answer,
         'refused': query.refused,
+        'visibility': query.visibility,
+        'shared_at': query.shared_at.isoformat() if query.shared_at else None,
         'requested_at': query.requested_at.isoformat(),
         'started_at': query.started_at.isoformat() if query.started_at else None,
         'completed_at': query.completed_at.isoformat() if query.completed_at else None,
@@ -398,7 +400,10 @@ async def list_assistant_queries(request, project_id: UUID, page: int = 1, page_
         return payload('Project not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this project.', 403, False)
-    queryset = AIAssistantQuery.objects.filter(project=project).order_by('-requested_at')
+    # Your own, plus anything the owner shared. Filtered in the query rather
+    # than after it -- this listing previously returned every question anyone
+    # had asked about the project.
+    queryset = assistant_services.list_assistant_queries_for_project(request.auth, project)
     items, meta = await paginate(queryset, page, page_size)
     return payload('Assistant query history retrieved successfully.', 200, True, {
         'results': [await assistant_query_data(query) for query in items], 'meta': meta,
@@ -446,12 +451,56 @@ async def delete_assistant_query_view(request, query_id: UUID):
     query, error = await assistant_services.get_assistant_query_for_user(request.auth, query_id)
     if error == 'not_found':
         return payload('Assistant query not found.', 404, False)
-    if error == 'forbidden':
-        return payload('You do not have permission to delete this assistant query.', 403, False)
     error = await assistant_services.delete_assistant_query(request.auth, query)
     if error == 'forbidden':
-        return payload('You do not have permission to delete this assistant query.', 403, False)
+        # Reachable only for a *shared* query the caller can read but does not
+        # own. There is no longer any path by which one person deletes
+        # another's question -- see assistant_services.delete_assistant_query.
+        return payload('Only the person who asked can delete this.', 403, False)
     return payload('Assistant query deleted.', 200, True)
+
+
+@router.post(
+    '/ai/assistant-queries/{query_id}/share/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def share_assistant_query_view(request, query_id: UUID):
+    """Make one answer visible to everyone who can view the project.
+
+    Owner only. Being able to read a shared answer does not let you share it
+    onward; that decision stays with the person who asked.
+    """
+    query, error = await assistant_services.get_assistant_query_for_user(request.auth, query_id)
+    if error == 'not_found':
+        return payload('Assistant query not found.', 404, False)
+    error = await assistant_services.share_assistant_query(request.auth, query)
+    if error == 'forbidden':
+        return payload('Only the person who asked can share this.', 403, False)
+    return payload('Answer shared with the project.', 200, True, {
+        'query': await assistant_query_data(query),
+    })
+
+
+@router.post(
+    '/ai/assistant-queries/{query_id}/unshare/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def unshare_assistant_query_view(request, query_id: UUID):
+    """Take a shared answer back to private.
+
+    Honest about its limits: this stops future reads, it does not unsee what
+    somebody already read. Worth having anyway -- a share nobody can undo is
+    a share nobody makes.
+    """
+    query, error = await assistant_services.get_assistant_query_for_user(request.auth, query_id)
+    if error == 'not_found':
+        return payload('Assistant query not found.', 404, False)
+    error = await assistant_services.unshare_assistant_query(request.auth, query)
+    if error == 'forbidden':
+        return payload('Only the person who asked can change who sees this.', 403, False)
+    return payload('Answer is private again.', 200, True, {
+        'query': await assistant_query_data(query),
+    })
 
 
 def health_summary_data(summary: AIProjectHealthSummary) -> dict:

@@ -1527,8 +1527,11 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
             **auth_header(self.owner_a),
         )
         query_id = created.json()['data']['assistant_query']['id']
+        # 404, not 403. An assistant query is private to whoever asked it, and
+        # a private question must not confirm its own existence -- "you may not
+        # read this" already tells you somebody asked something.
         response = self.client.get(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 404)
 
     def test_question_over_max_length_is_rejected(self):
         project = self.create_project(owner=self.owner_a)
@@ -1599,7 +1602,7 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
         )
         query_id = created.json()['data']['assistant_query']['id']
         response = self.client.delete(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 404)
 
     @patch('ai_agent.assistant_services.process_assistant_query.delay')
     def test_delete_assistant_query_forbidden_for_non_requester_member(self, mock_delay):
@@ -1610,10 +1613,12 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
             **auth_header(self.owner_a),
         )
         query_id = created.json()['data']['assistant_query']['id']
-        # member_a can view the query (company-visible project) but didn't
-        # ask it and has no manage rights on the project -- must not delete it.
+        # This asserted 403 on the reasoning that member_a "can view the query
+        # (company-visible project)". That premise was the defect: project
+        # visibility no longer grants any read on somebody else's assistant
+        # query, so it is not found rather than forbidden.
         response = self.client.delete(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.member_a))
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 404)
 
     def test_save_as_page_splits_the_answer_into_structured_blocks(self):
         project = self.create_project(owner=self.owner_a)

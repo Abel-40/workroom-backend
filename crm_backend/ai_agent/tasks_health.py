@@ -19,6 +19,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 
+from .health_anonymity import names_found_in
 from .models import AIProjectHealthSummary
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,21 @@ def _call_ai_service(payload: dict) -> dict:
     raise PermanentHealthSummaryError(
         f'AI service rejected the request ({response.status_code}): {response.text[:500]}',
     )
+
+
+def _project_members(project):
+    """Everyone the summary must not name: the company's members plus its
+    owner. Read at validation time rather than passed in, because a member
+    added between the request and the answer is still somebody who must not
+    be named."""
+    from users.models import CompanyUserProfile, User
+
+    ids = set(
+        CompanyUserProfile.objects.filter(company_id=project.company_id).values_list('user_id', flat=True)
+    )
+    if project.company.owner_id:
+        ids.add(project.company.owner_id)
+    return list(User.objects.filter(id__in=ids).only('first_name', 'last_name', 'username', 'email'))
 
 
 def _mark_failed(summary: AIProjectHealthSummary, error_message: str):
@@ -114,6 +130,31 @@ def process_health_summary(self, summary_id: str):
         risk_level = ''
     if not summary_text:
         _mark_failed(summary, 'AI service returned an empty summary.')
+        return
+
+    # §5's hard rule, checked before the row is written rather than after.
+    # A health summary is generated from analytics and readable by everyone
+    # with project VIEW; the moment it names somebody it becomes a broadcast
+    # performance statement about a named person, written by a model that was
+    # guessing. Once it is in the table it has been readable, so a summary
+    # that names anyone is regenerated, never saved and tidied up later.
+    named = names_found_in(summary_text, _project_members(summary.project))
+    if named:
+        # Deliberately logs the count, not the names -- a log line listing who
+        # the AI named would recreate the leak in a place with weaker access
+        # controls than the table it was kept out of.
+        logger.warning(
+            'ai_health_summary.named_individuals',
+            extra={'summary_id': str(summary.id), 'name_count': len(named), 'attempt': self.request.retries},
+        )
+        if self.request.retries < self.max_retries:
+            # Regenerate. The model is non-deterministic, so asking again is
+            # a real fix rather than a hopeful one.
+            raise self.retry(countdown=5)
+        _mark_failed(
+            summary,
+            'The generated summary referred to individual people and could not be produced anonymously.',
+        )
         return
 
     summary.status = AIProjectHealthSummary.STATUS.COMPLETED

@@ -163,6 +163,17 @@ class AIAssistantQuery(UUIDModel):
     only, never a general-purpose assistant). Django owns this record
     end-to-end, same as AIGeneration -- the FastAPI service only ever
     returns an answer through Celery, never writes here directly.
+
+    **Private by default, and private means private.** `requested_by` is the
+    only reader unless they explicitly share it. There is no project-manager
+    override and no company-owner override, in either direction.
+
+    That is stricter than it sounds and it is deliberate. What somebody asks
+    an assistant is a record of what they did not know, and a manager able to
+    read their reports' questions changes what people are willing to ask --
+    which makes the feature worse for everybody, including the manager. The
+    previous rule gated reads on project *view*, so every colleague who could
+    open the project could read every question asked about it.
     """
 
     class STATUS(models.TextChoices):
@@ -170,6 +181,13 @@ class AIAssistantQuery(UUIDModel):
         PROCESSING = 'processing', 'Processing'
         COMPLETED = 'completed', 'Completed'
         FAILED = 'failed', 'Failed'
+
+    class Visibility(models.TextChoices):
+        PRIVATE = 'private', 'Private to the person who asked'
+        # Shared deliberately, by the owner, with everyone who can view the
+        # project. There is no middle scope: a per-person share would be a
+        # second permission system for one answer.
+        PROJECT = 'project', 'Shared with the project'
 
     project = models.ForeignKey(
         'projects_and_tasks.Project', on_delete=models.CASCADE, related_name='ai_assistant_queries',
@@ -179,6 +197,11 @@ class AIAssistantQuery(UUIDModel):
     )
     question = models.TextField()
     reference_url = models.URLField(blank=True, default='')
+    # Defaults to private, which is also what every existing row becomes when
+    # this column is added -- the migration needs no backfill because the
+    # default *is* the correct historical answer.
+    visibility = models.CharField(max_length=20, choices=Visibility.choices, default=Visibility.PRIVATE)
+    shared_at = models.DateTimeField(null=True, blank=True)
     # Workroom pages the requester explicitly selected as context -- distinct
     # from the project's text-attachment excerpts (get_text_document_excerpts),
     # which are always included regardless of selection.
