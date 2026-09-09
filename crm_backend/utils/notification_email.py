@@ -27,6 +27,8 @@ TEMPLATE_MAP = {
     'folder_shared': 'emails/notifications/folder_shared_email.html',
     'todos_generated': 'emails/notifications/todos_generated_email.html',
     'todos_generation_failed': 'emails/notifications/todos_generation_failed_email.html',
+    'workload_override_requested': 'emails/notifications/workload_override_requested_email.html',
+    'workload_override_decided': 'emails/notifications/workload_override_decided_email.html',
 }
 
 

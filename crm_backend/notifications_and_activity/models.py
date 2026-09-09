@@ -55,6 +55,8 @@ class Notification(UUIDModel):
         TASK_PROPOSED = 'task_proposed', 'Task Proposed'
         TASK_PROPOSAL_ACCEPTED = 'task_proposal_accepted', 'Task Proposal Accepted'
         TASK_PROPOSAL_DECLINED = 'task_proposal_declined', 'Task Proposal Declined'
+        WORKLOAD_OVERRIDE_REQUESTED = 'workload_override_requested', 'Workload Override Requested'
+        WORKLOAD_OVERRIDE_DECIDED = 'workload_override_decided', 'Workload Override Decided'
         DEADLINE_EXTENDED = 'deadline_extended', 'Deadline Extended'
         PROJECT_AUTO_COMPLETED = 'project_auto_completed', 'Project Auto-Completed'
         VISIBILITY_REQUESTED = 'visibility_requested', 'Visibility Request'

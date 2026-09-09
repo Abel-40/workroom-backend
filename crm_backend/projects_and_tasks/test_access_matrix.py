@@ -432,7 +432,7 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
     def test_a_task_deadline_may_equal_the_project_deadline(self):
         """FIXED (was D5): the strict inequality is what forced the AI
         generator to subtract an hour from every task it produced."""
-        task, error = async_to_sync(services.create_task)(
+        task, _decision, error = async_to_sync(services.create_task)(
             self.other, self.project, title='On the boundary', description='x',
             priority='medium', deadline=self.project.deadline,
         )
@@ -440,7 +440,7 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
         self.assertEqual(task.deadline, self.project.deadline)
 
     def test_a_task_deadline_still_cannot_fall_after_the_project_deadline(self):
-        _, error = async_to_sync(services.create_task)(
+        _, _decision, error = async_to_sync(services.create_task)(
             self.other, self.project, title='One second too far', description='x',
             priority='medium', deadline=self.project.deadline + timedelta(seconds=1),
         )
@@ -449,7 +449,7 @@ class KnownDefectCharacterizationTests(AccessWorldMixin, TestCase):
     def test_a_task_deadline_defaults_to_the_project_deadline(self):
         """A task that runs to the end of its project is the common case, and
         making people retype the project's own date to say so was friction."""
-        task, error = async_to_sync(services.create_task)(
+        task, _decision, error = async_to_sync(services.create_task)(
             self.other, self.project, title='No deadline given', description='x',
             priority='medium', deadline=None,
         )

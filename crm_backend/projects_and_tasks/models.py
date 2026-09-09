@@ -159,6 +159,7 @@ class ApprovalRequest(UUIDModel):
     class Kind(models.TextChoices):
         PROJECT_VISIBILITY = 'project_visibility', 'Project visibility change'
         TASK_PROPOSAL = 'task_proposal', 'Task proposal'
+        WORKLOAD_OVERRIDE = 'workload_override', 'Assignment over a workload limit'
 
     class Status(models.TextChoices):
         PENDING = 'pending', 'Pending'
@@ -206,9 +207,15 @@ class ApprovalRequest(UUIDModel):
             # contributors may each suggest several pieces of work on the same
             # project at once. A blanket constraint would have let exactly one
             # person hold a proposal open at a time.
+            #
+            # A workload override falls on the visibility side. It targets one
+            # task and asks for one assignment; two open asks to assign the
+            # same task over the same limit is not a state anyone can reason
+            # about, and approving the older one would apply an assignment a
+            # newer request had already changed.
             models.UniqueConstraint(
                 fields=['kind', 'target_type', 'target_id'],
-                condition=models.Q(status='pending', kind='project_visibility'),
+                condition=models.Q(status='pending', kind__in=('project_visibility', 'workload_override')),
                 name='one_pending_approval_request_per_target',
             ),
         ]

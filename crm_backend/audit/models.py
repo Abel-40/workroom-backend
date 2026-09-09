@@ -47,6 +47,7 @@ class AuditAction(models.TextChoices):
     TASK_APPROVAL_REJECTED = 'task.approval_rejected', 'Task approval rejected'
     TASK_APPROVAL_VOIDED = 'task.approval_voided', 'Task approval voided by reassignment'
     TASK_ASSIGNEE_CHANGED = 'task.assignee_changed', 'Task assignee changed'
+    TASK_ASSIGNED_OVER_LIMIT = 'task.assigned_over_limit', 'Task assigned past a workload limit'
     TASK_PROPOSAL_DECIDED = 'task.proposal_decided', 'Task proposal accepted or declined'
     EVENT_AUDIENCE_CHANGED = 'event.audience_changed', 'Event audience changed'
     MEMBER_ROLE_CHANGED = 'member.role_changed', 'Member role changed'

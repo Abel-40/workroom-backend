@@ -32,6 +32,10 @@ TYPE_CATEGORY = {
     Notification.Type.TASK_PROPOSED: Notification.Category.CRITICAL,
     Notification.Type.TASK_PROPOSAL_ACCEPTED: Notification.Category.OPTIONAL,
     Notification.Type.TASK_PROPOSAL_DECLINED: Notification.Category.OPTIONAL,
+    # An assignment is waiting on this decision, so the reviewer is blocking
+    # somebody; the requester learning the outcome is not blocking anyone.
+    Notification.Type.WORKLOAD_OVERRIDE_REQUESTED: Notification.Category.CRITICAL,
+    Notification.Type.WORKLOAD_OVERRIDE_DECIDED: Notification.Category.OPTIONAL,
     Notification.Type.DEADLINE_EXTENDED: Notification.Category.OPTIONAL,
     Notification.Type.PROJECT_AUTO_COMPLETED: Notification.Category.OPTIONAL,
     # A pending request blocking someone else's work is actionable/time-sensitive;
@@ -544,4 +548,46 @@ def log_team_created(team, actor):
         team.company, actor, CompanyActivity.ActivityType.TEAM_CREATED,
         f"Team '{team.name}' was created",
         related_object_type='team', related_object_id=team.id,
+    )
+
+
+def notify_workload_override_requested(request, task):
+    """Tells the named reviewer that an assignment is waiting on their call.
+
+    Same shape as notify_task_proposed: one named reviewer rather than every
+    person who could decide it, so a routine "they are at five tasks, I still
+    want to give them this" does not read as an escalation to the whole
+    management chain.
+    """
+    if request.reviewer_id is None:
+        return
+    from users.models import User
+
+    reviewer = User.objects.filter(id=request.reviewer_id).first()
+    if reviewer is None:
+        return
+    requester = request.requested_by
+    requester_name = (requester.get_full_name() or requester.email) if requester else 'Someone'
+    _create(
+        reviewer, Notification.Type.WORKLOAD_OVERRIDE_REQUESTED,
+        f"{requester_name} wants to assign '{task.title}' past a workload limit",
+        message=request.payload.get('reason') or 'No reason was given.',
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_workload_override_decided(request, task):
+    """Tells the requester what happened. The reviewer's comment travels with
+    it: the request named a person and a reason, and a bare "denied" would
+    leave the requester with no way to act on it."""
+    if request.requested_by_id is None:
+        return
+    approved = request.status == 'approved'
+    _create(
+        request.requested_by, Notification.Type.WORKLOAD_OVERRIDE_DECIDED,
+        f"Your assignment request for '{task.title}' was {'approved' if approved else 'declined'}",
+        message=request.decision_comment or (
+            'The assignment has been made.' if approved else 'No reason was given.'
+        ),
+        related_object_type='task', related_object_id=task.id,
     )

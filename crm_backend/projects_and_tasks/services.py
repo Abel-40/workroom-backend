@@ -34,6 +34,8 @@ from notifications_and_activity.services import (
     notify_task_deadline_changed,
     notify_task_proposal_accepted,
     notify_task_proposal_declined,
+    notify_workload_override_decided,
+    notify_workload_override_requested,
     notify_task_proposed,
     notify_task_rejected,
     notify_task_submission_voided,
@@ -48,6 +50,7 @@ from documents import services as documents_services
 from documents.services import validate_upload
 from entitlements import services as entitlements
 from entitlements.models import UsageCounter
+from workforce import workload
 
 from .access import AccessLevel, resolve_project_access
 from .models import (
@@ -806,8 +809,14 @@ async def _resolve_assignee(company, assignee_id):
 
 
 async def create_task(user, project, *, title, description, priority, deadline, estimated_time=None,
-                       department_id=None, task_type_id=None, assigned_to_id=None):
+                       department_id=None, task_type_id=None, assigned_to_id=None,
+                       override_reason=''):
     """Add a task to a project. Requires MANAGE.
+
+    Returns ``(task, decision, error)``. The middle element is the workload
+    policy's verdict (workforce.workload.AssignmentDecision) and is what lets
+    the caller show "this is their sixth open task" alongside a successful
+    create -- warn mode is only useful if the number reaches somebody.
 
     Project *view* used to be enough, which meant company visibility -- meant
     to grant discovery and nothing else -- let any member of the company add
@@ -821,51 +830,83 @@ async def create_task(user, project, *, title, description, priority, deadline, 
     replacement would have removed the ability to raise work at all.
     """
     if not await user_can_manage_project(user, project):
-        return None, 'forbidden'
+        return None, None, 'forbidden'
     if project.status == Project.STATUS.DONE:
         # A new (necessarily not-Done) task would silently break the "all
         # tasks Done" invariant Done itself represents. Reopening has to stay
         # the explicit, creator-only action in update_project (B5).
-        return None, 'project_completed'
+        return None, None, 'project_completed'
     if deadline is None:
         # A task that runs to the end of its project is the common case, and
         # making people retype the project's own deadline to express it was
         # friction with no purpose.
         deadline = project.deadline
     if deadline < timezone.now() - PAST_DATE_GRACE:
-        return None, 'invalid_deadline'
+        return None, None, 'invalid_deadline'
     if deadline > project.deadline:
         # Inclusive: a task may land exactly on the project deadline. The
         # strict version is what forced the AI generator to subtract an hour
         # from every generated task so its output would validate.
-        return None, 'invalid_deadline'
+        return None, None, 'invalid_deadline'
     department, error = await _resolve_department(project.company, department_id)
     if error:
-        return None, error
+        return None, None, error
     task_type, error = await _resolve_task_type(project.company, task_type_id)
     if error:
-        return None, error
+        return None, None, error
     assignee, error = await _resolve_assignee(project.company, assigned_to_id)
     if error:
-        return None, error
+        return None, None, error
+    role = None
     if assignee is not None:
         # Same eligibility scoping as assign_task (B4) -- otherwise a DL/DM
         # could bypass it by setting the assignee at creation instead of
         # through the separate assign endpoint.
         role = await get_company_role(user, project.company)
         if role in DEPARTMENT_SCOPED_ROLES and not await is_eligible_assignee(user, project, assignee):
-            return None, 'ineligible_assignee'
-    task = await Task.objects.acreate(
-        project=project, department=department, task_type=task_type, assigned_to=assignee,
-        title=title, description=description, priority=priority, deadline=deadline,
-        estimated_time=estimated_time, created_by=user, source=Task.SOURCE.MANUAL,
+            return None, None, 'ineligible_assignee'
+
+    def build_task():
+        return Task.objects.create(
+            project=project, department=department, task_type=task_type, assigned_to=assignee,
+            title=title, description=description, priority=priority, deadline=deadline,
+            estimated_time=estimated_time, created_by=user, source=Task.SOURCE.MANUAL,
+        )
+
+    # The workload policy applies here as well as on the assign endpoint, for
+    # the same reason the eligibility check does: a limit you can step around
+    # by setting the assignee at creation is not a limit.
+    decision, task = await workload.guarded_write(
+        project.company, assignee, build_task, actor_role=role, override_reason=override_reason,
     )
+    if task is None:
+        return None, decision, 'workload_blocked'
+
     if assignee is not None:
+        if decision.breached:
+            await _record_over_limit_assignment(user, task, decision, override_reason)
         # B8: create_task previously never notified an assignee set at
         # creation time, unlike assign_task's separate reassignment path --
         # inconsistent for what's the same outcome (you were assigned to X).
         await sync_to_async(notify_task_assigned, thread_sensitive=True)(task)
-    return task, None
+    return task, decision, None
+
+
+async def _record_over_limit_assignment(actor, task, decision, override_reason=''):
+    """Audit an assignment that crossed a configured limit.
+
+    Written for both the warn case and an authorized block override. The warn
+    case matters most: nothing stopped it, so the audit row is the only record
+    that anybody was told and went ahead anyway.
+    """
+    await arecord_event(
+        company=task.project.company, actor=actor, action=AuditAction.TASK_ASSIGNED_OVER_LIMIT,
+        target=task,
+        before={'workload': decision.workload.as_dict() if decision.workload else None},
+        after={'assigned_to': str(task.assigned_to_id) if task.assigned_to_id else None,
+               'breached': list(decision.breached), 'enforcement': decision.enforcement},
+        reason=override_reason or '',
+    )
 
 
 async def update_task(user, task, updates: dict):
@@ -973,8 +1014,11 @@ async def is_eligible_assignee(user, project, candidate) -> bool:
     return any(u.id == candidate.id for u in eligible)
 
 
-async def assign_task(user, task, assignee_id):
+async def assign_task(user, task, assignee_id, *, override_reason=''):
     """Move a task to a different assignee, or to nobody.
+
+    Returns ``(task, decision, error)`` -- see create_task for why the
+    workload verdict travels back with the result.
 
     A pending submission does not block the reassignment -- it is voided by
     it. Blocking would be the wrong way round: the common reason to reassign
@@ -988,29 +1032,42 @@ async def assign_task(user, task, assignee_id):
     is audited.
     """
     if not await user_can_manage_task(user, task):
-        return None, 'forbidden'
+        return None, None, 'forbidden'
     assignee, error = await _resolve_assignee(task.project.company, assignee_id)
     if error:
-        return None, error
+        return None, None, error
+    role = await get_company_role(user, task.project.company)
     if assignee is not None:
         # list_eligible_assignees' department/team branches are a curated
         # subset (they don't include the Owner/CM unless literally a member
         # of that department), not a security boundary for a manage_any
         # role -- so only DL/DM assignment is actually restricted to it,
         # matching every other department-scoped check this session (B4).
-        role = await get_company_role(user, task.project.company)
         if role in DEPARTMENT_SCOPED_ROLES and not await is_eligible_assignee(user, task.project, assignee):
-            return None, 'ineligible_assignee'
+            return None, None, 'ineligible_assignee'
 
     previous_assignee_id = task.assigned_to_id
     new_assignee_id = assignee.id if assignee is not None else None
     if previous_assignee_id == new_assignee_id:
         # Reassigning someone to the task they already hold is a no-op, not a
-        # reason to void their submission out from under them.
-        return task, None
+        # reason to void their submission out from under them. Deliberately
+        # before the workload check: a no-op cannot put anybody over a limit,
+        # and refusing it would strand a task whose holder is already at cap.
+        return task, workload.AssignmentDecision(allowed=True, enforcement='off'), None
 
-    task.assigned_to = assignee
-    await task.asave(update_fields=['assigned_to', 'updated_at'])
+    def apply_assignment():
+        task.assigned_to = assignee
+        task.save(update_fields=['assigned_to', 'updated_at'])
+        return task
+
+    decision, applied = await workload.guarded_write(
+        task.project.company, assignee, apply_assignment,
+        actor_role=role, override_reason=override_reason,
+    )
+    if applied is None:
+        return None, decision, 'workload_blocked'
+    if decision.breached:
+        await _record_over_limit_assignment(user, task, decision, override_reason)
     await arecord_event(
         company=task.project.company, actor=user, action=AuditAction.TASK_ASSIGNEE_CHANGED, target=task,
         before={'assigned_to': str(previous_assignee_id) if previous_assignee_id else None},
@@ -1019,7 +1076,7 @@ async def assign_task(user, task, assignee_id):
     await _void_pending_approval(task, actor=user)
     if assignee is not None:
         await sync_to_async(notify_task_assigned, thread_sensitive=True)(task)
-    return task, None
+    return task, decision, None
 
 
 async def _void_pending_approval(task, *, actor):
@@ -1459,7 +1516,7 @@ async def accept_task_proposal(user, request, overrides=None):
         # being used.
         fields.update({k: v for k, v in overrides.items() if k in TASK_PROPOSAL_FIELDS and v is not None})
 
-    task, error = await create_task(
+    task, _decision, error = await create_task(
         user, project,
         title=fields.get('title') or 'Untitled task',
         description=fields.get('description') or 'No description provided',
@@ -2026,3 +2083,152 @@ async def get_default_task_types_with_status(company) -> list[dict]:
         {'id': str(item.id), 'name': item.name, 'description': item.description, 'enabled': item.id in enabled_ids}
         async for item in DefaultTaskType.objects.filter(Q(sector_id=company.sector_id) | Q(sector__isnull=True))
     ]
+
+
+# --------------------------------------------------------------------------
+# Workload overrides
+# --------------------------------------------------------------------------
+
+WORKLOAD_OVERRIDE_TARGET_TYPE = 'projects_and_tasks.task'
+
+
+async def resolve_company_member(company, user_id):
+    """Public form of the assignee check, for callers outside this module.
+
+    Same rule as every assignment path: an id from a request body is only ever
+    a name for somebody who is already an active member of *this* company.
+    Returns (user, error) with error 'invalid_assignee' or None.
+    """
+    return await _resolve_assignee(company, user_id)
+
+
+async def _resolve_workload_override_reviewer(project):
+    """Who decides an assignment that crosses a limit.
+
+    The same fallback chain as a task proposal -- accountable owner, then
+    creator, then the company owner -- because the question is the same shape:
+    somebody with authority over this project has to say yes, and the request
+    must never be created with nobody named on it.
+    """
+    return await _resolve_task_proposal_reviewer(project)
+
+
+async def request_workload_override(user, task, assignee, decision, reason):
+    """Ask somebody who can authorise it to make an assignment anyway.
+
+    Raised when block mode refused the assignment and the requester is not in
+    ``override_roles``. This is the difference between a limit and a wall: a
+    wall tells a manager no and stops, a limit routes the decision to whoever
+    is allowed to weigh it.
+
+    Returns (request, error) where error is 'duplicate_request', 'no_reason',
+    or None. The snapshot of the workload at the time of asking is stored on
+    the payload for the reviewer to read -- but approving re-checks from
+    scratch and never assigns from the payload, exactly as accept_task_proposal
+    does.
+    """
+    if not reason:
+        return None, 'no_reason'
+    try:
+        request = await ApprovalRequest.objects.acreate(
+            company=task.project.company,
+            kind=ApprovalRequest.Kind.WORKLOAD_OVERRIDE,
+            target_type=WORKLOAD_OVERRIDE_TARGET_TYPE,
+            target_id=task.id,
+            payload={
+                'assignee_id': str(assignee.id),
+                'reason': reason,
+                'breached': list(decision.breached),
+                'limits': decision.limits,
+                'workload_at_request': decision.workload.as_dict() if decision.workload else None,
+            },
+            requested_by=user,
+            reviewer=await _resolve_workload_override_reviewer(task.project),
+        )
+    except IntegrityError:
+        # The partial unique constraint: one open ask per task. A second is
+        # not a second opinion, it is a race between two answers.
+        return None, 'duplicate_request'
+    await sync_to_async(notify_workload_override_requested, thread_sensitive=True)(request, task)
+    return request, None
+
+
+async def get_workload_override_for_user(user, request_id):
+    """Tenant scoping only -- authority to decide is checked in the decide
+    call, keeping a 403 there distinguishable from a 404 for something outside
+    the caller's company. Same split as get_task_proposal_for_user."""
+    company = await get_member_company(user)
+    if company is None:
+        return None, 'not_found'
+    request = await ApprovalRequest.objects.select_related('requested_by').filter(
+        id=request_id, company=company, kind=ApprovalRequest.Kind.WORKLOAD_OVERRIDE,
+    ).afirst()
+    if request is None:
+        return None, 'not_found'
+    return request, None
+
+
+async def _override_task(request):
+    return await Task.objects.select_related(
+        'project', 'project__company', 'assigned_to',
+    ).filter(id=request.target_id, is_deleted=False).afirst()
+
+
+async def decide_workload_override(user, request, *, approve, comment=''):
+    """Approve or decline an assignment that crossed a limit.
+
+    Approving performs the assignment through ``assign_task`` with the
+    *reviewer* as the actor, never by writing the payload. That is the rule
+    ApprovalRequest exists for: the workload is re-read at decision time, so
+    an override approved a day later cannot apply a number that was true
+    yesterday, and an assignee who has since been taken off other work simply
+    passes the check normally.
+
+    Returns (request, error) where error is 'not_pending', 'forbidden',
+    'task_gone', 'invalid_assignee', or whatever assign_task returned.
+    """
+    if request.status != ApprovalRequest.Status.PENDING:
+        return None, 'not_pending'
+    task = await _override_task(request)
+    if task is None:
+        return None, 'task_gone'
+    if not await user_can_manage_task(user, task):
+        return None, 'forbidden'
+
+    if approve:
+        assignee_id = request.payload.get('assignee_id')
+        # The reviewer's own authority is what carries the assignment, so the
+        # reason is theirs to state too -- the requester's reason is on the
+        # payload and is what they are agreeing with.
+        _, _decision, error = await assign_task(
+            user, task, assignee_id,
+            override_reason=comment or request.payload.get('reason') or 'Approved workload override',
+        )
+        if error:
+            return None, error
+
+    request.status = ApprovalRequest.Status.APPROVED if approve else ApprovalRequest.Status.DENIED
+    request.decided_by = user
+    request.decided_at = timezone.now()
+    request.decision_comment = comment or ''
+    await request.asave(update_fields=['status', 'decided_by', 'decided_at', 'decision_comment'])
+    await sync_to_async(notify_workload_override_decided, thread_sensitive=True)(request, task)
+    return request, None
+
+
+async def list_workload_overrides_for_user(user, *, status=None):
+    """Open override requests in the caller's company.
+
+    Not filtered to requests naming this person as reviewer: the reviewer is
+    advisory, and anyone with MANAGE on the task may decide it -- the same
+    rule that stops one person's absence stalling the proposal queue.
+    """
+    company = await get_member_company(user)
+    if company is None:
+        return ApprovalRequest.objects.none()
+    queryset = ApprovalRequest.objects.filter(
+        company=company, kind=ApprovalRequest.Kind.WORKLOAD_OVERRIDE,
+    ).select_related('requested_by', 'reviewer')
+    if status:
+        queryset = queryset.filter(status=status)
+    return queryset.order_by('-created_at')

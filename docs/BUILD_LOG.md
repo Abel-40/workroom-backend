@@ -23,7 +23,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP7b | Task creation behind MANAGE; task proposals; break-into-steps (§2) | **done** |
 | WP8 | Task dependencies — `blocks` / `relates_to` (§2) | **done** |
 | WP9 | `ProjectBrief` and brief-assisted creation (§1) | |
-| WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | |
+| WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | **done** |
 | WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | |
 | WP12 | AI assistant privacy; health-summary anonymity (§5) | **done** |
 | WP13 | Events: audience, attendees, RRULE (§6) | **done** |
@@ -1557,6 +1557,237 @@ UI keeps working untouched through the shim.
 
 ---
 
+## WP10 — People, skills, capacity, and a limit on assignment
+
+§3, in a new app: `workforce`. It owns who the people in a company are and how
+much they can take on. Capacity fields live on `users.CompanyUserProfile`
+rather than in this app, for the same reason `MemberSkill` points at the
+membership: how many hours a week somebody works is a fact about a job, not
+about a person.
+
+### No free text anywhere
+
+`Profession` and `Skill` are company-scoped controlled vocabularies, seeded
+from sector templates exactly as departments, task types and event types
+already are. `MemberSkill` attaches a skill to a *membership* at a stated
+level.
+
+Uniqueness is **case-insensitive** — `UniqueConstraint('company', Lower(name))`
+— which is stricter than the plain `unique_together` the older catalogs use.
+That is the entire point of the section: "Python" / "python" / "Python 3" as
+three rows makes every question you would ask of the data quietly wrong rather
+than loudly broken. A company-created skill also reuses an existing category's
+exact spelling where one matches, so two spellings cannot split a list in the
+UI for no reason a user can see.
+
+`Skill.category` stayed a plain string rather than becoming a fourth
+template-pair. It groups skills for display and nothing else: no permission,
+no matching rule and no AI context reads it, so a table to control it would be
+machinery in exchange for nothing.
+
+### `profession` was three things at once
+
+The existing `CompanyUserProfile.profession` was a `CharField` defaulting to
+the literal `'Not provided'`, which made it a real answer, a placeholder and a
+null simultaneously, and every consumer had to know which. It is now
+deprecated in favour of `profession_ref`, dual-written for one release, with
+migration `0002` reading what people actually typed into a catalog.
+
+The backfill is deliberately conservative: only the literal placeholders are
+dropped, everything else is kept verbatim including odd capitalisation, and
+case variants fold into the first spelling seen. A migration is the wrong place
+to decide somebody's job title was a typo.
+
+`is_eligible_for_ai_recommendation` never consults the old column, for the
+obvious reason — `'Not provided'` was its default, so reading it would make
+every member in the database eligible.
+
+### Eligibility is a nudge, not a gate
+
+Profession is **not** mandatory. A member with no profession and no skills is
+simply not eligible for AI assignee recommendation, and the profile says so in
+as many words with the reason. Nobody is stopped from doing anything; they are
+not recommended for work nobody has recorded them as able to do. §3 asked for a
+self-interested nudge rather than a compliance chore, and a field somebody is
+forced to fill is a field full of noise.
+
+### Two numbers, for two jobs
+
+`active_task_count` is the cheap guardrail: no estimates and no stated capacity
+needed, so it works on day one. `committed_hours` against prorated
+`capacity_hours` over a 14-day rolling horizon is the meaningful figure and
+much more conditional.
+
+They count different things on purpose. The task count includes every open
+task — one due in March is still something you are on the hook for.
+`committed_hours` counts only what falls inside the horizon, **including
+anything already overdue**, because that is what the next fortnight actually
+looks like.
+
+**The honesty rule is the one worth keeping.** A task with no estimate
+contributes zero hours, which makes an overloaded person look free. So
+`hours_complete` travels with the number everywhere it goes, and the
+utilisation limit **does not fire** when it is False. Refusing on a figure
+known to be short is refusing on a figure known to be wrong; a limit that
+silently under-counts produces confident wrong answers and people stop
+believing the ones that are right.
+
+Unstated capacity is `None`, not zero. Treating "never opened the setting" as
+"works no hours" would put every such member permanently over any utilisation
+limit.
+
+### The policy warns, and only sometimes blocks
+
+`AssignmentPolicy` is one row per company, absent by default, and absent means
+no policy. Enforcement resolution has three outcomes, and the plan is part of
+it:
+
+- no `workload_policy_warn` entitlement → **off**, not even warn (§11: free
+  gets no policy at all)
+- configured `block` without `workload_policy_block` → **degrades to warn**,
+  not to off. They configured a limit and are entitled to be told about it;
+  they are not entitled to have it stop anybody.
+- otherwise what the row says.
+
+Warn mode returns the number beside a successful assignment — that is the whole
+point of warn mode, and a warning nobody sees is not one. Block mode refuses
+with a 403 whose body carries the limit, the current figures, and the route
+forward, so the UI offers a request instead of a dead end.
+
+`max_active_tasks=2` means two: the third assignment is the one refused, not
+the second.
+
+### Enforcement is at both assignment points
+
+`create_task` with an assignee is checked as well as `assign_task`. A limit you
+can step around by setting the assignee at creation is not a limit — the same
+reasoning WP7b applied to the eligibility check, which had exactly this gap.
+
+Both return `(task, decision, error)` now. The middle element is what lets a
+caller show "this is their sixth open task" alongside a successful create.
+
+Never blocked: unassigning, and reassigning somebody to the task they already
+hold. A no-op cannot put anyone over a limit, and refusing it would strand a
+task whose holder is already at cap.
+
+### The lock, and where it is not taken
+
+`guarded_write_sync` evaluates the policy and performs the write in one
+transaction, taking `select_for_update` on the target's membership row **in
+block mode only**. Checking in the caller and writing afterwards is a
+check-then-act race: two managers both read "4 of 5" and both proceed. In warn
+mode nothing is being enforced, and serialising every assignment in the company
+to produce a message nobody is bound by would be a real cost for no benefit.
+
+`apply` is a callable because the two paths write different things — one
+updates a task, one creates one — while the check around them has to be
+identical.
+
+A `TransactionTestCase` runs two real threads against a cap of one and asserts
+exactly one wins.
+
+### A refusal a manager can act on
+
+Block mode without an override role routes to
+`ApprovalRequest(kind='workload_override')` — the difference between a limit
+and a wall. A wall tells a manager no and stops; a limit routes the decision to
+whoever is allowed to weigh it.
+
+Approving calls `assign_task` with the *reviewer* as actor and never writes the
+payload, so the workload is re-read at decision time. An override approved a
+day later cannot apply a number that was true yesterday, and an assignee since
+taken off other work simply passes the check normally. That is the property
+`ApprovalRequest` exists for, and `accept_task_proposal` already established
+it.
+
+The pending-uniqueness constraint gained `workload_override` on the
+`project_visibility` side rather than the `task_proposal` side: it targets one
+task and asks for one assignment, so two open asks is a race between two
+answers rather than a second opinion.
+
+### Audited both ways
+
+`task.assigned_over_limit` is written for an authorized block override *and*
+for a warn-mode assignment that went ahead. The warn case matters most: nothing
+stopped it, so the audit row is the only record that somebody was told and
+proceeded anyway.
+
+### A patch script that reached too far
+
+Worth recording because it nearly shipped. Widening `create_task`'s return
+arity was done with a scripted `re.sub` between two anchors located with
+`str.index` — which finds the *first* match, not the one inside the target
+function. The window opened at an earlier `return None, 'forbidden'` and
+rewrote eleven returns across nine unrelated functions, including
+`get_task_for_user` and `get_viewable_project`. Every one of them then raised
+`ValueError: too many values to unpack` at runtime.
+
+The suite caught all twenty-four immediately, and every failure was a
+cross-tenant test asserting 404 and receiving 500 — which is the good version
+of this going wrong. The environment notes already say not to build edits by
+generated script; this is that lesson arriving a second time, in a new
+disguise. Anchored, verified string replacement or a real edit, not a regex
+over a window whose bounds were guessed.
+
+### A guard that paid for itself
+
+`NotificationEmailTemplateMappingTests::test_every_notification_type_maps_to_a
+_distinct_template` failed on the full run: the two new notification types had
+no email template, so both would have silently fallen back to the generic one
+in production and nobody would have noticed until somebody read a vague email.
+Two templates added and mapped. Worth naming because it is the kind of test
+that looks like bookkeeping right up to the moment it stops a real gap.
+
+### Judgment calls
+
+1. **A new app rather than growing `users`.** Catalogs, claims and limits are
+   one domain — "who the people are and how much they can take on" — and
+   putting them in `users` would have grown the identity app into a people
+   app.
+2. **Workload arithmetic lives in `workforce.workload`, and `analytics` will
+   call it.** One definition of "committed hours", not two that drift.
+3. **`/workforce/members/{id}/workload/` is readable by any member of the same
+   company.** It is the figure a manager consults *before* assigning; gating it
+   would make the policy's warning the first time anybody sees a number. It
+   carries no per-person performance measure — §8 rules those out and this
+   does not smuggle one in.
+4. **Everybody edits their own skills; Owner/CM edit anybody's.** A skill claim
+   is a statement about yourself, and needing a manager's help to record one is
+   how the data stops being kept up to date.
+5. **`availability` is validated on write.** A `JSONField` accepts any shape,
+   so the contract only exists where it is checked. Unknown keys are dropped
+   rather than rejected; an empty `working_days` array is refused, because it
+   is indistinguishable from a UI sending nothing and omitting the key is how
+   you ask for the default week.
+
+### Files
+
+New: `workforce/` (models, services, workload, tests, migrations, seed
+command), `api/routers/workforce.py`.
+Changed: `users/models.py` (+ migrations 0009, 0010),
+`projects_and_tasks/models.py` + `services.py` (+ migration 0018),
+`api/routers/tasks.py`, `audit/models.py` (+ 0006),
+`notifications_and_activity/models.py` + `services.py` (+ 0011),
+`crm_backend/settings/base.py`, `utils/notification_email.py` + two email
+templates, `projects_and_tasks/test_access_matrix.py` (three call sites,
+arity only).
+
+**139 tests** across `workforce/tests.py` (catalogs, member claims, capacity,
+availability validation, the profession backfill against a legacy fixture, seed
+idempotency) and `workforce/test_workload.py` (proration, the workload figures,
+the policy matrix, the settings endpoints, override requests, and the
+concurrency race).
+
+### Frontend work this creates
+
+A skills/profession picker on the member profile with the eligibility hint, a
+capacity and availability form, an assignment-policy settings page, the warn
+notice beside an assignment, the block dialog with an "ask for approval"
+action, and a reviewer queue for override requests. None of it is built —
+`useProjectAccess` and the WP20 views come first.
+
+---
+
 ## Test gate in use
 
 Per commit: the affected app's tests, plus `makemigrations --check --dry-run`,
@@ -1676,6 +1907,13 @@ exists, and record it when one does not", which is a real decision about
 separation of duties rather than a tidy-up, and it needs its own baseline
 regeneration. Worth doing as WP7c or folding into WP10, where the fallback
 chain gets revisited anyway.
+
+**Update, WP10.** Not folded in. WP10 reuses the proposal reviewer chain for
+workload overrides but never touches `user_can_approve_task`, so the premise
+that it would be revisited "anyway" turned out to be wrong -- they are two
+different chains that happen to resolve the same three people. R5 still needs
+its own commit, its own baseline regeneration, and a decision on what to do
+when the only eligible approver is the submitter.
 
 ### R6 — `today` mode is a daily focus list, not a backlog
 

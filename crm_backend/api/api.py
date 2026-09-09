@@ -53,6 +53,7 @@ from .routers.task_types import router as task_types_router
 from .routers.tasks import router as tasks_router
 from .routers.teams import router as teams_router
 from .routers.todos import router as todos_router
+from .routers.workforce import router as workforce_router
 from .schemas import (
     ApiResponse,
     CheckoutIn,
@@ -98,6 +99,7 @@ api.add_router('/company/members', members_router)
 api.add_router('/activity', activity_router)
 api.add_router('/company/default-config', company_config_router)
 api.add_router('/company/settings', company_settings_router)
+api.add_router('/workforce', workforce_router)
 
 payload = api_response
 logger = logging.getLogger(__name__)
