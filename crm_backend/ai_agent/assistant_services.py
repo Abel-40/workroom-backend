@@ -7,8 +7,10 @@ is scoped to the AI-decomposition flow only.
 import logging
 
 from asgiref.sync import sync_to_async
+from django.db.models import Q
+from django.utils import timezone
 from pages.services import get_pages_by_ids_for_company
-from projects_and_tasks.services import user_can_manage_project, user_can_view_project
+from projects_and_tasks.services import user_can_view_project
 
 from .models import AIAssistantQuery
 from .tasks_assistant import process_assistant_query
@@ -16,7 +18,9 @@ from .tasks_assistant import process_assistant_query
 logger = logging.getLogger(__name__)
 
 
-async def request_assistant_query(user, project, question: str, reference_url: str | None, page_ids: list | None = None):
+async def request_assistant_query(
+    user, project, question: str, reference_url: str | None, page_ids: list | None = None,
+):
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
     page_ids = page_ids or []
@@ -44,22 +48,96 @@ async def request_assistant_query(user, project, question: str, reference_url: s
     return query, None
 
 
+async def can_read_assistant_query(user, query) -> bool:
+    """The owner, or anybody with project VIEW once the owner has shared it.
+
+    No manager override and no company-owner override. This used to be
+    ``user_can_view_project`` alone, which meant every colleague who could
+    open a project could read every question anyone had asked about it.
+    """
+    if query.requested_by_id == user.id:
+        return True
+    if query.visibility != AIAssistantQuery.Visibility.PROJECT:
+        return False
+    return await user_can_view_project(user, query.project)
+
+
 async def get_assistant_query_for_user(user, query_id):
+    """Returns (query, error) with error 'not_found' or None.
+
+    A query the caller may not read answers 'not_found' rather than
+    'forbidden'. A private question must not confirm its own existence --
+    "you may not read Alice's conversation" already tells you Alice asked
+    something.
+    """
     query = await AIAssistantQuery.objects.select_related('project', 'project__company').filter(
         id=query_id,
     ).afirst()
     if query is None:
         return None, 'not_found'
-    if not await user_can_view_project(user, query.project):
-        return None, 'forbidden'
+    if not await can_read_assistant_query(user, query):
+        return None, 'not_found'
     return query, None
 
 
+def list_assistant_queries_for_project(user, project):
+    """What this caller may see on a project: their own, plus shared ones.
+
+    Filtered in the query rather than after it, so the listing cannot leak
+    through a forgotten check and pagination counts what the caller can
+    actually see.
+    """
+    return AIAssistantQuery.objects.filter(
+        Q(requested_by=user) | Q(visibility=AIAssistantQuery.Visibility.PROJECT),
+        project=project,
+    ).order_by('-requested_at')
+
+
+async def share_assistant_query(user, query) -> str | None:
+    """Make one answer visible to everyone who can view the project.
+
+    Owner only. Being able to read a shared answer does not let you share it
+    onward -- that decision stays with the person who asked.
+    """
+    if query.requested_by_id != user.id:
+        return 'forbidden'
+    if query.visibility == AIAssistantQuery.Visibility.PROJECT:
+        return None
+    query.visibility = AIAssistantQuery.Visibility.PROJECT
+    query.shared_at = timezone.now()
+    await query.asave(update_fields=['visibility', 'shared_at'])
+    return None
+
+
+async def unshare_assistant_query(user, query) -> str | None:
+    """Take it back. Owner only.
+
+    Honest about its limits: this stops future reads, it does not unsee what
+    somebody already read. Worth having anyway -- the alternative is that a
+    share is irreversible, which makes people share nothing.
+    """
+    if query.requested_by_id != user.id:
+        return 'forbidden'
+    query.visibility = AIAssistantQuery.Visibility.PRIVATE
+    query.shared_at = None
+    await query.asave(update_fields=['visibility', 'shared_at'])
+    return None
+
+
 async def delete_assistant_query(user, query) -> str | None:
-    """Remove a query from the requester's own history. Restricted to the
-    requester or someone who can manage the project -- viewing is broader
-    (any project member) but deleting another member's question isn't."""
-    if not (query.requested_by_id == user.id or await user_can_manage_project(user, query.project)):
+    """Remove a query from the owner's own history. **Owner only.**
+
+    The manager branch is gone, not tightened. §5 asks for the ability to
+    delete somebody else's conversation to be removed as a code path rather
+    than guarded by a check that a later change could widen again -- so there
+    is no longer any argument this function takes that lets one person delete
+    another's question.
+
+    Self-deletion stays, and deliberately: it is the same right the privacy
+    rule exists to protect. Removing it would mean your own question is a
+    permanent record you cannot withdraw.
+    """
+    if query.requested_by_id != user.id:
         return 'forbidden'
     await query.adelete()
     return None

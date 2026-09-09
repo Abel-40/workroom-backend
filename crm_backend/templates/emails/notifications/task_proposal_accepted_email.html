@@ -1,0 +1,20 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-green{% endblock %}
+{% block eyebrow %}Accepted{% endblock %}
+{% block heading %}Your proposal is now a task{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-green"><span>&#9989;</span></div>
+
+    <div class="wr-highlight wr-highlight-green">{{ title }}</div>
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-green">Open the task</a>
+    </div>
+{% endblock %}

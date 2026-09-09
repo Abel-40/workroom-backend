@@ -10,6 +10,8 @@ authorization primitive rather than introducing a new permission scheme.
 """
 
 from asgiref.sync import sync_to_async
+from entitlements import services as entitlements
+from entitlements.models import UsageCounter
 from company.services import get_company_role, get_managed_company, get_member_department_id, is_company_member
 from django.contrib.auth import get_user_model
 from django.db.models import Q
@@ -63,6 +65,9 @@ async def create_department(user, *, name, description='', leader_id=None):
         return None, 'forbidden'
     if await Department.objects.filter(company=company, name__iexact=name).aexists():
         return None, 'duplicate_name'
+    entitlement = await entitlements.check(company, UsageCounter.Metric.DEPARTMENTS)
+    if not entitlement.allowed:
+        return entitlement, 'plan_limit'
     leader, error = await _resolve_leader(company, leader_id)
     if error:
         return None, error
@@ -79,6 +84,9 @@ async def create_team(user, *, name, description='', leader_id=None, member_ids=
         return None, 'forbidden'
     if await Team.objects.filter(company=company, name__iexact=name).aexists():
         return None, 'duplicate_name'
+    entitlement = await entitlements.check(company, UsageCounter.Metric.TEAMS)
+    if not entitlement.allowed:
+        return entitlement, 'plan_limit'
     leader, error = await _resolve_leader(company, leader_id)
     if error:
         return None, error

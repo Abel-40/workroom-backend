@@ -12,6 +12,10 @@ TEMPLATE_MAP = {
     'task_submitted_for_approval': 'emails/notifications/task_submitted_for_approval_email.html',
     'task_approved': 'emails/notifications/task_approved_email.html',
     'task_rejected': 'emails/notifications/task_rejected_email.html',
+    'task_submission_voided': 'emails/notifications/task_submission_voided_email.html',
+    'task_proposed': 'emails/notifications/task_proposed_email.html',
+    'task_proposal_accepted': 'emails/notifications/task_proposal_accepted_email.html',
+    'task_proposal_declined': 'emails/notifications/task_proposal_declined_email.html',
     'deadline_extended': 'emails/notifications/deadline_extended_email.html',
     'project_auto_completed': 'emails/notifications/project_auto_completed_email.html',
     'visibility_requested': 'emails/notifications/visibility_requested_email.html',
@@ -23,6 +27,8 @@ TEMPLATE_MAP = {
     'folder_shared': 'emails/notifications/folder_shared_email.html',
     'todos_generated': 'emails/notifications/todos_generated_email.html',
     'todos_generation_failed': 'emails/notifications/todos_generation_failed_email.html',
+    'workload_override_requested': 'emails/notifications/workload_override_requested_email.html',
+    'workload_override_decided': 'emails/notifications/workload_override_decided_email.html',
 }
 
 

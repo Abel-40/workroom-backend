@@ -31,6 +31,7 @@ from .tasks import task_data
 from ..auth import JWTBearerAuth
 from ..schemas import (
     AIAssistantIn,
+    AIGeneratedTaskAcceptSuggestionIn,
     AIGeneratedTaskAssignIn,
     AIGeneratedTaskCommentIn,
     AIPlanRequestIn,
@@ -57,6 +58,11 @@ def generated_task_data(item: AIGeneratedTask) -> dict:
         'suggested_department_id': str(item.suggested_department_id) if item.suggested_department_id else None,
         'suggested_task_type_id': str(item.suggested_task_type_id) if item.suggested_task_type_id else None,
         'suggested_assignee_id': str(item.suggested_assignee_id) if item.suggested_assignee_id else None,
+        'suggested_assignee_rationale': item.suggested_assignee_rationale,
+        'suggested_assignee_over_capacity': item.suggested_assignee_over_capacity,
+        # False whenever there is nothing to accept -- a suggestion field that
+        # reads "accepted" with no suggestion behind it would be misleading.
+        'suggested_assignee_accepted': item.suggested_assignee_accepted and item.suggested_assignee_id is not None,
         'assigned_to_id': str(item.assigned_to_id) if item.assigned_to_id else None,
         'reviewer_comment': item.reviewer_comment,
         'comment_resolved': item.comment_resolved,
@@ -81,6 +87,10 @@ async def generation_data(generation: AIGeneration, *, include_tasks: bool = Tru
         'max_tasks': generation.max_tasks,
         'requested_assignee_ids': generation.requested_assignee_ids,
         'error_message': generation.error_message,
+        'input_tokens': generation.input_tokens,
+        'output_tokens': generation.output_tokens,
+        'cost': float(generation.cost) if generation.cost is not None else None,
+        'fallback_from': generation.fallback_from or None,
     }
     if include_tasks:
         data['generated_tasks'] = [generated_task_data(item) async for item in generation.generated_tasks.all()]
@@ -99,7 +109,7 @@ async def request_ai_plan(request, project_id: UUID, data: AIPlanRequestIn):
         return payload('You do not have permission to request an AI plan for this project.', 403, False)
     generation, error = await services.request_project_plan(
         request.auth, project, prompt=data.prompt, mentioned_user_ids=data.mentioned_user_ids,
-        assignee_ids=data.assignee_ids, max_tasks=data.max_tasks,
+        assignee_ids=data.assignee_ids, max_tasks=data.max_tasks, idempotency_key=data.idempotency_key,
     )
     if error == 'forbidden':
         return payload('You do not have permission to request an AI plan for this project.', 403, False)
@@ -193,6 +203,53 @@ async def assign_generated_task(request, generation_id: UUID, task_id: UUID, dat
         item.assigned_to = candidate
     await item.asave(update_fields=['assigned_to', 'updated_at'])
     return payload('Assignee saved.', 200, True, {'generated_task': generated_task_data(item)})
+
+
+@router.patch(
+    '/ai/generations/{generation_id}/tasks/{task_id}/accept-suggestion/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def accept_generated_task_suggestion(
+    request, generation_id: UUID, task_id: UUID, data: AIGeneratedTaskAcceptSuggestionIn,
+):
+    """Explicitly take (or take back) the AI's suggested assignee.
+
+    Nothing changes on the real project by this call -- see
+    persist_ai_generated_tasks, which only ever applies a suggestion where
+    ``suggested_assignee_accepted`` is True. §4: a suggestion the reviewer
+    never looked at must never become a real assignment.
+    """
+    generation, item, error = await _get_generation_and_task_for_review(request, generation_id, task_id)
+    if error == 'not_found':
+        return payload('Generation or task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to review this plan.', 403, False)
+    if item.suggested_assignee_id is None:
+        return payload('This task has no suggested assignee to accept.', 400, False)
+    item.suggested_assignee_accepted = data.accepted
+    await item.asave(update_fields=['suggested_assignee_accepted', 'updated_at'])
+    return payload('Suggestion updated.', 200, True, {'generated_task': generated_task_data(item)})
+
+
+@router.post(
+    '/ai/generations/{generation_id}/accept-all-suggestions/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def accept_all_generated_task_suggestions(request, generation_id: UUID):
+    """The convenience action §4 asks for alongside "must be explicitly
+    accepted" -- one click, not one click per task."""
+    generation, error = await services.get_generation_for_user(request.auth, generation_id)
+    if error == 'not_found':
+        return payload('Generation not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to review this plan.', 403, False)
+    if not (generation.requested_by_id == request.auth.id or await user_can_manage_project(request.auth, generation.project)):
+        return payload('You do not have permission to review this plan.', 403, False)
+    updated = await AIGeneratedTask.objects.filter(
+        generation=generation, suggested_assignee_id__isnull=False,
+    ).aupdate(suggested_assignee_accepted=True)
+    items = [generated_task_data(item) async for item in generation.generated_tasks.all()]
+    return payload(f'{updated} suggestion(s) accepted.', 200, True, {'generated_tasks': items})
 
 
 @router.post(
@@ -338,6 +395,8 @@ async def assistant_query_data(query: AIAssistantQuery) -> dict:
         'model': query.model,
         'answer': query.answer,
         'refused': query.refused,
+        'visibility': query.visibility,
+        'shared_at': query.shared_at.isoformat() if query.shared_at else None,
         'requested_at': query.requested_at.isoformat(),
         'started_at': query.started_at.isoformat() if query.started_at else None,
         'completed_at': query.completed_at.isoformat() if query.completed_at else None,
@@ -398,7 +457,10 @@ async def list_assistant_queries(request, project_id: UUID, page: int = 1, page_
         return payload('Project not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this project.', 403, False)
-    queryset = AIAssistantQuery.objects.filter(project=project).order_by('-requested_at')
+    # Your own, plus anything the owner shared. Filtered in the query rather
+    # than after it -- this listing previously returned every question anyone
+    # had asked about the project.
+    queryset = assistant_services.list_assistant_queries_for_project(request.auth, project)
     items, meta = await paginate(queryset, page, page_size)
     return payload('Assistant query history retrieved successfully.', 200, True, {
         'results': [await assistant_query_data(query) for query in items], 'meta': meta,
@@ -446,12 +508,56 @@ async def delete_assistant_query_view(request, query_id: UUID):
     query, error = await assistant_services.get_assistant_query_for_user(request.auth, query_id)
     if error == 'not_found':
         return payload('Assistant query not found.', 404, False)
-    if error == 'forbidden':
-        return payload('You do not have permission to delete this assistant query.', 403, False)
     error = await assistant_services.delete_assistant_query(request.auth, query)
     if error == 'forbidden':
-        return payload('You do not have permission to delete this assistant query.', 403, False)
+        # Reachable only for a *shared* query the caller can read but does not
+        # own. There is no longer any path by which one person deletes
+        # another's question -- see assistant_services.delete_assistant_query.
+        return payload('Only the person who asked can delete this.', 403, False)
     return payload('Assistant query deleted.', 200, True)
+
+
+@router.post(
+    '/ai/assistant-queries/{query_id}/share/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def share_assistant_query_view(request, query_id: UUID):
+    """Make one answer visible to everyone who can view the project.
+
+    Owner only. Being able to read a shared answer does not let you share it
+    onward; that decision stays with the person who asked.
+    """
+    query, error = await assistant_services.get_assistant_query_for_user(request.auth, query_id)
+    if error == 'not_found':
+        return payload('Assistant query not found.', 404, False)
+    error = await assistant_services.share_assistant_query(request.auth, query)
+    if error == 'forbidden':
+        return payload('Only the person who asked can share this.', 403, False)
+    return payload('Answer shared with the project.', 200, True, {
+        'query': await assistant_query_data(query),
+    })
+
+
+@router.post(
+    '/ai/assistant-queries/{query_id}/unshare/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def unshare_assistant_query_view(request, query_id: UUID):
+    """Take a shared answer back to private.
+
+    Honest about its limits: this stops future reads, it does not unsee what
+    somebody already read. Worth having anyway -- a share nobody can undo is
+    a share nobody makes.
+    """
+    query, error = await assistant_services.get_assistant_query_for_user(request.auth, query_id)
+    if error == 'not_found':
+        return payload('Assistant query not found.', 404, False)
+    error = await assistant_services.unshare_assistant_query(request.auth, query)
+    if error == 'forbidden':
+        return payload('Only the person who asked can change who sees this.', 403, False)
+    return payload('Answer is private again.', 200, True, {
+        'query': await assistant_query_data(query),
+    })
 
 
 def health_summary_data(summary: AIProjectHealthSummary) -> dict:

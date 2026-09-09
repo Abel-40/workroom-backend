@@ -48,6 +48,14 @@ class Project(UUIDModel):
     # mutual-exclusion rule enforced whenever either is set.
     image_url = models.URLField(blank=True, default='')
     priority = models.CharField(max_length=20, choices=PRIORITY.choices, default=PRIORITY.MEDIUM)
+    # DEPRECATED -- superseded by ProjectMembership (role="contributor").
+    #
+    # Kept for one release and dual-written by the service layer so a rollback
+    # does not lose who was on a project. Nothing should *read* it: every
+    # access decision goes through projects_and_tasks.access
+    # .resolve_project_access, which reads ProjectMembership. Remove the field,
+    # and the dual-write in services._resolve_collaborators, once the release
+    # carrying the backfill has shipped.
     collaborators = models.ManyToManyField(User, related_name='collaborated_projects', blank=True)
     is_deleted = models.BooleanField(default=False)
 
@@ -71,14 +79,170 @@ class Project(UUIDModel):
         return (completed / total) * 100
 
 
+class ProjectMembership(UUIDModel):
+    """An explicit grant of access to one project, for one person.
+
+    This is what separates *discovery* from *capability*. Before it, the only
+    way to give somebody rights on a project was to widen the project's
+    visibility -- which handed the same rights to everyone else the visibility
+    covered -- or to make them its owner. Visibility now grants VIEW and
+    nothing more, and anything beyond VIEW is named here, per person.
+
+    The three roles map onto the access levels in
+    :mod:`projects_and_tasks.access`:
+
+    ``viewer``
+        VIEW. Useful on a private project, where visibility grants nothing.
+    ``contributor``
+        CONTRIBUTE. Work on what you are given: move your tasks, submit
+        evidence, log time, upload.
+    ``manager``
+        MANAGE. Shape the work. This is the replacement for co-ownership --
+        a project has exactly one accountable ``current_owner``, and any
+        number of managers.
+
+    A membership only ever *adds*: effective access is the maximum of every
+    grant that applies, so a row here can never take away what a company role
+    already gives.
+    """
+
+    class Role(models.TextChoices):
+        VIEWER = 'viewer', 'Viewer'
+        CONTRIBUTOR = 'contributor', 'Contributor'
+        MANAGER = 'manager', 'Manager'
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memberships')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='project_memberships')
+    role = models.CharField(max_length=20, choices=Role.choices, default=Role.CONTRIBUTOR)
+    # Who granted it. SET_NULL so the grant survives the granter leaving --
+    # the same reasoning as Project.created_by.
+    added_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name='granted_project_memberships', null=True, blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # One row per person per project. Two grants at different levels
+            # would make "what may they do" ambiguous at exactly the moment it
+            # matters; changing access means changing the role on this row.
+            models.UniqueConstraint(fields=['project', 'user'], name='one_membership_per_project_user'),
+        ]
+        indexes = [
+            # The resolver's lookup: this user, on this project.
+            models.Index(fields=['user', 'project']),
+        ]
+
+    def __str__(self):
+        return f'{self.user_id} on {self.project_id} ({self.role})'
+
+
+class ApprovalRequest(UUIDModel):
+    """One person asks, one person decides -- for any kind of ask.
+
+    Workroom kept growing one-off request models, starting with
+    ``ProjectVisibilityRequest``. Each brought its own status field, its own
+    reviewer resolution, its own pending-uniqueness rule and its own
+    notifications, and each had to be found and understood separately. This is
+    the single shape: what is being asked (``kind``), about what (``target``),
+    by whom, for whose decision, and what came of it.
+
+    The payload is a JSON field rather than columns because the *ask* differs
+    per kind while the workflow does not -- a visibility escalation carries a
+    target visibility, a workload override carries the limit being exceeded.
+    What is deliberately **not** in the payload is the decision's effect: when
+    a request is approved, a service applies it through the same validated path
+    a direct action would take. Approving never writes state straight from the
+    payload, so a stale or malformed one cannot become a change nobody checked.
+    """
+
+    class Kind(models.TextChoices):
+        PROJECT_VISIBILITY = 'project_visibility', 'Project visibility change'
+        TASK_PROPOSAL = 'task_proposal', 'Task proposal'
+        WORKLOAD_OVERRIDE = 'workload_override', 'Assignment over a workload limit'
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        DENIED = 'denied', 'Denied'
+
+    company = models.ForeignKey('company.Company', on_delete=models.CASCADE, related_name='approval_requests')
+    kind = models.CharField(max_length=32, choices=Kind.choices)
+    # Loose reference, same convention as AuditEvent and Notification: the
+    # target may be archived or deleted, and the request should still read.
+    target_type = models.CharField(max_length=64)
+    target_id = models.UUIDField()
+    payload = models.JSONField(default=dict, blank=True)
+
+    requested_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='approval_requests', null=True)
+    # Resolved once, at creation, using each kind's own fallback chain, so a
+    # request is never left with nobody able to act on it. Advisory rather than
+    # exclusive: anyone with authority over the target may decide it, which is
+    # what stops a request dying because one named person is on holiday.
+    reviewer = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name='approval_requests_to_review', null=True, blank=True,
+    )
+
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    decided_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name='decided_approval_requests', null=True, blank=True,
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_comment = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        constraints = [
+            # Whether two open asks may coexist is a property of the *kind*,
+            # not of the workflow, so the condition names the kinds it applies
+            # to rather than covering everything.
+            #
+            # A project has one visibility, so two pending requests to change
+            # it is not a state anyone can reason about, and letting them
+            # accumulate is how a reviewer approves one that a second, later
+            # request already superseded.
+            #
+            # Task proposals are the opposite: the whole point is that several
+            # contributors may each suggest several pieces of work on the same
+            # project at once. A blanket constraint would have let exactly one
+            # person hold a proposal open at a time.
+            #
+            # A workload override falls on the visibility side. It targets one
+            # task and asks for one assignment; two open asks to assign the
+            # same task over the same limit is not a state anyone can reason
+            # about, and approving the older one would apply an assignment a
+            # newer request had already changed.
+            models.UniqueConstraint(
+                fields=['kind', 'target_type', 'target_id'],
+                condition=models.Q(status='pending', kind__in=('project_visibility', 'workload_override')),
+                name='one_pending_approval_request_per_target',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'status', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.kind} on {self.target_type}:{self.target_id} ({self.status})'
+
+
 class ProjectVisibilityRequest(UUIDModel):
-    """A Department Member's request to raise a private project to
-    department visibility -- see projects_and_tasks.services
+    """DEPRECATED -- superseded by ApprovalRequest(kind="project_visibility").
+
+    A Department Member's request to raise a private project to department
+    visibility -- see projects_and_tasks.services
     .request_visibility_change/approve_visibility_request/deny_visibility_request.
     Company-level visibility is deliberately out of a DM's reach through this
     workflow: only a Department Leader (or Owner/CM) may raise a project to
     company visibility, done directly via the ordinary project-update
-    endpoint, not through a request/approval cycle."""
+    endpoint, not through a request/approval cycle.
+
+    Rows were copied onto ApprovalRequest in migration 0014. The table is kept
+    for one release rather than dropped -- dropping a populated table is not a
+    reversible operation and this one is still written by the endpoints above.
+    Move those endpoints onto ApprovalRequest, then remove this model.
+    """
 
     class STATUS(models.TextChoices):
         PENDING = 'pending', 'Pending'
@@ -143,6 +307,75 @@ class Attachment(UUIDModel):
         return f"{self.name} - {self.type}"
 
 
+
+class TaskDependency(UUIDModel):
+    """One edge between two tasks in the same project.
+
+    Two kinds, and deliberately only two:
+
+    ``blocks``
+        Hard. The successor cannot leave To Do until the predecessor is Done.
+        Checked live at the transition (see services.update_task_status), never
+        cached on the task -- a cached "is blocked" flag is wrong the moment
+        the predecessor moves, and the moment it is wrong somebody is either
+        stuck on work that is ready or working on work that is not.
+    ``relates_to``
+        Soft. Informational only, and it gates nothing. Its whole job is to
+        let somebody say "these two belong together" without that becoming a
+        scheduling claim.
+
+    What is deliberately absent: start-to-start, finish-to-finish,
+    start-to-finish, lag, critical path, and cross-project edges. Those turn a
+    task board into a project-management scheduler, which is a different
+    product with a different failure mode -- one where the plan is wrong in a
+    way nobody can see. Two kinds can be explained in a sentence, and the hard
+    one has exactly one observable consequence.
+
+    Edges are stored directionally even for ``relates_to``, where the
+    direction carries no meaning. Storing it once with an arbitrary direction
+    beats storing it twice and having to keep the halves consistent; readers
+    that want both sides ask for both (see services.list_task_dependencies).
+    """
+
+    class Kind(models.TextChoices):
+        BLOCKS = 'blocks', 'Blocks'
+        RELATES_TO = 'relates_to', 'Relates to'
+
+    # CASCADE on both sides: an edge to a task that no longer exists is not a
+    # record worth keeping, and leaving one would let a deleted task go on
+    # blocking live work.
+    predecessor = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='dependents')
+    successor = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='dependencies')
+    kind = models.CharField(max_length=20, choices=Kind.choices, default=Kind.BLOCKS)
+
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='created_dependencies', null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['predecessor', 'successor', 'kind'],
+                name='one_dependency_per_pair_and_kind',
+            ),
+            # The shortest possible cycle, and the only one a database
+            # constraint can catch. Everything longer is checked in the
+            # service, under a lock -- see services.add_task_dependency.
+            models.CheckConstraint(
+                condition=~models.Q(predecessor=models.F('successor')),
+                name='no_self_dependency',
+            ),
+        ]
+        indexes = [
+            # The live block check: "what must be Done before this task may
+            # start", asked on every To Do -> In Progress transition.
+            models.Index(fields=['successor', 'kind']),
+            models.Index(fields=['predecessor', 'kind']),
+        ]
+
+    def __str__(self):
+        return f'{self.predecessor_id} {self.kind} {self.successor_id}'
+
 class TaskApproval(UUIDModel):
     """One evidence-submission review cycle for a task. A task may go through
     several of these over its lifetime (submit -> reject -> resubmit ->
@@ -154,11 +387,29 @@ class TaskApproval(UUIDModel):
         PENDING = 'pending', 'Pending'
         APPROVED = 'approved', 'Approved'
         REJECTED = 'rejected', 'Rejected'
+        # The task was reassigned while this submission was still pending.
+        # Distinct from REJECTED on purpose: nobody judged the work. Rejected
+        # means "this is not good enough" and is a fact about the submission;
+        # voided means "the question stopped applying" and is a fact about the
+        # task. Collapsing the two would put a black mark on the record of
+        # somebody whose work was never actually read.
+        VOIDED = 'voided', 'Voided'
 
     task = models.ForeignKey('Task', on_delete=models.CASCADE, related_name='approvals')
     submitted_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='submitted_approvals', null=True)
     submitted_at = models.DateTimeField(auto_now_add=True)
+    # Lateness is recorded on the submission, not on the task: a task may be
+    # submitted late, rejected, and resubmitted on time, and both facts are
+    # true of their own attempt. Overdue remains a derived state everywhere
+    # else -- there is no "late" status and no extra Kanban column.
+    submitted_late = models.BooleanField(default=False)
+    late_by = models.DurationField(null=True, blank=True)
     status = models.CharField(max_length=10, choices=STATUS.choices, default=STATUS.PENDING)
+    # Who closed this cycle and when -- the approver for APPROVED/REJECTED,
+    # and for VOIDED whoever reassigned the task. One pair of fields rather
+    # than a separate voided_by/voided_at: in all three cases this is "the
+    # person whose action ended this review, and when", and splitting it would
+    # mean every reader of the history had to check two places to find out.
     decided_by = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='decided_approvals', null=True, blank=True)
     decided_at = models.DateTimeField(null=True, blank=True)
     # Visible only to `submitted_by` -- enforced in the API serialization

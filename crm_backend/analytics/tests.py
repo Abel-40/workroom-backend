@@ -94,7 +94,7 @@ class CompanyWorkloadTests(TwoCompanyTestCase):
         response = self.get_workload(self.owner_a)
         self.assertEqual(response.status_code, 200)
         members = {m['id']: m for m in response.json()['data']['members']}
-        self.assertEqual(len(members), 2)  # owner (no profile row) + member_a
+        self.assertEqual(len(members), 2)  # owner + member_a, both from profile rows
 
         owner_row = members[str(self.owner_a.id)]
         self.assertEqual(owner_row['role'], 'Owner')
@@ -102,7 +102,12 @@ class CompanyWorkloadTests(TwoCompanyTestCase):
         self.assertEqual(owner_row['in_progress_count'], 1)
         self.assertEqual(owner_row['todo_count'], 0)
         self.assertIsNone(owner_row['department'])
-        self.assertIsNone(owner_row['profession'])  # no CompanyUserProfile row to read one from
+        # 'Not provided' is CompanyUserProfile.profession's model default. This
+        # asserted None, which was only ever true of the placeholder row the
+        # roster used to synthesize for an owner who had no profile -- the one
+        # person guaranteed to be in every company was the one assembled by
+        # different code. They now come from the same loop as everybody else.
+        self.assertEqual(owner_row['profession'], 'Not provided')
 
         member_row = members[str(self.member_a.id)]
         self.assertEqual(member_row['role'], 'DM')

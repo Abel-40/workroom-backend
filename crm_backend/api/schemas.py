@@ -88,6 +88,10 @@ class AIPlanRequestIn(Schema):
     mentioned_user_ids: list[UUID] = Field(default_factory=list)
     assignee_ids: list[UUID] = Field(default_factory=list)
     max_tasks: int = Field(default=10, ge=1, le=50)
+    # Client-supplied, scoped to the project. A repeated key returns the
+    # generation it already produced rather than starting a second one -- see
+    # ai_agent.services.request_project_plan.
+    idempotency_key: str = Field(default='', max_length=64)
 
 
 class AIGeneratedTaskCommentIn(Schema):
@@ -96,6 +100,15 @@ class AIGeneratedTaskCommentIn(Schema):
 
 class AIGeneratedTaskAssignIn(Schema):
     assigned_to_id: UUID | None = None
+
+
+class AIGeneratedTaskAcceptSuggestionIn(Schema):
+    """Explicitly take the AI's suggested assignee for one draft task, or
+    take back an earlier acceptance. Nothing is applied to real project state
+    until the whole plan is saved -- see
+    projects_and_tasks.services.persist_ai_generated_tasks."""
+
+    accepted: bool = True
 
 
 class AITaskRegenerateIn(Schema):

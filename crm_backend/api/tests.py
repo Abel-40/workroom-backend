@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from ai_agent.models import AIAssistantQuery, AIGeneratedTask, AIGeneration, AIProjectHealthSummary
+from audit.models import AuditAction, AuditEvent
 from company.models import Company, Sector
 from departments_and_teams.models import Department, Team
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -19,7 +20,7 @@ from django.test import TestCase
 from django.utils import timezone
 from notifications_and_activity.models import Notification
 from pages.models import Page, PageFolder
-from projects_and_tasks.models import Project, Task
+from projects_and_tasks.models import Project, Task, TaskApproval
 from rest_framework_simplejwt.tokens import RefreshToken
 from users.models import CompanyUserProfile, PendingInvite, User
 
@@ -39,6 +40,14 @@ class TwoCompanyTestCase(TestCase):
             email='owner-a@example.com', username='owner-a', password='Kx9#mQ2vLp8Z',
         )
         self.company_a = Company.objects.create(name='Company A', owner=self.owner_a, sector=sector)
+        # Every company has an Owner-role profile for its owner: created with
+        # the company at registration, and backfilled for older companies in
+        # users migration 0008. Fixtures that omitted it were building a shape
+        # the system no longer produces, and the code that used to paper over
+        # it -- a synthesized roster row, a +1 on the member count -- is gone.
+        CompanyUserProfile.objects.create(
+            user=self.owner_a, company=self.company_a, role=CompanyUserProfile.Role.Owner,
+        )
         self.department_a = Department.objects.create(name='Engineering', company=self.company_a)
         self.member_a = User.objects.create_user(
             email='member-a@example.com', username='member-a', password='Kx9#mQ2vLp8Z',
@@ -52,6 +61,9 @@ class TwoCompanyTestCase(TestCase):
             email='owner-b@example.com', username='owner-b', password='Kx9#mQ2vLp8Z',
         )
         self.company_b = Company.objects.create(name='Company B', owner=self.owner_b, sector=sector)
+        CompanyUserProfile.objects.create(
+            user=self.owner_b, company=self.company_b, role=CompanyUserProfile.Role.Owner,
+        )
 
     def create_project(self, owner=None, **overrides):
         # Deadline defaults far in the future so any reasonably-future task
@@ -535,9 +547,29 @@ class ProjectSecurityTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_public_project_visible_across_companies(self):
+        """What `public` means is unchanged -- it is the one visibility that
+        crosses the tenant boundary. What changed is getting there: the company
+        has to allow public projects at all before an Owner or CM can create
+        one, so the flag is switched on here rather than the creation being
+        silently refused."""
+        self.company_a.allow_public_projects = True
+        self.company_a.save(update_fields=['allow_public_projects'])
         project = self.create_project(owner=self.owner_a, visibility='public')
         response = self.client.get(f"/api/v1/projects/{project['id']}/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 200)
+
+    def test_a_public_project_cannot_be_created_while_the_company_disallows_it(self):
+        """The other half of the same rule, kept next to it: without the flag
+        the creation is refused outright rather than quietly downgraded."""
+        response = self.client.post(
+            '/api/v1/projects/',
+            json.dumps({
+                'title': 'Website Revamp', 'visibility': 'public',
+                'deadline': (timezone.now() + timedelta(days=365)).isoformat(),
+            }),
+            content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 403, response.content)
 
     def test_only_manager_can_update_project(self):
         project = self.create_project(owner=self.owner_a)
@@ -832,14 +864,25 @@ class TaskApprovalWorkflowTests(TwoCompanyTestCase):
         response = self.submit(task['id'])
         self.assertEqual(response.status_code, 400)
 
-    def test_submit_rejected_once_deadline_has_passed(self):
+    def test_submit_is_allowed_once_the_deadline_has_passed_and_is_flagged(self):
+        """Reversed deliberately. Refusing a late submission meant a task that
+        ran a day over could never reach Done by any route -- a dead end rather
+        than a guardrail, and one whose only workaround was backdating the
+        deadline to close out work that had genuinely been done.
+
+        Lateness is now recorded on the submission for the reviewer to weigh.
+        """
         project, task = self._project_and_assigned_task()
         # Bypasses create/update_task's deadline-vs-project validation --
         # deliberately simulating a task whose deadline has simply elapsed
         # since creation, not testing creation-time validation here.
-        Task.objects.filter(id=task['id']).update(deadline=timezone.now() - timedelta(minutes=1))
+        Task.objects.filter(id=task['id']).update(deadline=timezone.now() - timedelta(minutes=90))
         response = self.submit(task['id'])
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 202)
+
+        approval = TaskApproval.objects.get(task_id=task['id'])
+        self.assertTrue(approval.submitted_late)
+        self.assertGreater(approval.late_by, timedelta(hours=1))
 
     def test_submit_rejected_with_no_evidence(self):
         project, task = self._project_and_assigned_task()
@@ -985,87 +1028,126 @@ class TaskApprovalWorkflowTests(TwoCompanyTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.json()['data']['results'][0]['rejection_comment'])
 
-    # -- deadline extension -----------------------------------------------
+    # -- deadline changes --------------------------------------------------
+    #
+    # These rules were reversed deliberately. Deadline changes used to belong
+    # to project.created_by alone and could only ever move outwards, which
+    # meant a departed creator froze a project's dates permanently and the
+    # most common real correction -- "this was scheduled optimistically, pull
+    # it in" -- had no route through the product at all. They now belong to
+    # whoever can manage the project, go in either direction, require a stated
+    # reason, and are audited.
 
-    def test_creator_can_extend_task_deadline(self):
-        project, task = self._project_and_assigned_task()
-        new_deadline = timezone.now() + timedelta(days=60)
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
+    def change_task_deadline(self, task, deadline, actor, reason='Scope changed'):
+        body = {'deadline': deadline.isoformat()}
+        if reason is not None:
+            body['reason'] = reason
+        return self.client.post(
+            f"/api/v1/tasks/{task['id']}/change-deadline/", json.dumps(body),
+            content_type='application/json', **auth_header(actor),
         )
+
+    def change_project_deadline(self, project, deadline, actor, reason='Scope changed'):
+        body = {'deadline': deadline.isoformat()}
+        if reason is not None:
+            body['reason'] = reason
+        return self.client.post(
+            f"/api/v1/projects/{project['id']}/change-deadline/", json.dumps(body),
+            content_type='application/json', **auth_header(actor),
+        )
+
+    def test_a_project_manager_can_change_a_task_deadline(self):
+        project, task = self._project_and_assigned_task()
+        response = self.change_task_deadline(task, timezone.now() + timedelta(days=60), self.owner_a)
         self.assertEqual(response.status_code, 200)
 
-    def test_current_owner_cannot_extend_deadline_if_not_creator(self):
+    def test_the_current_owner_can_change_a_deadline_they_did_not_create(self):
+        """The case the old rule got wrong: transferring a project handed over
+        accountability for delivery without the ability to move the dates."""
         project, task = self._project_and_assigned_task()
         self.client.patch(
             f"/api/v1/projects/{project['id']}/owner/", json.dumps({'new_owner_id': str(self.member_a.id)}),
             content_type='application/json', **auth_header(self.owner_a),
         )
-        new_deadline = timezone.now() + timedelta(days=60)
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
-            content_type='application/json', **auth_header(self.member_a),
-        )
-        self.assertEqual(response.status_code, 403)
-
-    def test_extend_task_deadline_rejects_a_non_later_deadline(self):
-        project, task = self._project_and_assigned_task()
-        earlier = timezone.now() + timedelta(days=1)
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': earlier.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
-        )
-        self.assertEqual(response.status_code, 400)
-
-    def test_extend_task_deadline_rejects_a_deadline_at_or_past_the_project_deadline(self):
-        project, task = self._project_and_assigned_task()
-        past_project_deadline = datetime.fromisoformat(project['deadline'])
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/", json.dumps({'deadline': past_project_deadline.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
-        )
-        self.assertEqual(response.status_code, 400)
-
-    def test_creator_can_extend_project_deadline(self):
-        project = self.create_project(owner=self.owner_a)
-        new_deadline = timezone.now() + timedelta(days=1000)
-        response = self.client.post(
-            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
-        )
+        response = self.change_task_deadline(task, timezone.now() + timedelta(days=60), self.member_a)
         self.assertEqual(response.status_code, 200)
 
-    def test_extend_project_deadline_rejects_a_non_later_deadline(self):
-        project = self.create_project(owner=self.owner_a)
-        earlier = timezone.now()
-        response = self.client.post(
-            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': earlier.isoformat()}),
-            content_type='application/json', **auth_header(self.owner_a),
+    def test_a_company_manager_can_change_a_project_deadline(self):
+        """Previously refused: a CM qualified for every other management action
+        on a project but not for its dates."""
+        manager = User.objects.create_user(
+            email='manager-a2@example.com', username='manager-a2', password='Kx9#mQ2vLp8Z',
         )
-        self.assertEqual(response.status_code, 400)
+        CompanyUserProfile.objects.create(
+            user=manager, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER,
+        )
+        project = self.create_project(owner=self.owner_a)
+        response = self.change_project_deadline(project, timezone.now() + timedelta(days=1000), manager)
+        self.assertEqual(response.status_code, 200)
 
-    def test_company_manager_cannot_extend_project_deadline(self):
-        """Deadline extension is narrower than general project management --
-        a Company Manager qualifies for user_can_manage_project but not for
-        user_can_extend_deadline."""
-        manager = User.objects.create_user(email='manager-a2@example.com', username='manager-a2', password='Kx9#mQ2vLp8Z')
-        CompanyUserProfile.objects.create(user=manager, company=self.company_a, role=CompanyUserProfile.Role.COMPANY_MANAGER)
-        project = self.create_project(owner=self.owner_a)
-        new_deadline = timezone.now() + timedelta(days=1000)
-        response = self.client.post(
-            f"/api/v1/projects/{project['id']}/extend-deadline/", json.dumps({'deadline': new_deadline.isoformat()}),
-            content_type='application/json', **auth_header(manager),
-        )
+    def test_a_member_with_no_relationship_to_the_project_cannot(self):
+        project = self.create_project(owner=self.owner_a, visibility='company')
+        response = self.change_project_deadline(project, timezone.now() + timedelta(days=1000), self.member_a)
         self.assertEqual(response.status_code, 403)
 
-    def test_extend_deadline_is_scoped_to_the_callers_own_company(self):
+    def test_a_reason_is_required(self):
         project, task = self._project_and_assigned_task()
-        response = self.client.post(
-            f"/api/v1/tasks/{task['id']}/extend-deadline/",
-            json.dumps({'deadline': (timezone.now() + timedelta(days=60)).isoformat()}),
-            content_type='application/json', **auth_header(self.owner_b),
+        for reason in ('', '   '):
+            response = self.change_task_deadline(
+                task, timezone.now() + timedelta(days=60), self.owner_a, reason=reason,
+            )
+            self.assertEqual(response.status_code, 400, f'blank reason {reason!r} was accepted')
+
+    def test_a_deadline_can_be_pulled_in(self):
+        project, task = self._project_and_assigned_task()
+        response = self.change_task_deadline(task, timezone.now() + timedelta(days=1), self.owner_a)
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_task_deadline_may_equal_the_project_deadline(self):
+        """The inclusive invariant. The strict version is what forced the AI
+        generator to subtract an hour from every task it produced."""
+        project, task = self._project_and_assigned_task()
+        response = self.change_task_deadline(task, datetime.fromisoformat(project['deadline']), self.owner_a)
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_task_deadline_may_not_fall_after_the_project_deadline(self):
+        project, task = self._project_and_assigned_task()
+        past_project_deadline = datetime.fromisoformat(project['deadline']) + timedelta(seconds=1)
+        response = self.change_task_deadline(task, past_project_deadline, self.owner_a)
+        self.assertEqual(response.status_code, 400)
+
+    def test_shortening_a_project_deadline_returns_the_tasks_that_block_it(self):
+        """Blocked, but not with a bare error: the caller gets the offending
+        tasks back so the UI can list them and let someone fix them inline."""
+        project, task = self._project_and_assigned_task()
+        response = self.change_project_deadline(project, timezone.now() + timedelta(days=1), self.owner_a)
+        self.assertEqual(response.status_code, 409)
+        blocking = response.json()['data']['blocking_tasks']
+        self.assertEqual([entry['id'] for entry in blocking], [task['id']])
+
+    def test_a_deadline_change_is_audited_with_its_reason(self):
+        project, task = self._project_and_assigned_task()
+        self.change_task_deadline(task, timezone.now() + timedelta(days=60), self.owner_a, reason='Client moved')
+        event = AuditEvent.objects.get(action=AuditAction.TASK_DEADLINE_CHANGED)
+        self.assertEqual(event.reason, 'Client moved')
+        self.assertNotEqual(event.before['deadline'], event.after['deadline'])
+
+    def test_changing_a_project_deadline_notifies_everyone_holding_a_task(self):
+        """Notifying only the owner was wrong: a project deadline moving is
+        exactly the event that changes what the people doing the work must do."""
+        project, task = self._project_and_assigned_task()
+        Notification.objects.all().delete()
+        response = self.change_project_deadline(project, timezone.now() + timedelta(days=1000), self.owner_a)
+        self.assertEqual(response.status_code, 200)
+        notified = set(
+            Notification.objects.filter(type=Notification.Type.DEADLINE_EXTENDED)
+            .values_list('recipient_id', flat=True)
         )
+        self.assertIn(self.member_a.id, notified)
+
+    def test_changing_a_deadline_is_scoped_to_the_callers_own_company(self):
+        project, task = self._project_and_assigned_task()
+        response = self.change_task_deadline(task, timezone.now() + timedelta(days=60), self.owner_b)
         self.assertEqual(response.status_code, 403)
 
 
@@ -1328,8 +1410,13 @@ class DocumentSecurityTests(TwoCompanyTestCase):
         self.assertEqual(created.status_code, 201)
         document_id = created.json()['data']['document']['id']
 
+        # 404, not 403. NON-NEGOTIABLE RULE 1 is explicit that cross-tenant
+        # access answers 404, and the unified document lookup follows it: a
+        # document must not confirm its own existence to somebody who may not
+        # read it. This asserted 403 while project documents had their own
+        # lookup that distinguished the two cases.
         outsider_download = self.client.get(f'/api/v1/documents/{document_id}/download/', **auth_header(self.owner_b))
-        self.assertEqual(outsider_download.status_code, 403)
+        self.assertEqual(outsider_download.status_code, 404)
 
         owner_download = self.client.get(f'/api/v1/documents/{document_id}/download/', **auth_header(self.owner_a))
         self.assertEqual(owner_download.status_code, 200)
@@ -1440,8 +1527,11 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
             **auth_header(self.owner_a),
         )
         query_id = created.json()['data']['assistant_query']['id']
+        # 404, not 403. An assistant query is private to whoever asked it, and
+        # a private question must not confirm its own existence -- "you may not
+        # read this" already tells you somebody asked something.
         response = self.client.get(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 404)
 
     def test_question_over_max_length_is_rejected(self):
         project = self.create_project(owner=self.owner_a)
@@ -1512,7 +1602,7 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
         )
         query_id = created.json()['data']['assistant_query']['id']
         response = self.client.delete(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.owner_b))
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 404)
 
     @patch('ai_agent.assistant_services.process_assistant_query.delay')
     def test_delete_assistant_query_forbidden_for_non_requester_member(self, mock_delay):
@@ -1523,10 +1613,12 @@ class AIAssistantQuerySecurityTests(TwoCompanyTestCase):
             **auth_header(self.owner_a),
         )
         query_id = created.json()['data']['assistant_query']['id']
-        # member_a can view the query (company-visible project) but didn't
-        # ask it and has no manage rights on the project -- must not delete it.
+        # This asserted 403 on the reasoning that member_a "can view the query
+        # (company-visible project)". That premise was the defect: project
+        # visibility no longer grants any read on somebody else's assistant
+        # query, so it is not found rather than forbidden.
         response = self.client.delete(f'/api/v1/ai/assistant-queries/{query_id}/', **auth_header(self.member_a))
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 404)
 
     def test_save_as_page_splits_the_answer_into_structured_blocks(self):
         project = self.create_project(owner=self.owner_a)
@@ -1884,14 +1976,29 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
-    def test_save_applies_the_ai_suggested_assignee_when_no_human_override_exists(self):
+    def test_save_applies_the_ai_suggested_assignee_once_accepted(self):
+        """§4: a suggestion must be explicitly accepted before it applies --
+        V1 auto-applied it whenever there was no human override, which made
+        "review the plan" mean "review the titles"."""
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(
-            project['id'], self.owner_a, suggested_assignee=self.member_a,
+            project['id'], self.owner_a, suggested_assignee=self.member_a, suggested_assignee_accepted=True,
         )
         response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['tasks'][0]['assigned_to'], str(self.member_a.id))
+
+    def test_save_does_not_apply_an_unaccepted_suggestion(self):
+        """The suggestion sitting on the row is not enough by itself -- an
+        accept action is a positive, recorded act, not a default."""
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, suggested_assignee=self.member_a,
+        )
+        self.assertFalse(draft.suggested_assignee_accepted)
+        response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()['data']['tasks'][0]['assigned_to'])
 
     def test_save_prefers_the_human_override_over_the_ai_suggestion(self):
         project = self.create_project(owner=self.owner_a)
@@ -1900,11 +2007,60 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
             user=other_member, company=self.company_a, role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
         )
         generation, draft = self._make_generation_with_draft(
-            project['id'], self.owner_a, suggested_assignee=self.member_a, assigned_to=other_member,
+            project['id'], self.owner_a, suggested_assignee=self.member_a, suggested_assignee_accepted=True,
+            assigned_to=other_member,
         )
         response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['tasks'][0]['assigned_to'], str(other_member.id))
+
+    def test_accept_suggestion_endpoint_flips_the_flag(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, suggested_assignee=self.member_a,
+        )
+        response = self.client.patch(
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/accept-suggestion/",
+            json.dumps({'accepted': True}), content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['data']['generated_task']['suggested_assignee_accepted'])
+        draft.refresh_from_db()
+        self.assertTrue(draft.suggested_assignee_accepted)
+
+    def test_accept_suggestion_endpoint_is_scoped_to_the_callers_own_company(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, suggested_assignee=self.member_a,
+        )
+        response = self.client.patch(
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/accept-suggestion/",
+            json.dumps({'accepted': True}), content_type='application/json', **auth_header(self.owner_b),
+        )
+        self.assertEqual(response.status_code, 403)
+        draft.refresh_from_db()
+        self.assertFalse(draft.suggested_assignee_accepted)
+
+    def test_accept_all_suggestions_endpoint(self):
+        project = self.create_project(owner=self.owner_a)
+        generation = AIGeneration.objects.create(
+            project_id=project['id'], requested_by=self.owner_a, status=AIGeneration.STATUS.COMPLETED,
+        )
+        with_suggestion = AIGeneratedTask.objects.create(
+            generation=generation, temporary_id='t1', sequence=1, title='A',
+            suggested_assignee=self.member_a,
+        )
+        without_suggestion = AIGeneratedTask.objects.create(
+            generation=generation, temporary_id='t2', sequence=2, title='B',
+        )
+        response = self.client.post(
+            f"/api/v1/ai/generations/{generation.id}/accept-all-suggestions/", **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        with_suggestion.refresh_from_db()
+        without_suggestion.refresh_from_db()
+        self.assertTrue(with_suggestion.suggested_assignee_accepted)
+        self.assertFalse(without_suggestion.suggested_assignee_accepted)
 
 
 class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
@@ -1978,10 +2134,19 @@ class SelfServiceProfileTests(TwoCompanyTestCase):
         db_profile = CompanyUserProfile.objects.get(user=self.member_a, company=self.company_a)
         self.assertEqual(db_profile.phone_number, 'Not provided')
 
-    def test_owner_with_no_profile_row_gets_no_profile_error(self):
+    def test_the_owner_has_a_profile_like_everybody_else(self):
+        """This used to assert the opposite -- that fetching your own profile
+        as the company owner returned a 400, because the owner existed as
+        Company.owner and nowhere else. That was the defect, not the contract:
+        it also kept the owner off the member roster, out of the assignable
+        pool, and without a notification preference."""
         response = self.client.get('/api/v1/company/members/me/profile/', **auth_header(self.owner_a))
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()['message'], 'The company owner has no profile.')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertIn('profession', response.json()['data']['profile'])
+        self.assertEqual(
+            CompanyUserProfile.objects.get(user=self.owner_a, company=self.company_a).role,
+            CompanyUserProfile.Role.Owner,
+        )
 
     def test_upload_resume_accepts_pdf(self):
         resume = SimpleUploadedFile('cv.pdf', b'%PDF-1.4 fake', content_type='application/pdf')

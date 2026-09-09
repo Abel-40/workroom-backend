@@ -24,6 +24,18 @@ TYPE_CATEGORY = {
     Notification.Type.TASK_SUBMITTED_FOR_APPROVAL: Notification.Category.CRITICAL,
     Notification.Type.TASK_REJECTED: Notification.Category.CRITICAL,
     Notification.Type.TASK_APPROVED: Notification.Category.OPTIONAL,
+    # Work you submitted will now never be read, and the task has left your
+    # hands -- you would otherwise wait on a review that is not coming.
+    Notification.Type.TASK_SUBMISSION_VOIDED: Notification.Category.CRITICAL,
+    # A proposal sitting unreviewed blocks somebody who is trying to raise
+    # work; learning the outcome does not block anything.
+    Notification.Type.TASK_PROPOSED: Notification.Category.CRITICAL,
+    Notification.Type.TASK_PROPOSAL_ACCEPTED: Notification.Category.OPTIONAL,
+    Notification.Type.TASK_PROPOSAL_DECLINED: Notification.Category.OPTIONAL,
+    # An assignment is waiting on this decision, so the reviewer is blocking
+    # somebody; the requester learning the outcome is not blocking anyone.
+    Notification.Type.WORKLOAD_OVERRIDE_REQUESTED: Notification.Category.CRITICAL,
+    Notification.Type.WORKLOAD_OVERRIDE_DECIDED: Notification.Category.OPTIONAL,
     Notification.Type.DEADLINE_EXTENDED: Notification.Category.OPTIONAL,
     Notification.Type.PROJECT_AUTO_COMPLETED: Notification.Category.OPTIONAL,
     # A pending request blocking someone else's work is actionable/time-sensitive;
@@ -53,7 +65,11 @@ def _should_email(recipient, category: str) -> bool:
     enabled = CompanyUserProfile.objects.filter(user=recipient).values_list(
         'email_notifications_enabled', flat=True,
     ).first()
-    # No profile row -- e.g. the company owner -- defaults to enabled.
+    # None here no longer means "the company owner, who has no row" -- every
+    # owner has one (users migration 0008). It now means the recipient holds no
+    # membership anywhere, which is a user who has been removed from every
+    # company. Defaulting them to enabled is deliberate: the alternative is
+    # silently dropping mail to somebody mid-offboarding.
     return True if enabled is None else enabled
 
 
@@ -213,29 +229,135 @@ def notify_task_rejected(approval):
     )
 
 
-def notify_task_deadline_extended(task, old_deadline, new_deadline):
-    """Tells the assignee their task's deadline moved."""
-    if task.assigned_to_id is None:
+def notify_task_submission_voided(approval, recipient, actor):
+    """Tells the person whose pending submission was voided that the task was
+    reassigned, so they stop waiting on a review that will never come.
+
+    ``recipient`` is passed in rather than read from ``approval.submitted_by``
+    because the caller already holds it and, by the time this runs, the task's
+    ``assigned_to`` has already moved to somebody else -- reading it back from
+    the task would notify the wrong person.
+    """
+    if recipient is None:
         return
+    task = approval.task
+    actor_name = actor.get_full_name() or actor.email if actor else 'A manager'
     _create(
-        task.assigned_to, Notification.Type.DEADLINE_EXTENDED,
-        f"Deadline extended for '{task.title}'",
-        message=f"New deadline: {new_deadline.isoformat()}.",
+        recipient, Notification.Type.TASK_SUBMISSION_VOIDED,
+        f"Your submission for '{task.title}' was closed without review",
+        message=f'{actor_name} reassigned the task, so it is no longer waiting on your submission.',
         related_object_type='task', related_object_id=task.id,
     )
 
 
-def notify_project_deadline_extended(project, old_deadline, new_deadline):
-    """Tells the project's current owner (the person accountable for
-    delivery day-to-day) its deadline moved."""
-    if project.current_owner_id is None:
+def notify_task_proposed(request, project):
+    """Tells the named reviewer that somebody has suggested a piece of work.
+
+    Only the named reviewer is told, not everyone who could decide it. Anyone
+    with MANAGE may accept a proposal -- that is what stops one person's
+    absence stalling the queue -- but notifying all of them would make a
+    routine suggestion feel like an escalation to the whole management chain.
+    """
+    if request.reviewer_id is None:
         return
+    from users.models import User
+
+    reviewer = User.objects.filter(id=request.reviewer_id).first()
+    proposer = request.requested_by
+    proposer_name = (proposer.get_full_name() or proposer.email) if proposer else 'Someone'
+    title = request.payload.get('title') or 'a task'
     _create(
-        project.current_owner, Notification.Type.DEADLINE_EXTENDED,
-        f"Deadline extended for '{project.title}'",
-        message=f"New deadline: {new_deadline.isoformat()}.",
+        reviewer, Notification.Type.TASK_PROPOSED,
+        f"{proposer_name} proposed '{title}' on {project.title}",
+        message='Review it and turn it into a task, or decline it with a reason.',
         related_object_type='project', related_object_id=project.id,
     )
+
+
+def notify_task_proposal_accepted(request, task):
+    """Tells the proposer their suggestion is now real work."""
+    if request.requested_by_id is None:
+        return
+    _create(
+        request.requested_by, Notification.Type.TASK_PROPOSAL_ACCEPTED,
+        f"Your proposal '{task.title}' was accepted",
+        message='It is now a task on the board.',
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_task_proposal_declined(request):
+    """Tells the proposer their suggestion was declined.
+
+    The reviewer's comment is included. Unlike a rejected task submission --
+    where the comment is private to the submitter and deliberately withheld
+    from every other read path -- a declined proposal has exactly one audience,
+    the person who wrote it, and withholding the reason would leave them
+    guessing about work they still think needs doing.
+    """
+    if request.requested_by_id is None:
+        return
+    title = request.payload.get('title') or 'your proposal'
+    message = request.decision_comment or 'No reason was given.'
+    _create(
+        request.requested_by, Notification.Type.TASK_PROPOSAL_DECLINED,
+        f"Your proposal '{title}' was declined",
+        message=message,
+        related_object_type='project', related_object_id=request.target_id,
+    )
+
+
+def _deadline_direction(old_deadline, new_deadline):
+    return 'moved out' if new_deadline > old_deadline else 'pulled in'
+
+
+def notify_task_deadline_changed(task, old_deadline, new_deadline, reason=''):
+    """Tells the assignee their task's deadline moved, which way, and why.
+
+    The reason is included deliberately. A date changing under someone with no
+    explanation is the thing that makes a deadline feel arbitrary, and the
+    reason is now required at the point of change.
+    """
+    if task.assigned_to_id is None:
+        return
+    direction = _deadline_direction(old_deadline, new_deadline)
+    message = f"New deadline: {new_deadline.isoformat()}."
+    if reason:
+        message = f"{message} Reason: {reason}"
+    _create(
+        task.assigned_to, Notification.Type.DEADLINE_EXTENDED,
+        f"Deadline {direction} for '{task.title}'",
+        message=message,
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_project_deadline_changed(project, old_deadline, new_deadline, reason=''):
+    """Tells the project's current owner and everyone holding a live task on
+    it that the project's deadline moved.
+
+    Notifying only the owner was wrong: a project deadline moving is precisely
+    the event that changes what the people doing the work have to do, and they
+    were the ones not being told.
+    """
+    direction = _deadline_direction(old_deadline, new_deadline)
+    message = f"New deadline: {new_deadline.isoformat()}."
+    if reason:
+        message = f"{message} Reason: {reason}"
+
+    recipients = {}
+    if project.current_owner_id is not None:
+        recipients[project.current_owner_id] = project.current_owner
+    for task in project.tasks.filter(is_deleted=False, assigned_to__isnull=False).select_related('assigned_to'):
+        recipients.setdefault(task.assigned_to_id, task.assigned_to)
+
+    for recipient in recipients.values():
+        _create(
+            recipient, Notification.Type.DEADLINE_EXTENDED,
+            f"Deadline {direction} for '{project.title}'",
+            message=message,
+            related_object_type='project', related_object_id=project.id,
+        )
 
 
 def notify_project_auto_completed(project):
@@ -426,4 +548,46 @@ def log_team_created(team, actor):
         team.company, actor, CompanyActivity.ActivityType.TEAM_CREATED,
         f"Team '{team.name}' was created",
         related_object_type='team', related_object_id=team.id,
+    )
+
+
+def notify_workload_override_requested(request, task):
+    """Tells the named reviewer that an assignment is waiting on their call.
+
+    Same shape as notify_task_proposed: one named reviewer rather than every
+    person who could decide it, so a routine "they are at five tasks, I still
+    want to give them this" does not read as an escalation to the whole
+    management chain.
+    """
+    if request.reviewer_id is None:
+        return
+    from users.models import User
+
+    reviewer = User.objects.filter(id=request.reviewer_id).first()
+    if reviewer is None:
+        return
+    requester = request.requested_by
+    requester_name = (requester.get_full_name() or requester.email) if requester else 'Someone'
+    _create(
+        reviewer, Notification.Type.WORKLOAD_OVERRIDE_REQUESTED,
+        f"{requester_name} wants to assign '{task.title}' past a workload limit",
+        message=request.payload.get('reason') or 'No reason was given.',
+        related_object_type='task', related_object_id=task.id,
+    )
+
+
+def notify_workload_override_decided(request, task):
+    """Tells the requester what happened. The reviewer's comment travels with
+    it: the request named a person and a reason, and a bare "denied" would
+    leave the requester with no way to act on it."""
+    if request.requested_by_id is None:
+        return
+    approved = request.status == 'approved'
+    _create(
+        request.requested_by, Notification.Type.WORKLOAD_OVERRIDE_DECIDED,
+        f"Your assignment request for '{task.title}' was {'approved' if approved else 'declined'}",
+        message=request.decision_comment or (
+            'The assignment has been made.' if approved else 'No reason was given.'
+        ),
+        related_object_type='task', related_object_id=task.id,
     )

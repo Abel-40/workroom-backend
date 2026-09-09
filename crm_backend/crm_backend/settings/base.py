@@ -85,6 +85,11 @@ INSTALLED_APPS = [
     'connected_apps',
     'pages',
     'todos',
+    'audit',
+    'documents',
+    'entitlements',
+    'integrations',
+    'workforce',
 ]
 
 MIDDLEWARE = [
@@ -255,15 +260,59 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'users.tasks.retry_pending_invite_emails_task',
         'schedule': crontab(minute='*/15'),
     },
+    # Backstop for the cycle check in projects_and_tasks.services
+    # .add_task_dependency, which already refuses to close a loop under an
+    # advisory lock. Nightly rather than frequent: in a correct system it
+    # finds nothing, and a cycle that does slip in is silent rather than
+    # urgent -- two tasks quietly never start. It reports and never repairs.
+    'check-task-dependency-graph': {
+        'task': 'projects_and_tasks.tasks.check_dependency_graph_integrity_task',
+        'schedule': crontab(hour=3, minute=30),
+    },
+    # Permanently removes documents past documents.services.RETENTION_DAYS.
+    # Offset from the graph check so two nightly jobs do not start together.
+    'purge-expired-documents': {
+        'task': 'documents.tasks.purge_expired_documents_task',
+        'schedule': crontab(hour=4, minute=0),
+    },
+    # Recomputes usage counters from rows and logs any drift. Nothing depends
+    # on it for correctness -- limit decisions read rows directly -- so it runs
+    # once nightly, offset from the other jobs.
+    'reconcile-usage-counters': {
+        'task': 'entitlements.tasks.reconcile_usage_counters_task',
+        'schedule': crontab(hour=4, minute=30),
+    },
 }
 
 # utils/rate_limit.py guard on signup/signin/invite endpoints. Off by
 # default in tests (conftest.py) so the suite never needs a real Redis.
 RATE_LIMIT_ENABLED = env.bool('RATE_LIMIT_ENABLED', default=True)
 
+# Whether plan restrictions apply at all: limits refuse, and features gate.
+#
+# Default OFF, which is the V1 position. The source documents disagree -- the
+# V2 prompt's section 11 demands real enforcement, while the same prompt's OUT
+# OF SCOPE list and CLAUDE.md sections 15 and 16 both say billing stays
+# permissive in V1 -- and turning it on makes that disagreement concrete: 46
+# existing tests fail, because every company without a subscription resolves to
+# Free, and Free allows one department, zero teams, and no public projects.
+# The product was built without limits, so switching them on is a product
+# decision with real customer consequences, not a default.
+#
+# Everything else in `entitlements` is live either way. Limits resolve, usage
+# is counted and reconciled, and every check reports the true numbers, so the
+# UI can already say "5 of 3 used" and the data needed to decide the rollout
+# exists. Only the refusal is deferred. See R1 in docs/BUILD_LOG.md.
+ENTITLEMENTS_ENFORCED = env.bool('ENTITLEMENTS_ENFORCED', default=False)
+
 # FastAPI AI service (Phase 6/7). Django never calls this synchronously from
 # a request -- only the Celery worker does (ai_agent/tasks.py).
 WORKROOM_AI_SERVICE_URL = env('WORKROOM_AI_SERVICE_URL', default='http://localhost:8001')
+# Which provider the AI service is configured to try first. Django does not
+# choose the provider -- it only needs to recognise when the answer came from
+# somewhere else, so a fallback is visible in the generation record rather
+# than being an invisible success.
+WORKROOM_AI_PRIMARY_PROVIDER = env('WORKROOM_AI_PRIMARY_PROVIDER', default='gemini')
 WORKROOM_AI_SERVICE_TOKEN = env('WORKROOM_AI_SERVICE_TOKEN', default='')
 WORKROOM_AI_SERVICE_TIMEOUT = env.float('WORKROOM_AI_SERVICE_TIMEOUT', default=90.0)
 

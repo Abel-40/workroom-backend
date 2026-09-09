@@ -48,21 +48,17 @@ async def get_company_stats(company) -> dict:
     task_count = await tasks.acount()
     completed_tasks = await tasks.filter(status=Task.STATUS.DONE).acount()
 
-    # A company registered since register_company started creating an Owner
-    # profile row has the owner counted in profile_count already; a company
-    # that predates that (no CompanyUserProfile row for its owner) needs the
-    # +1 so the owner still gets counted. See get_company_workload below for
-    # the same fallback applied to the actual member list.
-    profile_count = await CompanyUserProfile.objects.filter(company=company).acount()
-    owner_has_profile = await CompanyUserProfile.objects.filter(
-        company=company, user_id=company.owner_id,
-    ).aexists()
+    # Every company has a profile row for its owner -- created with the
+    # company at registration, and backfilled for older ones in users
+    # migration 0008 -- so the roster is simply the profile count. This used
+    # to carry a +1 for owners who had no row.
+    member_count = await CompanyUserProfile.objects.filter(company=company).acount()
 
     return {
         'project_count': project_count,
         'active_projects': active_projects,
         'completed_projects': completed_projects,
-        'member_count': profile_count if owner_has_profile else profile_count + 1,
+        'member_count': member_count,
         'task_count': task_count,
         'completed_tasks': completed_tasks,
     }
@@ -108,31 +104,12 @@ async def get_company_workload(company) -> list[dict]:
             'in_review_count': in_review,
         }
 
-    owner = await User.objects.aget(id=company.owner_id)
-    owner_has_profile = await CompanyUserProfile.objects.filter(
-        company=company, user_id=owner.id,
-    ).aexists()
-
+    # The owner is in here like everybody else: their profile row is created
+    # with the company, and backfilled for older companies in users migration
+    # 0008. This used to synthesize a placeholder row for owners who had none,
+    # which meant the one person who could not be left off the roster was the
+    # one assembled by different code from everyone else.
     members = []
-    if not owner_has_profile:
-        # Legacy company that predates register_company always creating an
-        # Owner profile row -- synthesize a placeholder so it still shows up.
-        # A company registered since then has a real row and is picked up
-        # naturally by the loop below instead.
-        members.append({
-            'id': str(owner.id),
-            'first_name': owner.first_name,
-            'last_name': owner.last_name,
-            'username': owner.username,
-            'email': owner.email,
-            'role': CompanyUserProfile.Role.Owner,
-            'department': None,
-            'profession': None,
-            'profile_picture_url': None,
-            'is_active': True,
-            **workload_fields(str(owner.id)),
-        })
-
     profiles = CompanyUserProfile.objects.filter(company=company).select_related('user', 'department')
     async for profile in profiles:
         profile_picture_url = (
@@ -157,8 +134,10 @@ async def get_company_workload(company) -> list[dict]:
             **workload_fields(str(profile.user_id)),
         })
 
-    # Owner listed first regardless of which branch produced their row.
-    members.sort(key=lambda m: m['id'] != str(owner.id))
+    # Owner listed first. Read straight off the company rather than fetching
+    # the User -- the row itself now comes from the same loop as everyone
+    # else's, so all this needs is the id to sort by.
+    members.sort(key=lambda m: m['id'] != str(company.owner_id))
     return members
 
 
@@ -215,3 +194,60 @@ async def get_member_workload(company, user) -> dict:
         'in_progress_count': in_progress,
         'in_review_count': in_review,
     }
+
+
+async def get_project_people_workload(project) -> list[dict]:
+    """Per-member task counts for one project's own people.
+
+    The PROJECT_PEOPLE tier (see analytics.tiers). Scoped to people who
+    actually hold work on this project, not to the company roster: a project
+    manager needs to know who on their project is overloaded, and that is a
+    different question from being able to enumerate everybody.
+
+    The counts are of *this project's* tasks only. Showing someone's
+    company-wide load here would leak the workload of projects the viewer has
+    nothing to do with, through a project they happen to manage.
+
+    Deliberately absent, per §8: any on-time percentage, velocity, score or
+    ranking. Open counts describe the work in front of somebody. A rate
+    describes the person, and Workroom does not build that.
+    """
+    counts: dict[str, dict] = {}
+    rows = (
+        Task.objects.filter(project=project, is_deleted=False, assigned_to__isnull=False)
+        .exclude(status=Task.STATUS.DONE)
+        .values('assigned_to_id', 'status')
+        .annotate(count=Count('id'))
+    )
+    async for row in rows:
+        entry = counts.setdefault(
+            str(row['assigned_to_id']),
+            {'todo_count': 0, 'in_progress_count': 0, 'in_review_count': 0},
+        )
+        field = _ACTIVE_STATUS_FIELD.get(row['status'])
+        if field is not None:
+            entry[field] = row['count']
+
+    if not counts:
+        return []
+
+    users = {
+        str(user.id): user
+        async for user in User.objects.filter(id__in=list(counts))
+    }
+    members = []
+    for user_id, entry in counts.items():
+        user = users.get(user_id)
+        if user is None:
+            continue
+        members.append({
+            'id': user_id,
+            'username': user.username,
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'active_task_count': entry['todo_count'] + entry['in_progress_count'] + entry['in_review_count'],
+            **entry,
+        })
+    members.sort(key=lambda m: (-m['active_task_count'], m['username']))
+    return members

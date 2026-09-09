@@ -11,5 +11,9 @@ pluggy==1.6.0
 Pygments==2.20.0
 pytest==9.1.1
 pytest-django==4.14.0
+# Parallel test execution. The suite is ~39 minutes serially on 8 cores
+# and ~12 with `pytest -n 8`, which is the difference between a usable
+# pre-commit gate and one people skip.
+pytest-xdist==3.8.0
 pytokens==0.4.1
 ruff==0.16.3

@@ -90,7 +90,29 @@ class CompanyUserProfile(UUIDModel):
     address = models.CharField(max_length=200, default='Not provided')
     phone_number = models.CharField(max_length=20, default='Not provided')
     resume = models.FileField(upload_to='user_resume/', blank=True, null=True)
+    # DEPRECATED -- superseded by profession_ref, a row in the company's own
+    # catalog. Kept for one release and dual-written by the service layer so a
+    # rollback does not lose what people had entered. Nothing should *read*
+    # it. Remove the field, and the dual-write in
+    # workforce.services.set_member_profession, once the release carrying
+    # workforce migration 0002 has shipped.
+    #
+    # Note the default: 'Not provided' meant this column was a real answer, a
+    # placeholder and a null all at once, and every consumer had to know which.
     profession = models.CharField(max_length=100,default='Not provided')
+    profession_ref = models.ForeignKey(
+        'workforce.Profession', on_delete=models.SET_NULL, null=True, blank=True, related_name='members',
+    )
+    # How many hours a week this person works *for this company*. Null means
+    # unstated, and unstated is not zero -- utilisation is reported as unknown
+    # rather than as 0%, and the utilisation limit cannot fire. See
+    # workforce.services.prorated_capacity_hours.
+    weekly_capacity_hours = models.PositiveSmallIntegerField(null=True, blank=True)
+    # {"working_days": ["mon", ...], "time_off": [{"start": "YYYY-MM-DD",
+    # "end": "YYYY-MM-DD"}]}. Validated on write by
+    # workforce.services.validate_availability -- a JSONField accepts any
+    # shape, so the shape has to be checked somewhere or it is not a contract.
+    availability = models.JSONField(default=dict, blank=True)
     birthday = models.DateField(null=True, blank=True)
     skype = models.CharField(max_length=100, blank=True, default='')
 

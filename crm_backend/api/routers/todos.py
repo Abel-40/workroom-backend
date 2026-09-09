@@ -47,9 +47,21 @@ class TodoUpdateIn(Schema):
     is_done: bool | None = None
 
 
+class TaskStepsIn(Schema):
+    """"Break this into steps" on a task the caller is assigned to."""
+
+    steps: list[str] = Field(min_length=1, max_length=20)
+    # Optional. Left unset, the steps land on the task's own deadline (or
+    # today, if that has passed) rather than on an arbitrary day.
+    due_date: date | None = None
+
+
 DUE_DATE_ERRORS = {
     'due_date_required': 'Pick the day this belongs to.',
     'due_date_too_far': 'That due date is too far in the future.',
+    # Computed in the owner's own timezone, at request time -- see
+    # todos.services.validate_due_date for why that matters.
+    'due_date_in_past': 'Pick today or a later day.',
 }
 
 
@@ -169,7 +181,7 @@ def generation_data(generation) -> dict:
 
 @router.post(
     '/generate/', auth=auth,
-    response={202: ApiResponse, 400: ApiResponse, 404: ApiResponse, 409: ApiResponse},
+    response={202: ApiResponse, 400: ApiResponse, 404: ApiResponse, 409: ApiResponse, 429: ApiResponse},
 )
 @rate_limit('todo_generate', limit=20, window_seconds=3600, key_func=lambda r: str(r.auth.id))
 async def generate_todos(request, data: TodoGenerateIn):
@@ -183,6 +195,14 @@ async def generate_todos(request, data: TodoGenerateIn):
             'generation': generation_data(in_flight),
         })
 
+    # Checked before the provider call, not after -- the point of a quota is
+    # to not spend the request you were going to reject.
+    if await services.check_generation_quota(request.auth):
+        return payload(
+            f'You have used all {services.MAX_GENERATIONS_PER_DAY} to-do generations for today. '
+            'The count resets tomorrow in your own timezone.', 429, False,
+        )
+
     task = None
     if data.mode == 'task':
         if data.task_id is None:
@@ -195,11 +215,27 @@ async def generate_todos(request, data: TodoGenerateIn):
         request.auth, company, mode=data.mode, task=task,
     )
     if error == 'no_assigned_tasks':
-        return payload('You have no open tasks assigned to you right now.', 400, False)
+        # Precise on purpose: 'today' mode draws on work due today or already
+        # overdue (see todos.services.eligible_tasks_for_generation), so a
+        # person with a full fortnight ahead of them and nothing due today
+        # gets this. Saying 'no tasks assigned' would be untrue.
+        return payload(
+            'Nothing is due today and nothing is overdue, so there is nothing to plan. '
+            'Pick a specific task to break down instead.', 400, False,
+        )
 
     window_start, window_end = await services.resolve_generation_window(
         request.auth, mode=data.mode, task=task, days=data.days,
     )
+    # §9: one active plan per (user, task) and per (user, today). Asking again
+    # means "that one was wrong", not "give me two lists" -- and two
+    # overlapping AI checklists for the same day is precisely the duplication
+    # people report as the feature being broken. Completed items survive and
+    # are detached; incomplete AI items go; manual to-dos are never touched.
+    superseded = await services.find_superseded_generation(request.auth, mode=data.mode, task=task)
+    if superseded is not None:
+        await services.supersede_generation(request.auth, superseded)
+
     generation = await AITodoGeneration.objects.acreate(
         user=request.auth, company=company, mode=data.mode, task=task,
         source_task_ids=[str(t.id) for t in tasks],
@@ -232,6 +268,47 @@ async def dismiss_todo_generation(request, generation_id: UUID):
         return payload('Generation not found.', 404, False)
     dismissed = await services.dismiss_generation(request.auth, generation)
     return payload('Generated to-dos dismissed.', 200, True, {'dismissed': dismissed})
+
+
+@router.post(
+    '/tasks/{task_id}/steps/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def break_task_into_steps(request, task_id: UUID, data: TaskStepsIn):
+    """Turn a task you are assigned to into a private checklist.
+
+    Assignment is the test, not visibility -- see todos.services
+    .get_assignable_task. A non-assignee gets the same 404 as a task that does
+    not exist, so task ids cannot be probed through this route.
+
+    The steps are to-dos, not sub-tasks, and that is the point: they are the
+    private working notes of the person doing the job. Nobody else sees them,
+    they do not appear on the board, and they do not count toward project
+    progress. Work that other people need to see is a task, proposed through
+    POST /projects/{id}/task-proposals/ if you cannot create one directly.
+    """
+    company = await get_member_company(request.auth)
+    if company is None:
+        return payload('You are not a member of any company.', 404, False)
+    task, error = await services.get_assignable_task(request.auth, task_id)
+    if error:
+        return payload('Task not found, or it is not assigned to you.', 404, False)
+    todos, error = await services.create_steps_for_task(
+        request.auth, company, task, data.steps, data.due_date,
+    )
+    if error == 'no_steps':
+        return payload('Give at least one step.', 400, False, errors={'steps': ['At least one step is required']})
+    if error == 'too_many_steps':
+        return payload(
+            f'That is more than {services.MAX_STEPS_PER_TASK} steps. A checklist that long is probably '
+            'several tasks -- propose them on the project instead.', 400, False,
+            errors={'steps': [f'At most {services.MAX_STEPS_PER_TASK} steps']},
+        )
+    if error:
+        return payload(DUE_DATE_ERRORS.get(error, 'Validation error'), 400, False)
+    return payload('Steps created successfully.', 201, True, {
+        'todos': [todo_data(todo, viewer=request.auth) for todo in todos],
+    })
 
 
 # --------------------------------------------------------------------------

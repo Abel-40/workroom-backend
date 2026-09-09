@@ -1,0 +1,22 @@
+{% extends "emails/_base_email.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+{% block preheader %}{{ title }}{% endblock %}
+{% block header_class %}wr-header-amber{% endblock %}
+{% block eyebrow %}Decision made{% endblock %}
+{% block heading %}Your assignment request was answered{% endblock %}
+
+{% block content %}
+    <div class="wr-badge wr-badge-amber"><span>&#9878;</span></div>
+
+    <div class="wr-highlight wr-highlight-amber">{{ title }}</div>
+    {# The reviewer's comment, shown in full. The requester named a person and
+       a reason; a bare "declined" would leave them with nothing to act on. #}
+    {% if message %}
+        <p style="font-size: 15px; color: #475569;">{{ message }}</p>
+    {% endif %}
+
+    <div class="wr-btn-container">
+        <a href="{{ frontend_url }}/admin/dashboard/" class="wr-btn wr-btn-amber">Open the task</a>
+    </div>
+{% endblock %}

@@ -46,9 +46,13 @@ class AITodoGenerationTestCase(TwoCompanyTestCase):
             title='Website Revamp', company=self.company_a, created_by=self.owner_a,
             deadline=timezone.now() + timedelta(days=365),
         )
+        # Due today. 'today' mode draws on work due today or already overdue
+        # (§9, and todos.services.eligible_tasks_for_generation) -- a task due
+        # in a month is real work, but it is not what a daily checklist is
+        # for, and these tests exercise the daily checklist.
         self.task = Task.objects.create(
             project=self.project_a, title='Ship the landing page', created_by=self.owner_a,
-            assigned_to=self.owner_a, deadline=timezone.now() + timedelta(days=30),
+            assigned_to=self.owner_a, deadline=timezone.now() + timedelta(hours=6),
         )
 
     def generate(self, user=None, **body):

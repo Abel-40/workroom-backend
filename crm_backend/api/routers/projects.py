@@ -13,6 +13,7 @@ from django.utils import timezone
 from ninja import File, Router, Schema
 from ninja.files import UploadedFile
 from projects_and_tasks import services
+from projects_and_tasks.access import AccessLevel, resolve_project_access
 from projects_and_tasks.models import Project, ProjectVisibilityRequest, Task
 from pydantic import Field, HttpUrl
 from users.models import CompanyUserProfile
@@ -21,7 +22,16 @@ from utils.pagination import DEFAULT_PAGE_SIZE, paginate
 
 from ..auth import JWTBearerAuth
 from ..schemas import ApiResponse
-from .tasks import DeadlineExtendIn
+from .tasks import DeadlineChangeIn
+
+# The wire form of projects_and_tasks.access.AccessLevel. Names rather than
+# the stored integers: a client comparing 20 >= 10 is a client that breaks
+# silently the day a level is inserted between two existing ones.
+ACCESS_LEVEL_NAMES = {
+    AccessLevel.VIEW: 'view',
+    AccessLevel.CONTRIBUTE: 'contribute',
+    AccessLevel.MANAGE: 'manage',
+}
 
 router = Router(tags=['projects'])
 auth = JWTBearerAuth()
@@ -68,10 +78,18 @@ def _project_image_data(project: Project) -> dict | None:
     return None
 
 
-async def project_data(project: Project) -> dict:
+async def project_data(project: Project, *, viewer=None) -> dict:
     """The model's total_tasks/active_tasks/completion_percent properties run
     synchronous ORM queries, so they can't be called from this async view --
-    query the counts directly instead."""
+    query the counts directly instead.
+
+    ``viewer`` adds ``access_level``: what *this* caller may do with this
+    project, straight from `resolve_project_access`. The client then reads a
+    level instead of re-deriving one from `created_by`, `current_owner`, role
+    and department -- which is how the frontend's copy of these rules drifted
+    out of date twice, granting management on `created_by` long after the
+    server stopped doing so.
+    """
     total_tasks = await project.tasks.filter(is_deleted=False).acount()
     completed_tasks = await project.tasks.filter(is_deleted=False, status=Task.STATUS.DONE).acount()
     collaborator_ids = [str(user_id) async for user_id in project.collaborators.values_list('id', flat=True)]
@@ -79,8 +97,12 @@ async def project_data(project: Project) -> dict:
     has_pending_visibility_request = await ProjectVisibilityRequest.objects.filter(
         project=project, status=ProjectVisibilityRequest.STATUS.PENDING,
     ).aexists()
+    access = await resolve_project_access(viewer, project) if viewer is not None else None
     return {
         'id': str(project.id),
+        # 'view' | 'contribute' | 'manage', or None when not requested.
+        # Named rather than numeric so a client never compares magic numbers.
+        'access_level': ACCESS_LEVEL_NAMES.get(access) if access is not None else None,
         'title': project.title,
         'description': project.description,
         'company_id': str(project.company_id),
@@ -106,7 +128,7 @@ async def project_data(project: Project) -> dict:
     }
 
 
-@router.post('/', auth=auth, response={201: ApiResponse, 400: ApiResponse})
+@router.post('/', auth=auth, response={201: ApiResponse, 400: ApiResponse, 402: ApiResponse, 403: ApiResponse})
 async def create_project(request, data: ProjectIn):
     project, error = await services.create_project(
         request.auth,
@@ -142,7 +164,39 @@ async def create_project(request, data: ProjectIn):
             "Your department is fixed to your own -- you can't create a project in another department.", 400, False,
             errors={'department_id': ['Must be your own department']},
         )
-    return payload('Project created successfully.', 201, True, {'project': await project_data(project)})
+    if error == 'plan_limit':
+        # Never a bare 403. Section 11: name the limit that was hit and point
+        # at the plans page, because "denied" with no number is indisput-
+        # able and useless.
+        return payload(
+            f'Your plan allows {project.limit} active projects and you have {project.current}. '
+            'Archive one, or upgrade your plan.', 402, False,
+            errors={'plan': ['active_projects limit reached']},
+        )
+    if error == 'public_projects_not_in_plan':
+        return payload(
+            'Public projects are not included in your plan.', 402, False,
+            errors={'plan': ['public_projects not available']},
+        )
+    if error == 'public_projects_disabled':
+        return payload(
+            'This company does not allow public projects. Public projects are readable by anyone with the '
+            'link, including people outside the company, so the Owner has to switch it on first.',
+            403, False,
+        )
+    if error == 'visibility_locked':
+        return payload(
+            'Only a Company Manager or the Owner can create a public project.', 403, False,
+        )
+    if error == 'department_required':
+        return payload(
+            'A project with no department cannot use department visibility -- nobody would be able to '
+            'see it. Give the project a department first.', 400, False,
+            errors={'visibility': ['Project has no department']},
+        )
+    return payload(
+        'Project created successfully.', 201, True, {'project': await project_data(project, viewer=request.auth)},
+    )
 
 
 @router.get('/', auth=auth, response={200: ApiResponse})
@@ -150,7 +204,7 @@ async def list_projects(request, page: int = 1, page_size: int = DEFAULT_PAGE_SI
     queryset = await services.list_projects_for_user(request.auth)
     items, meta = await paginate(queryset, page, page_size)
     return payload('Projects retrieved successfully.', 200, True, {
-        'results': [await project_data(project) for project in items], 'meta': meta,
+        'results': [await project_data(project, viewer=request.auth) for project in items], 'meta': meta,
     })
 
 
@@ -175,7 +229,9 @@ async def get_project(request, project_id: UUID):
         return payload('Project not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this project.', 403, False)
-    return payload('Project retrieved successfully.', 200, True, {'project': await project_data(project)})
+    return payload(
+        'Project retrieved successfully.', 200, True, {'project': await project_data(project, viewer=request.auth)},
+    )
 
 
 @router.patch('/{project_id}/', auth=auth, response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -201,6 +257,11 @@ async def update_project(request, project_id: UUID, data: ProjectUpdateIn):
             'Invalid collaborator for this company.', 400, False,
             errors={'collaborator_ids': ['One or more users are not members of this company']},
         )
+    if error == 'deadline_has_own_route':
+        return payload(
+            'Change a deadline through POST /projects/{id}/change-deadline/, which requires a reason.',
+            400, False, errors={'deadline': ['Use the change-deadline endpoint']},
+        )
     if error == 'department_locked':
         return payload(
             "Your department is fixed to your own -- you can't move this project to another department.",
@@ -208,10 +269,25 @@ async def update_project(request, project_id: UUID, data: ProjectUpdateIn):
         )
     if error == 'visibility_locked':
         return payload(
-            'Department Members cannot change project visibility directly -- request department visibility '
-            'instead, or ask your Department Leader to raise it.', 403, False,
+            'You do not have permission to set that visibility. Company-wide visibility is set by a '
+            'Department Leader, Company Manager or the Owner; public visibility by a Company Manager or '
+            'the Owner.', 403, False,
         )
-    return payload('Project updated successfully.', 200, True, {'project': await project_data(updated)})
+    if error == 'public_projects_disabled':
+        return payload(
+            'This company does not allow public projects. Public projects are readable by anyone with the '
+            'link, including people outside the company, so the Owner has to switch it on first.',
+            403, False,
+        )
+    if error == 'department_required':
+        return payload(
+            'A project with no department cannot use department visibility -- nobody would be able to '
+            'see it. Give the project a department first.', 400, False,
+            errors={'visibility': ['Project has no department']},
+        )
+    return payload(
+        'Project updated successfully.', 200, True, {'project': await project_data(updated, viewer=request.auth)},
+    )
 
 
 class ProjectOwnerIn(Schema):
@@ -233,7 +309,10 @@ async def transfer_project_owner(request, project_id: UUID, data: ProjectOwnerIn
             'Invalid owner for this company.', 400, False,
             errors={'new_owner_id': ['Must be a member of this project\'s company']},
         )
-    return payload('Project ownership transferred successfully.', 200, True, {'project': await project_data(updated)})
+    return payload(
+        'Project ownership transferred successfully.', 200, True,
+        {'project': await project_data(updated, viewer=request.auth)},
+    )
 
 
 @router.delete('/{project_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -262,7 +341,9 @@ async def set_project_image_link(request, project_id: UUID, data: ProjectImageLi
     updated, error = await services.set_project_image_link(request.auth, project, str(data.image_url))
     if error == 'forbidden':
         return payload('You do not have permission to modify this project.', 403, False)
-    return payload('Project image updated successfully.', 200, True, {'project': await project_data(updated)})
+    return payload(
+        'Project image updated successfully.', 200, True, {'project': await project_data(updated, viewer=request.auth)},
+    )
 
 
 @router.post('/{project_id}/image/', auth=auth, response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -279,7 +360,10 @@ async def upload_project_image(request, project_id: UUID, image: UploadedFile = 
         return payload('Image exceeds the maximum allowed size (5MB).', 400, False)
     if error == 'invalid_content_type':
         return payload('This image type is not allowed. Use PNG, JPEG, GIF, or WEBP.', 400, False)
-    return payload('Project image uploaded successfully.', 200, True, {'project': await project_data(updated)})
+    return payload(
+        'Project image uploaded successfully.', 200, True,
+        {'project': await project_data(updated, viewer=request.auth)},
+    )
 
 
 @router.get('/{project_id}/image/', auth=auth, response={403: ApiResponse, 404: ApiResponse})
@@ -370,23 +454,37 @@ async def list_eligible_assignees(request, project_id: UUID):
 
 
 @router.post(
-    '/{project_id}/extend-deadline/', auth=auth,
-    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    '/{project_id}/change-deadline/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse, 409: ApiResponse},
 )
-async def extend_project_deadline(request, project_id: UUID, data: DeadlineExtendIn):
-    """Project-creator-only, extend-only -- see
-    projects_and_tasks.services.user_can_extend_deadline."""
+async def change_project_deadline(request, project_id: UUID, data: DeadlineChangeIn):
+    """Open to whoever can manage the project, in either direction, with a
+    required reason. Shortening past a task's own deadline returns 409 and the
+    offending tasks, so the UI can list them and let someone fix them inline
+    rather than making the user find them."""
     project, error = await services.get_project_for_user(request.auth, project_id)
     if error == 'not_found':
         return payload('Project not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this project.', 403, False)
-    updated, error = await services.extend_project_deadline(request.auth, project, data.deadline)
+    result, error = await services.change_project_deadline(
+        request.auth, project, data.deadline, reason=data.reason,
+    )
     if error == 'forbidden':
-        return payload('Only the project creator can extend the deadline.', 403, False)
-    if error == 'not_an_extension':
-        return payload('The new deadline must be later than the current one.', 400, False)
-    return payload('Project deadline extended.', 200, True, {'project': await project_data(updated)})
+        return payload('You do not have permission to change this deadline.', 403, False)
+    if error == 'reason_required':
+        return payload('A reason is required when changing a deadline.', 400, False)
+    if error == 'tasks_exceed_deadline':
+        return payload(
+            'Some tasks would fall after the new deadline.', 409, False,
+            {'blocking_tasks': [
+                {'id': str(task.id), 'title': task.title, 'deadline': task.deadline.isoformat()}
+                for task in result
+            ]},
+        )
+    return payload(
+        'Project deadline changed.', 200, True, {'project': await project_data(result, viewer=request.auth)},
+    )
 
 
 # --------------------------------------------------------------------------
@@ -453,6 +551,21 @@ async def approve_visibility_request(request, request_id: UUID):
         return payload('Only this project\'s department leader (or Owner/CM) may review this request.', 403, False)
     if error == 'not_pending':
         return payload('This request has already been decided.', 400, False)
+    # approve_visibility_request re-checks the reviewer against the target, so it
+    # can refuse a request that was legal when it was filed -- a project whose
+    # department was cleared since, or a visibility the current rules no longer
+    # let this reviewer set. Without these branches the refusal fell through to
+    # the success line and returned 200 with a None request.
+    if error in ('visibility_locked', 'public_projects_disabled'):
+        return payload(
+            'You can no longer approve this request: the visibility it asks for is not one you may '
+            'set on this project today. Deny it instead.', 403, False,
+        )
+    if error == 'department_required':
+        return payload(
+            'This project no longer has a department, so it cannot be given department visibility. '
+            'Give it a department, or deny the request.', 400, False,
+        )
     return payload('Visibility request approved.', 200, True, {'request': _visibility_request_data(updated)})
 
 

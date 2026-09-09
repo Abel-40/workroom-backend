@@ -8,6 +8,7 @@ from zoneinfo import available_timezones
 
 from analytics.services import get_member_workload
 from asgiref.sync import sync_to_async
+from audit.services import AuditAction, record_event
 from company.services import (
     get_company_role_sync,
     get_managed_company_sync,
@@ -16,6 +17,7 @@ from company.services import (
     is_company_member_sync,
 )
 from departments_and_teams.models import Department, Team
+from documents.services import validate_upload
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
@@ -140,6 +142,10 @@ def update_member_role(requester, target_user_id, new_role: str):
             Department.objects.filter(company=company, leader_id=target_user_id).update(leader=None)
             Team.objects.filter(company=company, leader_id=target_user_id).update(leader=None)
 
+        record_event(
+            company=company, actor=requester, action=AuditAction.MEMBER_ROLE_CHANGED, target=profile,
+            before={'role': old_role}, after={'role': new_role},
+        )
         return profile, None
 
 
@@ -307,6 +313,11 @@ def set_member_active_status(requester, target_user_id, is_active: bool):
         if profile.is_active != is_active:
             profile.is_active = is_active
             profile.save(update_fields=['is_active'])
+            record_event(
+                company=company, actor=requester, target=profile,
+                action=AuditAction.MEMBER_REACTIVATED if is_active else AuditAction.MEMBER_DEACTIVATED,
+                before={'is_active': not is_active}, after={'is_active': is_active},
+            )
         return profile, None
 
 
@@ -461,6 +472,14 @@ def remove_member(requester, target_user_id, *, reassign_to_user_id=None):
             team.members.remove(target_user_id)
 
         removed_user = profile.user
+        # Recorded against the User, not the CompanyUserProfile: the profile
+        # row is about to stop existing, and "what happened to this person"
+        # has to stay answerable afterwards.
+        record_event(
+            company=company, actor=requester, action=AuditAction.MEMBER_REMOVED, target=removed_user,
+            before={'role': profile.role, 'department': profile.department_id, 'is_active': profile.is_active},
+            after=None,
+        )
         profile.delete()
         log_member_removed(company, requester, removed_user, reassigned_count=reassigned_count)
         return {'reassigned_count': reassigned_count}, None
@@ -469,10 +488,13 @@ def remove_member(requester, target_user_id, *, reassign_to_user_id=None):
 async def update_notification_preference(user, email_notifications_enabled: bool):
     """Self-service: a member updates their own email-notification
     preference. Returns (profile, error) where error is 'forbidden' (no
-    company) or 'no_profile' (only reachable for a legacy company whose
-    owner predates register_company always creating an Owner profile row --
-    they always get critical-only behavior, see
-    notifications_and_activity.services._should_email)."""
+    company) or 'no_profile'.
+
+    ``no_profile`` is no longer the company owner: every owner has a profile
+    row, created with the company at registration and backfilled for older
+    companies in users migration 0008. It now means only what it says -- the
+    caller resolves to a company but holds no membership row in it, which
+    should not happen and is reported as a 400 rather than crashed on."""
     company = await get_member_company(user)
     if company is None:
         return None, 'forbidden'
@@ -533,8 +555,8 @@ ALLOWED_RESUME_CONTENT_TYPES = {
 async def get_own_profile(user):
     """Self-service: fetch the caller's own CompanyUserProfile fields, e.g.
     to hydrate a profile-edit form. Returns (profile, error) where error is
-    'forbidden' (no company) or 'no_profile' (the company owner has no
-    profile row), or None."""
+    'forbidden' (no company) or 'no_profile' -- see
+    update_notification_preference for what that now means."""
     company = await get_member_company(user)
     if company is None:
         return None, 'forbidden'
@@ -547,7 +569,8 @@ async def get_own_profile(user):
 async def update_own_profile(user, updates: dict):
     """Self-service: a member updates their own CompanyUserProfile fields.
     Returns (profile, error) where error is 'forbidden' (no company) or
-    'no_profile' (the company owner has no profile row), or None."""
+    'no_profile' -- see update_notification_preference for what that now
+    means."""
     company = await get_member_company(user)
     if company is None:
         return None, 'forbidden'
@@ -572,11 +595,13 @@ async def upload_own_resume(user, uploaded_file):
     profile = await CompanyUserProfile.objects.filter(user=user, company=company).afirst()
     if profile is None:
         return None, 'no_profile'
-    if uploaded_file.size > MAX_RESUME_SIZE_BYTES:
-        return None, 'too_large'
-    content_type = uploaded_file.content_type or ''
-    if content_type not in ALLOWED_RESUME_CONTENT_TYPES:
-        return None, 'invalid_content_type'
+    # Its own smaller cap and narrower type set, passed as arguments rather
+    # than written out again -- see documents.services.validate_upload.
+    error = validate_upload(
+        uploaded_file, max_bytes=MAX_RESUME_SIZE_BYTES, allowed_types=ALLOWED_RESUME_CONTENT_TYPES,
+    )
+    if error:
+        return None, error
     if profile.resume:
         await sync_to_async(profile.resume.delete, thread_sensitive=True)(save=False)
     profile.resume = uploaded_file

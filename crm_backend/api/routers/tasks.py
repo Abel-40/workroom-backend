@@ -13,6 +13,7 @@ from pydantic import Field
 from todos import services as todo_services
 from utils.api_response import api_response as payload
 from utils.pagination import DEFAULT_PAGE_SIZE, paginate
+from workforce import workload
 
 from ..auth import JWTBearerAuth
 from ..schemas import ApiResponse
@@ -37,9 +38,22 @@ class TaskIn(Schema):
     # an equal value would always fail. Forces a real per-task choice instead.
     deadline: datetime
     estimated_time_hours: float | None = Field(default=None, gt=0, le=1000)
+    # Only read when the company runs a blocking workload policy and the
+    # caller holds an override role. Ignored otherwise -- a reason nobody
+    # asked for is not a permission.
+    override_reason: str | None = Field(default=None, max_length=2000)
 
 
 class TaskUpdateIn(Schema):
+    """Not every field here is writable by everyone who can reach the task:
+    `description` and `estimated_time_hours` belong to the assignee, the rest
+    to whoever can manage the project. See services.TASK_ASSIGNEE_FIELDS.
+
+    `deadline` is still declared, but only so it can be refused with a
+    message that says where to go instead. Dropping it from the schema would
+    have been worse than useless: Ninja ignores unknown fields, so a client
+    still sending one would get a 200 and no deadline change."""
+
     title: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=10_000)
     department_id: UUID | None = None
@@ -55,20 +69,112 @@ class TaskStatusIn(Schema):
 
 class TaskAssignIn(Schema):
     assigned_to_id: UUID | None = None
+    override_reason: str | None = Field(default=None, max_length=2000)
+
+
+class WorkloadOverrideIn(Schema):
+    assigned_to_id: UUID
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class WorkloadOverrideDecisionIn(Schema):
+    comment: str = Field(default='', max_length=2000)
 
 
 class TaskRejectIn(Schema):
     comment: str = Field(min_length=1, max_length=2000)
 
 
-class DeadlineExtendIn(Schema):
+class DeadlineChangeIn(Schema):
     deadline: datetime
+    # Required, and validated as non-blank server-side too. A deadline moving
+    # under the people doing the work is exactly the change that needs to
+    # carry an explanation with it.
+    reason: str
+
+
+class TaskProposalIn(Schema):
+    """What a contributor may suggest. Deliberately narrower than TaskIn:
+    there is no `assigned_to_id`, because deciding who does a piece of work is
+    a management act and a proposal is not the place to pre-empt it."""
+
+    title: str = Field(min_length=1, max_length=255)
+    description: str = Field(default='No description provided', max_length=10_000)
+    department_id: UUID | None = None
+    task_type_id: UUID | None = None
+    priority: PriorityLiteral = 'medium'
+    # Optional here, unlike TaskIn: a proposer often knows what needs doing
+    # without knowing when it has to land. Defaults to the project deadline.
+    deadline: datetime | None = None
+    estimated_time_hours: float | None = Field(default=None, gt=0, le=1000)
+
+
+class TaskProposalAcceptIn(Schema):
+    """Corrections a reviewer may apply as they accept. Every field optional:
+    the common case is accepting as proposed, and making a reviewer restate
+    the whole thing to fix one priority is how a queue stops being used."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=10_000)
+    department_id: UUID | None = None
+    task_type_id: UUID | None = None
+    priority: PriorityLiteral | None = None
+    deadline: datetime | None = None
+    estimated_time_hours: float | None = Field(default=None, gt=0, le=1000)
+
+
+class TaskProposalDeclineIn(Schema):
+    comment: str = Field(default='', max_length=2000)
+
+
+class TaskDependencyIn(Schema):
+    """One edge. `blocks` is hard and gates the successor leaving To Do;
+    `relates_to` is informational and gates nothing."""
+
+    # The other end. Which end it is depends on `direction` below, because
+    # "this task blocks that one" and "this task is blocked by that one" are
+    # both natural things for a UI to offer and neither is more primary.
+    task_id: UUID
+    kind: Literal['blocks', 'relates_to'] = 'blocks'
+    direction: Literal['blocks', 'blocked_by'] = 'blocks'
 
 
 class TimeLogIn(Schema):
     hours: float = Field(gt=0, le=24)
     work_date: date | None = None
     description: str = Field(default='', max_length=2000)
+
+
+def workload_notice(decision) -> dict | None:
+    """What the client shows beside a successful assignment.
+
+    ``None`` when nothing was configured or nothing was crossed, so the common
+    case adds no noise to the response. When a limit *was* crossed in warn
+    mode this is the whole point of warn mode: the assignment went through and
+    the manager is told the number they did not have.
+    """
+    if decision is None or decision.enforcement == 'off' or not decision.breached:
+        return None
+    return decision.as_dict()
+
+
+def workload_blocked_response(decision):
+    """The refusal, with the numbers that caused it.
+
+    403 rather than 400: the request was well formed and the caller is simply
+    not permitted to make this assignment. The body names the limit, the
+    current figures, and whether an override request is the way forward, so
+    the UI can offer that instead of a dead end.
+    """
+    body = decision.as_dict() if decision else {}
+    if body.get('needs_approval'):
+        message = (
+            'This assignment is over your company workload limit. Ask for approval: '
+            'POST /tasks/{id}/workload-override/.'
+        )
+    else:
+        message = 'This assignment is over your company workload limit. A reason is required to override it.'
+    return payload(message, 403, False, {'workload': body}, errors={'workload': list(body.get('breached') or [])})
 
 
 async def task_data(task: Task) -> dict:
@@ -126,15 +232,21 @@ async def create_task(request, project_id: UUID, data: TaskIn):
         return payload('Project not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to add tasks to this project.', 403, False)
-    task, error = await services.create_task(
+    task, decision, error = await services.create_task(
         request.auth, project,
         title=data.title, description=data.description, priority=data.priority,
         deadline=data.deadline,
         estimated_time=_hours_to_duration(data.estimated_time_hours),
         department_id=data.department_id, task_type_id=data.task_type_id, assigned_to_id=data.assigned_to_id,
+        override_reason=data.override_reason or '',
     )
+    if error == 'workload_blocked':
+        return workload_blocked_response(decision)
     if error == 'forbidden':
-        return payload('You do not have permission to add tasks to this project.', 403, False)
+        return payload(
+            'Adding a task to this project requires permission to manage it. You can propose one instead: '
+            'POST /projects/{id}/task-proposals/.', 403, False,
+        )
     if error == 'invalid_deadline':
         return payload(
             "The task deadline must be before the project's deadline.", 400, False,
@@ -151,7 +263,9 @@ async def create_task(request, project_id: UUID, data: TaskIn):
         )
     if error:
         return payload('Invalid department, task type, or assignee for this company.', 400, False, errors={error: ['Invalid value']})
-    return payload('Task created successfully.', 201, True, {'task': await task_data(task)})
+    return payload('Task created successfully.', 201, True, {
+        'task': await task_data(task), 'workload': workload_notice(decision),
+    })
 
 
 @router.get('/projects/{project_id}/tasks/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -219,11 +333,15 @@ async def update_task(request, task_id: UUID, data: TaskUpdateIn):
         updates['estimated_time'] = _hours_to_duration(updates.pop('estimated_time_hours'))
     updated, error = await services.update_task(request.auth, task, updates)
     if error == 'forbidden':
-        return payload('You do not have permission to modify this task.', 403, False)
-    if error == 'invalid_deadline':
         return payload(
-            "The task deadline must be before the project's deadline.", 400, False,
-            errors={'deadline': ['Must be earlier than the project deadline']},
+            'You do not have permission to change those fields. The assignee may edit the description and '
+            'estimate; the title, priority, type and department belong to whoever manages the project.',
+            403, False,
+        )
+    if error == 'deadline_has_own_route':
+        return payload(
+            'Change a deadline through POST /tasks/{id}/change-deadline/, which requires a reason.',
+            400, False, errors={'deadline': ['Use the change-deadline endpoint']},
         )
     if error:
         return payload('Invalid department or task type for this company.', 400, False)
@@ -240,6 +358,13 @@ async def update_task_status(request, task_id: UUID, data: TaskStatusIn):
     if error == 'forbidden':
         return payload('You do not have permission to view this task.', 403, False)
     updated, error = await services.update_task_status(request.auth, task, data.status)
+    if error == 'blocked':
+        # `updated` carries the unfinished predecessors -- naming them is the
+        # difference between an actionable message and a dead end.
+        return payload(
+            'This task is waiting on work that is not finished yet.', 400, False,
+            errors={'blocked_by': [blocker.title for blocker in updated]},
+        )
     if error == 'forbidden':
         return payload('You do not have permission to update this task.', 403, False)
     if error == 'invalid_status':
@@ -259,9 +384,13 @@ async def assign_task(request, task_id: UUID, data: TaskAssignIn):
         return payload('Task not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this task.', 403, False)
-    updated, error = await services.assign_task(request.auth, task, data.assigned_to_id)
+    updated, decision, error = await services.assign_task(
+        request.auth, task, data.assigned_to_id, override_reason=data.override_reason or '',
+    )
     if error == 'forbidden':
         return payload('You do not have permission to assign this task.', 403, False)
+    if error == 'workload_blocked':
+        return workload_blocked_response(decision)
     if error == 'invalid_assignee':
         return payload('The selected user is not a member of this company.', 400, False, errors={'assigned_to_id': ['Not eligible']})
     if error == 'ineligible_assignee':
@@ -269,7 +398,9 @@ async def assign_task(request, task_id: UUID, data: TaskAssignIn):
             "That person isn't eligible for this project (outside its department/team).", 400, False,
             errors={'assigned_to_id': ['Not eligible for this project']},
         )
-    return payload('Task assigned successfully.', 200, True, {'task': await task_data(updated)})
+    return payload('Task assigned successfully.', 200, True, {
+        'task': await task_data(updated), 'workload': workload_notice(decision),
+    })
 
 
 @router.delete('/tasks/{task_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})
@@ -416,23 +547,25 @@ async def list_task_approvals(request, task_id: UUID):
 
 
 @router.post(
-    '/tasks/{task_id}/extend-deadline/', auth=auth,
+    '/tasks/{task_id}/change-deadline/', auth=auth,
     response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
 )
-async def extend_task_deadline(request, task_id: UUID, data: DeadlineExtendIn):
+async def change_task_deadline(request, task_id: UUID, data: DeadlineChangeIn):
     task, error = await services.get_task_for_user(request.auth, task_id)
     if error == 'not_found':
         return payload('Task not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this task.', 403, False)
-    updated, error = await services.extend_task_deadline(request.auth, task, data.deadline)
+    updated, error = await services.change_task_deadline(
+        request.auth, task, data.deadline, reason=data.reason,
+    )
     if error == 'forbidden':
-        return payload('Only the project creator can extend a task deadline.', 403, False)
-    if error == 'not_an_extension':
-        return payload('The new deadline must be later than the current one.', 400, False)
+        return payload('You do not have permission to change this deadline.', 403, False)
+    if error == 'reason_required':
+        return payload('A reason is required when changing a deadline.', 400, False)
     if error == 'exceeds_project_deadline':
-        return payload("The task's deadline must remain before the project's deadline.", 400, False)
-    return payload('Task deadline extended.', 200, True, {'task': await task_data(updated)})
+        return payload("A task's deadline cannot fall after the project's deadline.", 400, False)
+    return payload('Task deadline changed.', 200, True, {'task': await task_data(updated)})
 
 
 # --------------------------------------------------------------------------
@@ -506,3 +639,336 @@ async def list_my_time_logs(
     return payload('Time logs retrieved successfully.', 200, True, {
         'results': [my_time_log_data(log) for log in items], 'meta': meta,
     })
+
+
+# --------------------------------------------------------------------------
+# Task proposals
+# --------------------------------------------------------------------------
+
+def _proposal_data(request) -> dict:
+    proposer = request.requested_by
+    return {
+        'id': str(request.id),
+        'project_id': str(request.target_id),
+        'status': request.status,
+        'payload': request.payload,
+        'requested_by': {
+            'id': str(proposer.id),
+            'name': proposer.get_full_name() or proposer.email,
+        } if proposer else None,
+        'decision_comment': request.decision_comment,
+        'created_at': request.created_at.isoformat(),
+        'decided_at': request.decided_at.isoformat() if request.decided_at else None,
+    }
+
+
+@router.post(
+    '/projects/{project_id}/task-proposals/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def propose_task(request, project_id: UUID, data: TaskProposalIn):
+    """Suggest a task on a project you can contribute to but not manage."""
+    project, error = await services.get_viewable_project(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+
+    fields = data.model_dump(exclude_unset=True)
+    if 'estimated_time_hours' in fields:
+        fields['estimated_time'] = _hours_to_duration(fields.pop('estimated_time_hours'))
+    proposal, error = await services.propose_task(request.auth, project, **fields)
+    if error == 'forbidden':
+        return payload('You do not have permission to propose work on this project.', 403, False)
+    if error == 'can_create_directly':
+        return payload(
+            'You can manage this project, so create the task directly instead of proposing it.', 400, False,
+        )
+    if error == 'project_completed':
+        return payload('This project is marked Done -- reopen it before proposing new work.', 400, False)
+    if error == 'invalid_deadline':
+        return payload(
+            "The proposed deadline must fall on or before the project's deadline.", 400, False,
+            errors={'deadline': ['Must be on or before the project deadline']},
+        )
+    return payload('Task proposed successfully.', 201, True, {'proposal': _proposal_data(proposal)})
+
+
+@router.get(
+    '/projects/{project_id}/task-proposals/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def list_task_proposals(request, project_id: UUID):
+    """Pending proposals. Whoever can manage the project sees all of them;
+    anyone else sees only the ones they filed themselves."""
+    project, error = await services.get_viewable_project(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    queryset, error = await services.list_task_proposals_for_user(request.auth, project)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    proposals = [_proposal_data(item) async for item in queryset]
+    return payload('Task proposals retrieved successfully.', 200, True, {'results': proposals})
+
+
+@router.post(
+    '/task-proposals/{proposal_id}/accept/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def accept_task_proposal(request, proposal_id: UUID, data: TaskProposalAcceptIn):
+    """Turn a proposal into a real task, optionally correcting it first."""
+    proposal, error = await services.get_task_proposal_for_user(request.auth, proposal_id)
+    if error == 'not_found':
+        return payload('Task proposal not found.', 404, False)
+
+    overrides = data.model_dump(exclude_unset=True)
+    if 'estimated_time_hours' in overrides:
+        overrides['estimated_time'] = _hours_to_duration(overrides.pop('estimated_time_hours'))
+    task, error = await services.accept_task_proposal(request.auth, proposal, overrides)
+    if error == 'forbidden':
+        return payload('Only someone who can manage this project may decide its proposals.', 403, False)
+    if error == 'not_pending':
+        return payload('This proposal has already been decided.', 400, False)
+    if error == 'project_gone':
+        return payload('The project this proposal belongs to no longer exists.', 404, False)
+    if error == 'invalid_deadline':
+        return payload(
+            "The proposed deadline no longer fits the project's deadline -- set a new one as you accept.",
+            400, False, errors={'deadline': ['Must be on or before the project deadline']},
+        )
+    if error == 'project_completed':
+        return payload('This project is marked Done -- reopen it before adding new tasks.', 400, False)
+    if error:
+        return payload(
+            'Invalid department or task type for this company.', 400, False,
+            errors={error: ['Invalid value']},
+        )
+    return payload('Task proposal accepted.', 201, True, {'task': await task_data(task)})
+
+
+@router.post(
+    '/task-proposals/{proposal_id}/decline/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def decline_task_proposal(request, proposal_id: UUID, data: TaskProposalDeclineIn):
+    proposal, error = await services.get_task_proposal_for_user(request.auth, proposal_id)
+    if error == 'not_found':
+        return payload('Task proposal not found.', 404, False)
+    declined, error = await services.decline_task_proposal(request.auth, proposal, data.comment)
+    if error == 'forbidden':
+        return payload('Only someone who can manage this project may decide its proposals.', 403, False)
+    if error == 'not_pending':
+        return payload('This proposal has already been decided.', 400, False)
+    if error == 'project_gone':
+        return payload('The project this proposal belongs to no longer exists.', 404, False)
+    return payload('Task proposal declined.', 200, True, {'proposal': _proposal_data(declined)})
+
+
+# --------------------------------------------------------------------------
+# Task dependencies
+# --------------------------------------------------------------------------
+
+def _dependency_data(dependency, *, task) -> dict:
+    """Rendered from the perspective of the task being asked about, so a
+    client never has to work out which end it is on."""
+    is_predecessor = dependency.predecessor_id == task.id
+    other = dependency.successor if is_predecessor else dependency.predecessor
+    return {
+        'id': str(dependency.id),
+        'kind': dependency.kind,
+        'direction': 'blocks' if is_predecessor else 'blocked_by',
+        'task': {
+            'id': str(other.id),
+            'title': other.title,
+            'status': other.status,
+        },
+        'created_at': dependency.created_at.isoformat(),
+    }
+
+
+@router.get(
+    '/tasks/{task_id}/dependencies/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def list_task_dependencies(request, task_id: UUID):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    edges, error = await services.list_task_dependencies(request.auth, task)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    return payload('Dependencies retrieved successfully.', 200, True, {
+        'results': [_dependency_data(edge, task=task) for edge in edges],
+    })
+
+
+@router.post(
+    '/tasks/{task_id}/dependencies/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def add_task_dependency(request, task_id: UUID, data: TaskDependencyIn):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    other, error = await services.get_task_for_user(request.auth, data.task_id)
+    if error:
+        # Same answer for "not found" and "you cannot see it": otherwise this
+        # endpoint reports which task ids exist to anyone who can reach any
+        # task at all.
+        return payload('The other task was not found.', 404, False)
+
+    predecessor, successor = (task, other) if data.direction == 'blocks' else (other, task)
+    dependency, error = await services.add_task_dependency(
+        request.auth, predecessor, successor, data.kind,
+    )
+    if error == 'forbidden':
+        return payload('Changing how tasks depend on each other requires permission to manage the project.', 403, False)
+    if error == 'different_projects':
+        return payload(
+            'Dependencies only exist between tasks in the same project.', 400, False,
+            errors={'task_id': ['Must be a task on the same project']},
+        )
+    if error == 'self_dependency':
+        return payload('A task cannot depend on itself.', 400, False)
+    if error == 'duplicate':
+        return payload('That dependency already exists.', 400, False)
+    if error == 'cycle':
+        return payload(
+            'That would create a loop -- the two tasks would end up waiting on each other and neither '
+            'could ever start.', 400, False,
+        )
+    return payload('Dependency created successfully.', 201, True, {
+        'dependency': _dependency_data(dependency, task=task),
+    })
+
+
+@router.delete(
+    '/tasks/{task_id}/dependencies/{dependency_id}/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def remove_task_dependency(request, task_id: UUID, dependency_id: UUID):
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    _, error = await services.remove_task_dependency(request.auth, task, dependency_id)
+    if error == 'not_found':
+        return payload('Dependency not found.', 404, False)
+    if error == 'forbidden':
+        return payload('Changing how tasks depend on each other requires permission to manage the project.', 403, False)
+    return payload('Dependency removed successfully.', 200, True)
+
+
+# --------------------------------------------------------------------------
+# Workload overrides
+# --------------------------------------------------------------------------
+
+def override_data(request) -> dict:
+    return {
+        'id': str(request.id),
+        'task_id': str(request.target_id),
+        'status': request.status,
+        'reason': request.payload.get('reason', ''),
+        'breached': request.payload.get('breached', []),
+        'limits': request.payload.get('limits', {}),
+        'workload_at_request': request.payload.get('workload_at_request'),
+        'requested_by': str(request.requested_by_id) if request.requested_by_id else None,
+        'reviewer_id': str(request.reviewer_id) if request.reviewer_id else None,
+        'decision_comment': request.decision_comment,
+        'created_at': request.created_at.isoformat(),
+    }
+
+
+@router.post(
+    '/tasks/{task_id}/workload-override/', auth=auth,
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def request_workload_override(request, task_id: UUID, data: WorkloadOverrideIn):
+    """Ask somebody who can authorise it to make an assignment anyway.
+
+    The route a manager takes when block mode refused them and they do not
+    hold an override role -- the difference between a limit and a wall.
+    """
+    task, error = await services.get_task_for_user(request.auth, task_id)
+    if error == 'not_found':
+        return payload('Task not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this task.', 403, False)
+    if not await services.user_can_manage_task(request.auth, task):
+        return payload('You do not have permission to assign this task.', 403, False)
+
+    assignee, resolve_error = await services.resolve_company_member(task.project.company, data.assigned_to_id)
+    if resolve_error:
+        return payload(
+            'The selected user is not a member of this company.', 400, False,
+            errors={'assigned_to_id': ['Not eligible']},
+        )
+    decision = await workload.evaluate_assignment(task.project.company, assignee)
+    if not decision.breached:
+        return payload(
+            'That assignment is not over any workload limit -- assign it directly.', 400, False,
+            errors={'workload': ['No limit exceeded']},
+        )
+    approval, error = await services.request_workload_override(
+        request.auth, task, assignee, decision, data.reason,
+    )
+    if error == 'duplicate_request':
+        return payload(
+            'There is already an open request to assign this task.', 400, False,
+            errors={'task': ['A request is already pending']},
+        )
+    if error == 'no_reason':
+        return payload('A reason is required.', 400, False, errors={'reason': ['Required']})
+    return payload('Request sent for approval.', 201, True, {'request': override_data(approval)})
+
+
+@router.get('/workload-overrides/', auth=auth, response={200: ApiResponse})
+async def list_workload_overrides(request, status: Literal['pending', 'approved', 'denied'] | None = None,
+                                  page: int = 1, page_size: int = DEFAULT_PAGE_SIZE):
+    queryset = await services.list_workload_overrides_for_user(request.auth, status=status)
+    items, meta = await paginate(queryset, page, page_size)
+    return payload('Requests retrieved successfully.', 200, True, {
+        'results': [override_data(item) for item in items], 'meta': meta,
+    })
+
+
+@router.post(
+    '/workload-overrides/{request_id}/approve/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def approve_workload_override(request, request_id: UUID, data: WorkloadOverrideDecisionIn):
+    return await _decide_override(request, request_id, data, approve=True)
+
+
+@router.post(
+    '/workload-overrides/{request_id}/decline/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def decline_workload_override(request, request_id: UUID, data: WorkloadOverrideDecisionIn):
+    return await _decide_override(request, request_id, data, approve=False)
+
+
+async def _decide_override(request, request_id, data, *, approve):
+    approval, error = await services.get_workload_override_for_user(request.auth, request_id)
+    if error:
+        return payload('Request not found.', 404, False)
+    decided, error = await services.decide_workload_override(
+        request.auth, approval, approve=approve, comment=data.comment,
+    )
+    if error == 'forbidden':
+        return payload('You do not have permission to decide this request.', 403, False)
+    if error == 'not_pending':
+        return payload('This request has already been decided.', 400, False)
+    if error == 'task_gone':
+        return payload('The task this request was about no longer exists.', 400, False)
+    if error:
+        return payload('The assignment could not be applied.', 400, False, errors={error: ['Invalid']})
+    verb = 'approved' if approve else 'declined'
+    return payload(f'Request {verb}.', 200, True, {'request': override_data(decided)})
