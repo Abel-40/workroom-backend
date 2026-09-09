@@ -17,6 +17,7 @@ from company.services import (
     is_company_member_sync,
 )
 from departments_and_teams.models import Department, Team
+from documents.services import validate_upload
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
@@ -594,11 +595,13 @@ async def upload_own_resume(user, uploaded_file):
     profile = await CompanyUserProfile.objects.filter(user=user, company=company).afirst()
     if profile is None:
         return None, 'no_profile'
-    if uploaded_file.size > MAX_RESUME_SIZE_BYTES:
-        return None, 'too_large'
-    content_type = uploaded_file.content_type or ''
-    if content_type not in ALLOWED_RESUME_CONTENT_TYPES:
-        return None, 'invalid_content_type'
+    # Its own smaller cap and narrower type set, passed as arguments rather
+    # than written out again -- see documents.services.validate_upload.
+    error = validate_upload(
+        uploaded_file, max_bytes=MAX_RESUME_SIZE_BYTES, allowed_types=ALLOWED_RESUME_CONTENT_TYPES,
+    )
+    if error:
+        return None, error
     if profile.resume:
         await sync_to_async(profile.resume.delete, thread_sensitive=True)(save=False)
     profile.resume = uploaded_file

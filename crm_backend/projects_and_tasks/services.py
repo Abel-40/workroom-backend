@@ -44,6 +44,9 @@ from notifications_and_activity.services import (
 )
 from users.models import CompanyUserProfile
 
+from documents import services as documents_services
+from documents.services import validate_upload
+
 from .access import AccessLevel, resolve_project_access
 from .models import (
     ApprovalRequest, Attachment, DefaultTaskType, Project, ProjectMembership, ProjectVisibilityRequest, Task,
@@ -70,17 +73,11 @@ TASK_UPDATABLE_FIELDS = TASK_ASSIGNEE_FIELDS | TASK_MANAGE_FIELDS
 # see change_task_deadline. Leaving it writable through the general update
 # path made all three optional by simply choosing the other endpoint.
 
-MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
-ALLOWED_DOCUMENT_CONTENT_TYPES = {
-    'application/pdf',
-    'image/png', 'image/jpeg', 'image/gif', 'image/webp',
-    'text/plain', 'text/csv',
-    'application/msword',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/vnd.ms-excel',
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    'application/zip',
-}
+# Re-exported from documents.services, which is now the one definition. Kept
+# importable here because existing callers and tests refer to them by this
+# name, and moving them was not worth a rename across the codebase.
+MAX_DOCUMENT_SIZE_BYTES = documents_services.MAX_DOCUMENT_SIZE_BYTES
+ALLOWED_DOCUMENT_CONTENT_TYPES = documents_services.ALLOWED_DOCUMENT_CONTENT_TYPES
 
 
 # --------------------------------------------------------------------------
@@ -701,11 +698,12 @@ async def set_project_image_link(user, project, image_url: str):
 async def upload_project_image(user, project, uploaded_file):
     if not await user_can_manage_project(user, project):
         return None, 'forbidden'
-    if uploaded_file.size > MAX_PROJECT_IMAGE_SIZE_BYTES:
-        return None, 'too_large'
-    content_type = uploaded_file.content_type or ''
-    if content_type not in ALLOWED_PROJECT_IMAGE_CONTENT_TYPES:
-        return None, 'invalid_content_type'
+    error = validate_upload(
+        uploaded_file, max_bytes=MAX_PROJECT_IMAGE_SIZE_BYTES,
+        allowed_types=ALLOWED_PROJECT_IMAGE_CONTENT_TYPES,
+    )
+    if error:
+        return None, error
     if project.image:
         await sync_to_async(project.image.delete, thread_sensitive=True)(save=False)
     project.image = uploaded_file
@@ -1584,10 +1582,9 @@ async def submit_task_for_approval(user, task, *, files=None, links=None, page_i
         return None, 'no_evidence'
 
     for uploaded_file in files:
-        if uploaded_file.size > MAX_DOCUMENT_SIZE_BYTES:
-            return None, 'too_large'
-        if (uploaded_file.content_type or '') not in ALLOWED_DOCUMENT_CONTENT_TYPES:
-            return None, 'invalid_content_type'
+        error = validate_upload(uploaded_file)
+        if error:
+            return None, error
 
     pages = []
     if page_ids:
@@ -1914,11 +1911,10 @@ def get_text_document_excerpts(project, *, max_documents=3, max_chars_per_docume
 async def upload_document(user, project, uploaded_file, *, label='', task_id=None):
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
-    if uploaded_file.size > MAX_DOCUMENT_SIZE_BYTES:
-        return None, 'too_large'
+    error = validate_upload(uploaded_file)
+    if error:
+        return None, error
     content_type = uploaded_file.content_type or ''
-    if content_type not in ALLOWED_DOCUMENT_CONTENT_TYPES:
-        return None, 'invalid_content_type'
     task = None
     if task_id is not None:
         task = await Task.objects.filter(id=task_id, project=project).afirst()

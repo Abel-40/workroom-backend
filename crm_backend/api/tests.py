@@ -1410,8 +1410,13 @@ class DocumentSecurityTests(TwoCompanyTestCase):
         self.assertEqual(created.status_code, 201)
         document_id = created.json()['data']['document']['id']
 
+        # 404, not 403. NON-NEGOTIABLE RULE 1 is explicit that cross-tenant
+        # access answers 404, and the unified document lookup follows it: a
+        # document must not confirm its own existence to somebody who may not
+        # read it. This asserted 403 while project documents had their own
+        # lookup that distinguished the two cases.
         outsider_download = self.client.get(f'/api/v1/documents/{document_id}/download/', **auth_header(self.owner_b))
-        self.assertEqual(outsider_download.status_code, 403)
+        self.assertEqual(outsider_download.status_code, 404)
 
         owner_download = self.client.get(f'/api/v1/documents/{document_id}/download/', **auth_header(self.owner_a))
         self.assertEqual(owner_download.status_code, 200)

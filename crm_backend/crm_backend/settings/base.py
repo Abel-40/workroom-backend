@@ -86,6 +86,7 @@ INSTALLED_APPS = [
     'pages',
     'todos',
     'audit',
+    'documents',
 ]
 
 MIDDLEWARE = [
@@ -264,6 +265,12 @@ CELERY_BEAT_SCHEDULE = {
     'check-task-dependency-graph': {
         'task': 'projects_and_tasks.tasks.check_dependency_graph_integrity_task',
         'schedule': crontab(hour=3, minute=30),
+    },
+    # Permanently removes documents past documents.services.RETENTION_DAYS.
+    # Offset from the graph check so two nightly jobs do not start together.
+    'purge-expired-documents': {
+        'task': 'documents.tasks.purge_expired_documents_task',
+        'schedule': crontab(hour=4, minute=0),
     },
 }
 

@@ -10,6 +10,7 @@ from company.services import get_company_role, get_managed_company, get_member_c
 from departments_and_teams import services as departments_and_teams_services
 from departments_and_teams.models import DefaultDepartment, Department
 from django.conf import settings
+from documents.services import validate_upload
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -61,6 +62,12 @@ from .schemas import (
     SignInIn,
     SignUpIn,
 )
+
+# Profile pictures have their own smaller cap and image-only type set --
+# passed to documents.services.validate_upload rather than written out as a
+# fourth copy of the same two checks.
+MAX_PROFILE_PICTURE_BYTES = 5 * 1024 * 1024
+ALLOWED_PROFILE_PICTURE_TYPES = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
 
 api = NinjaAPI(
     title='Workroom API',
@@ -439,10 +446,17 @@ async def accept_invite(
         await sync_to_async(validate_password, thread_sensitive=True)(password)
     except DjangoValidationError as exc:
         return payload('Validation error', 400, False, errors={'password': exc.messages})
-    if profile_picture.size > 5 * 1024 * 1024:
+    # Same validator as every other upload path, with this one's own limits.
+    error = validate_upload(
+        profile_picture, max_bytes=MAX_PROFILE_PICTURE_BYTES,
+        allowed_types=ALLOWED_PROFILE_PICTURE_TYPES,
+    )
+    if error == 'too_large':
         return payload('Profile picture exceeds the maximum allowed size (5MB).', 400, False)
-    if (profile_picture.content_type or '') not in {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}:
+    if error == 'invalid_content_type':
         return payload('Profile picture must be a PNG, JPEG, GIF, or WEBP image.', 400, False)
+    if error:
+        return payload('That file could not be read.', 400, False)
     user, error = await sync_to_async(accept_invite_in_transaction, thread_sensitive=True)(
         token, password, full_name, profession, phone_number, address, profile_picture,
     )
