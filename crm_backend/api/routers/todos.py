@@ -59,6 +59,9 @@ class TaskStepsIn(Schema):
 DUE_DATE_ERRORS = {
     'due_date_required': 'Pick the day this belongs to.',
     'due_date_too_far': 'That due date is too far in the future.',
+    # Computed in the owner's own timezone, at request time -- see
+    # todos.services.validate_due_date for why that matters.
+    'due_date_in_past': 'Pick today or a later day.',
 }
 
 
@@ -178,7 +181,7 @@ def generation_data(generation) -> dict:
 
 @router.post(
     '/generate/', auth=auth,
-    response={202: ApiResponse, 400: ApiResponse, 404: ApiResponse, 409: ApiResponse},
+    response={202: ApiResponse, 400: ApiResponse, 404: ApiResponse, 409: ApiResponse, 429: ApiResponse},
 )
 @rate_limit('todo_generate', limit=20, window_seconds=3600, key_func=lambda r: str(r.auth.id))
 async def generate_todos(request, data: TodoGenerateIn):
@@ -192,6 +195,14 @@ async def generate_todos(request, data: TodoGenerateIn):
             'generation': generation_data(in_flight),
         })
 
+    # Checked before the provider call, not after -- the point of a quota is
+    # to not spend the request you were going to reject.
+    if await services.check_generation_quota(request.auth):
+        return payload(
+            f'You have used all {services.MAX_GENERATIONS_PER_DAY} to-do generations for today. '
+            'The count resets tomorrow in your own timezone.', 429, False,
+        )
+
     task = None
     if data.mode == 'task':
         if data.task_id is None:
@@ -204,11 +215,27 @@ async def generate_todos(request, data: TodoGenerateIn):
         request.auth, company, mode=data.mode, task=task,
     )
     if error == 'no_assigned_tasks':
-        return payload('You have no open tasks assigned to you right now.', 400, False)
+        # Precise on purpose: 'today' mode draws on work due today or already
+        # overdue (see todos.services.eligible_tasks_for_generation), so a
+        # person with a full fortnight ahead of them and nothing due today
+        # gets this. Saying 'no tasks assigned' would be untrue.
+        return payload(
+            'Nothing is due today and nothing is overdue, so there is nothing to plan. '
+            'Pick a specific task to break down instead.', 400, False,
+        )
 
     window_start, window_end = await services.resolve_generation_window(
         request.auth, mode=data.mode, task=task, days=data.days,
     )
+    # §9: one active plan per (user, task) and per (user, today). Asking again
+    # means "that one was wrong", not "give me two lists" -- and two
+    # overlapping AI checklists for the same day is precisely the duplication
+    # people report as the feature being broken. Completed items survive and
+    # are detached; incomplete AI items go; manual to-dos are never touched.
+    superseded = await services.find_superseded_generation(request.auth, mode=data.mode, task=task)
+    if superseded is not None:
+        await services.supersede_generation(request.auth, superseded)
+
     generation = await AITodoGeneration.objects.acreate(
         user=request.auth, company=company, mode=data.mode, task=task,
         source_task_ids=[str(t.id) for t in tasks],

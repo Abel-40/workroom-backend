@@ -27,9 +27,9 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | |
 | WP12 | AI assistant privacy; health-summary anonymity (§5) | |
 | WP13 | Events: audience, attendees, RRULE (§6) | |
-| WP14 | Unified `Document` model with scopes (§7) | |
-| WP15 | Analytics tiers (§8) | |
-| WP16 | To-dos: timezone, eligibility, supersede semantics (§9) | |
+| WP14 | Unified `Document` model with scopes (§7) | **done** |
+| WP15 | Analytics tiers (§8) | **done** |
+| WP16 | To-dos: timezone, eligibility, supersede semantics (§9) | **done** |
 | WP17 | Plans, `Entitlements`, `UsageCounter`, enforcement (§11) | |
 | WP18 | Integration seams (§12) | |
 | WP19 | `docs/DECISIONS.md` (§13) | **done** |
@@ -957,6 +957,171 @@ could always leave To Do.
 
 ---
 
+## WP14 — One document model, four scopes
+
+§7 asks for one `Document` with a `scope` rather than four systems. There were
+already two -- project `Attachment` rows and Info Portal folders -- and
+personal and company files had nowhere to live at all.
+
+### What moved, and what deliberately did not
+
+`Attachment` was doing two jobs that look alike:
+
+- **project and task documents** -- a file somebody filed. Migration
+  `documents/0002` copies those onto `Document(scope="project")`.
+- **task-approval evidence** (`approval` set) -- a file submitted for
+  judgement inside one review cycle, part of an append-only history PRESERVE
+  EXACTLY names. Those **stay** on `Attachment`.
+
+A document is something you filed; evidence is something you submitted.
+Merging them would have meant either evidence inheriting document deletion, or
+documents inheriting evidence's immutability. Link and page attachments stay
+too -- they hold no file, and giving a URL a `FileField` row with nothing in it
+would be pretending otherwise.
+
+Additive: nothing is deleted from `Attachment`, the copied rows are simply no
+longer what the API reads. Same treatment as `Project.collaborators`.
+
+### One access function, and one strict scope
+
+`resolve_document_access` answers all four scopes. `personal` is checked first
+and returns immediately, so there is no path by which a company-role check
+below it could ever apply: §7 says no administrative override "including
+Owner-over-CM or CM-over-Owner", and both directions are tested.
+
+The listing filters in the query rather than after it. A listing that fetches
+everything and then drops what the caller may not see is one forgotten call
+away from being a leak, and it cannot be paginated correctly.
+
+### One validator, several policies
+
+§7 wants content-type and size validation "on every upload path, not just
+approval evidence". There were four hand-written copies of the same two checks
+-- documents, evidence, project images, résumés -- plus profile pictures in
+`api.py`. They now all call `documents.services.validate_upload`, which takes
+the limits as arguments. The differences between paths are real and worth
+keeping; four copies free to drift were not. A zero-byte upload is now refused
+too, which none of the copies did.
+
+### Two things I broke and had to fix
+
+Worth recording rather than quietly correcting:
+
+1. **I overwrote `api/routers/documents.py` wholesale**, destroying the
+   existing project-document endpoints including `download`. Recovered from
+   git and rewritten so every original URL survives, backed by `Document`.
+   The paths stayed because breaking every client to rename a model is a cost
+   with no benefit.
+2. **I dropped the `project__is_deleted=False` filter** the old lookup carried,
+   which left documents reachable by direct id after their project was
+   archived. Caught by `ProjectDeletionCascadeTests`, which existed for exactly
+   this and earned its keep.
+
+One stale expectation: a cross-tenant download asserted 403. It now answers
+404, which is what NON-NEGOTIABLE RULE 1 requires and what a personal document
+needs -- a document must not confirm its own existence to somebody who may not
+read it.
+
+**Retention**: soft delete records `deleted_at`, a nightly job purges past 30
+days, and `restore` exists inside the window -- without it the window is only
+a delay before permanent loss. Files are deleted one at a time rather than by
+a bulk queryset delete, which would drop the rows and orphan every file behind
+them.
+
+**48 tests** in `documents/tests.py`.
+
+---
+
+## WP15 — Analytics tiers
+
+Five tiers, in `analytics/tiers.py`, drawn wherever a number stops being about
+a project and starts being about a person.
+
+The endpoint §8 singles out is `/analytics/company/members/`: every
+colleague's name against their open task counts, previously readable by **every
+role**, including a Department Member. That is one join away from a performance
+dashboard. It is now Owner/CM only.
+
+Two boundaries worth explaining:
+
+- **The department breakdown with no `department_id` is company-tier.** It is
+  every department's numbers, and a Department Leader asking for it would be
+  reading every other department's figures through a different door. With an
+  id, a DL may ask about their own and no other.
+- **`PROJECT_PEOPLE` counts only that project's tasks.** Showing someone's
+  company-wide load there would leak the workload of projects the viewer has
+  nothing to do with, through one they happen to manage.
+
+`/analytics/me/` is new and never gated. Being able to see your own workload is
+not a privilege, and making it one pushes people toward the company roster to
+answer a question about themselves.
+
+**Nothing per-person is computed.** §8 rules out on-time percentages, velocity,
+productivity scores and rankings "not now, not later without a separate
+explicit decision". `NoPerPersonRatesTests` walks every analytics response and
+fails on a key containing any of those words, so adding one is a deliberate act
+that breaks a test rather than a quiet addition to a serializer.
+
+**39 tests** in `analytics/test_tiers.py`.
+
+---
+
+## WP16 — To-do timezone, eligibility and supersede
+
+### A manual due date may no longer be in the past
+
+Computed in the owner's timezone, at request time. The timezone half matters:
+"today" for somebody in Addis is a different day from the server's for several
+hours of every day, so a UTC comparison would reject a legitimate today or
+accept a yesterday depending on when they happened to be working.
+
+The past-date half **reverses** an existing deliberate decision -- the old
+docstring argued backfilling yesterday is legitimate. §9 says otherwise and is
+right: overdue is a state a to-do *arrives at*, not one worth being able to
+create. The AI path keeps `allow_past`, because §9 requires overdue work to be
+included and ranked first.
+
+### The eligibility rule, and a reading I got wrong first
+
+§9 lists six conditions. The `blocks` clause is only implementable because of
+WP8.
+
+I initially separated "the window the to-dos are dated in" from "the horizon
+tasks are drawn from", on the reasoning that a `today`-mode list restricted to
+tasks due today would tell somebody with a full fortnight of work that they
+had none. That was me second-guessing the prompt. §9 states it twice --
+"deadline is inside the window or already overdue", and "only exclude
+completed, archived, and out-of-window-future work" -- so `today` mode is a
+**daily focus list**, not a backlog, and that is a coherent product.
+
+The consequence is real and handled: a person with plenty of work and nothing
+due today gets an empty result, so the message says *nothing is due today*
+rather than *no tasks assigned*, which would have been untrue.
+
+### Supersede
+
+One active plan per (user, task) and per (user, today). Asking again means
+"that one was wrong", not "give me two lists", and two overlapping AI
+checklists for one day is exactly the duplication people report as the feature
+being broken.
+
+Completed items are **kept and detached** -- the owner did that work, deleting
+it would destroy their record rather than tidy ours, and detaching stops a
+later dismissal of the old generation reaching back for them. Incomplete AI
+items go. **Manual to-dos are never touched**, and the filter names the source
+as well as the generation so even a mis-attached manual row survives.
+
+Ten generations per user per day, counted in the user's own timezone so the cap
+and the plan agree about which day it is, and checked **before** the provider
+call rather than after.
+
+**39 tests** in `todos/test_generation_rules.py`. Five stale expectations
+updated, including one that asserted a past due date is allowed; the tests that
+need an overdue to-do now build one the way reality does -- written directly,
+past the endpoint that guards creation.
+
+---
+
 ## Test gate in use
 
 Per commit: the affected app's tests, plus `makemigrations --check --dry-run`,
@@ -993,9 +1158,20 @@ Nothing asserts on the algorithm. Password *strength* is enforced by
 **Pre-existing baseline, recorded before any change on this branch:
 511 passed, 1 failed.** The failure is
 `api/tests.py::AIHealthSummarySecurityTests::test_rate_limit_boundary`, which
-its own docstring says needs a real Redis at `CELERY_BROKER_URL`; Docker is not
-running on this machine. It is an environment failure, not a code failure, and
-not something this work introduced or should fix.
+its own docstring says needs a real Redis at `CELERY_BROKER_URL`. It is an
+environment failure, not a code failure, and not something this work introduced
+or should fix.
+
+**Corrected 2026-09-09.** The reason recorded here for months -- "Docker is not
+running" -- was wrong. With every container up and `workroom-redis` healthy, the
+test still fails: `docker-compose.yml` **publishes no host port for Redis**, so
+it is reachable only as `redis:6379` inside the compose network and never from
+a suite run on the host. Starting Docker does not and cannot fix it.
+
+Two ways to make it pass, both a change to the dev environment rather than to
+the code, and neither taken here: publish `6379:6379` in `docker-compose.yml`,
+or run the suite inside `workroom-bd` (which would first need `pytest` --
+the image installs `requirements.txt` only).
 
 `ruff` also has **5 pre-existing errors** in
 `projects_and_tasks/services.py` (2 × `I001`, 2 × `E501`) and
@@ -1059,6 +1235,22 @@ exists, and record it when one does not", which is a real decision about
 separation of duties rather than a tidy-up, and it needs its own baseline
 regeneration. Worth doing as WP7c or folding into WP10, where the fallback
 chain gets revisited anyway.
+
+### R6 — `today` mode is a daily focus list, not a backlog
+
+§9's eligibility rule ("deadline is inside the window or already overdue")
+combined with its window rule ("`today` mode = today only") means an AI to-do
+generation in `today` mode draws only on tasks due today or already overdue.
+
+Implemented literally, because §9 says it twice -- the second time as "only
+exclude completed, archived, and out-of-window-future work". But it is worth a
+conscious look, because the product consequence is not small: a person with a
+full fortnight of scheduled work and nothing due today gets an empty result.
+The message says so precisely rather than claiming they have no tasks, so it is
+honest either way.
+
+If the intent was "everything open, dated into today", the change is one
+argument in `eligible_tasks_for_generation`.
 
 ### R4 — Three repositories, one branch name
 
