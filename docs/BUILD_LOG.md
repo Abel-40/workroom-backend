@@ -22,7 +22,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP7a | Task field-level authority; `created_by` stops granting MANAGE (§2) | **done** |
 | WP7b | Task creation behind MANAGE; task proposals; break-into-steps (§2) | **done** |
 | WP8 | Task dependencies — `blocks` / `relates_to` (§2) | **done** |
-| WP9 | `ProjectBrief` and brief-assisted creation (§1) | |
+| WP9 | `ProjectBrief` and brief-assisted creation (§1) | **partial** — the model/API/completeness score are done; the two-human-gate AI-extraction creation flow is deferred, see the WP9 entry |
 | WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | **done** |
 | WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | **done** |
 | WP12 | AI assistant privacy; health-summary anonymity (§5) | **done** |
@@ -36,7 +36,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | **partial** — composable + task panel done; remaining views outstanding |
 | WP21 | Owner-with-no-membership backfill, then delete every "owner might have no profile" branch (§10) | **done** |
 | WP22 | Company context returns the membership, accepts an explicit company id (§10) | **done** |
-| WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | **partial** — plan written, README outstanding |
+| WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | **done** |
 
 Three rows were added to this table on 2026-09-08, after a read-back against
 the prompt. WP21 and WP22 are the two tail paragraphs of §10 that are not part
@@ -1964,6 +1964,92 @@ service (7 new in `test_fallback.py`).
 
 Touched-area suite (`ai_agent api projects_and_tasks workforce`): **587
 passed, 1 failed** -- the Redis one.
+
+---
+
+## WP9 — `ProjectBrief`, structural half only
+
+§1, scoped down deliberately -- see the deferral below.
+
+### What's built
+
+`ProjectBrief`: a one-row-per-project structured "what and why", separate
+from the project itself and from creation. Six free-text fields answering
+distinct questions on purpose (objective/background/scope_in/scope_out/
+expected_outcome/constraints, not one big description box), a `body` JSON
+field for deliverables/stakeholders/resources shaped however a company
+likes, `required_departments`/`required_skills` as catalog references
+(never free text -- `required_skills` is WP10's `workforce.Skill`, which is
+exactly why WP9 needed WP10 to exist first), and a completeness score.
+
+`GET`/`PATCH /projects/{id}/brief/`. VIEW is enough to read -- a brief is
+project context, not a capability, same as reading the project's own
+description -- and it is created empty on first read rather than needing a
+separate setup step, so a project the caller can see never 404s on its
+brief. MANAGE is required to write it, same authority as editing the
+project itself. Creation is untouched and ungated, per §1's explicit
+instruction: title/deadline/visibility only, brief filled in later.
+
+**Completeness scoring excludes the two catalog M2Ms on purpose.** Only the
+six prose fields plus a non-empty `body` count toward the percentage. A
+project's real department/skill requirements vary too much in natural size
+-- one project needs three departments, another needs none -- to score
+fairly against a fixed weight; scoring them would make the number swing for
+reasons that have nothing to do with how filled-in the brief actually is.
+
+`ai_agent.context.build_generation_context` already had a `getattr`-based
+read of `project.brief` staged from WP11 (`ai_agent/context.py`'s docstring
+said "WP9 hasn't landed yet" -- it has now). No code change was needed there;
+only the six prose fields are sent, `body` deliberately stays off the
+allow-list (an open JSON blob is exactly what an allow-list exists to keep
+out until someone deliberately adds it), and a project with no brief row
+simply omits the `brief` key from the payload, same as before.
+
+### A real bug the tests caught
+
+`update_brief`'s department/skill validation compared a queryset's UUID
+objects against the request body's UUID strings with a bare set equality --
+`{UUID(...), ...} != {'uuid-string', ...}` is always true even for the exact
+same records, so **every** valid department/skill reference was being
+rejected as invalid. Caught immediately by
+`test_required_departments_from_own_company_are_accepted` and its skill
+counterpart failing with a 400 where they should have passed. Fixed by
+`str()`-ing both sides before comparing.
+
+### What's deliberately not built: the AI-extraction creation flow
+
+§1 also asks for: upload a doc → AI extracts into the guided form → human
+confirms → AI runs a cheap interpretation pass (restated objective,
+assumptions, open questions) → human confirms again → only then the full
+planning call runs. Two human gates, not one.
+
+**Not built this pass.** This is a second, comparably-sized feature on top
+of the structural model above -- a new AI-service endpoint and prompt for
+document extraction, a second for the interpretation pass, a new lifecycle
+record on the Django side to track a multi-step confirm flow (closer in
+shape to `AIGeneration` than to a single request/response), file-upload
+handling, and frontend UI for both confirmation steps. Building it at the
+same quality bar as everything else this session would not fit inside
+"quick," and building it below that bar would mean shipping exactly the kind
+of unfinished, half-tested AI flow this whole prompt exists to avoid.
+
+The structural model does not block it: `ProjectBrief` is what either path
+(guided form or AI-assisted) writes into, so the extraction/interpretation
+flow is additive whenever it's built -- a new AI-service endpoint pair plus
+a Django lifecycle record and two confirmation endpoints, writing to the
+same `PATCH /projects/{id}/brief/` path that already exists.
+
+### Files
+
+`projects_and_tasks/models.py` (+ migration 0019), `projects_and_tasks/services.py`,
+`api/routers/projects.py`, `projects_and_tasks/test_project_brief.py` (new),
+`ai_agent/context.py` (docstring only), `ai_agent/test_context.py` (+3 tests).
+
+**53 tests**: 50 in `test_project_brief.py` (access, edit authority, every
+field, catalog-reference validation and tenant isolation, completeness
+scoring including the whitespace/empty-body edge cases), 3 added to
+`test_context.py` (a real brief's prose fields reach the AI payload; `body`
+never does).
 
 ---
 

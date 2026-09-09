@@ -98,10 +98,44 @@ class AllowListBoundaryTests(ContextFixture):
     def test_the_top_level_shape_is_exactly_the_allow_list(self):
         generation = self.make_generation()
         context = build_generation_context(generation)
-        # No brief yet (WP9 hasn't landed), so its key is absent entirely --
-        # not null, absent, which is the honest shape for "there is no brief".
+        # No brief row exists for this project, so the key is absent
+        # entirely -- not null, absent, which is the honest shape for
+        # "there is no brief" (see test_a_briefs_prose_fields_are_sent below
+        # for the case where one exists).
         self.assertNotIn('brief', context)
         self.assertTrue(set(context).issubset(CONTEXT_FIELDS))
+
+    def test_a_briefs_prose_fields_are_sent_once_one_exists(self):
+        from projects_and_tasks.models import ProjectBrief
+
+        ProjectBrief.objects.create(
+            project=self.project, objective='Ship it', background='Old system is slow',
+            scope_in='API', scope_out='Mobile app', expected_outcome='Faster checkout',
+            constraints='No downtime',
+        )
+        generation = self.make_generation()
+        context = build_generation_context(generation)
+        self.assertEqual(context['brief'], {
+            'objective': 'Ship it', 'background': 'Old system is slow', 'scope_in': 'API',
+            'scope_out': 'Mobile app', 'expected_outcome': 'Faster checkout', 'constraints': 'No downtime',
+        })
+
+    def test_the_briefs_body_field_never_reaches_the_payload(self):
+        """`body` is the deliberately unstructured remainder --
+        deliverables/stakeholders/resources shaped however a company likes.
+        Not on the allow-list: an open JSON blob is exactly the kind of field
+        an allow-list exists to keep out until someone deliberately adds it."""
+        import json
+
+        from projects_and_tasks.models import ProjectBrief
+
+        ProjectBrief.objects.create(
+            project=self.project, objective='Ship it',
+            body={'stakeholders': ['forbidden-sentinel-stakeholder']},
+        )
+        generation = self.make_generation()
+        context = build_generation_context(generation)
+        self.assertNotIn('forbidden-sentinel-stakeholder', json.dumps(context))
 
     def test_a_candidate_entry_carries_only_the_allow_listed_fields(self):
         generation = self.make_generation()
