@@ -30,13 +30,13 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP14 | Unified `Document` model with scopes (§7) | **done** |
 | WP15 | Analytics tiers (§8) | **done** |
 | WP16 | To-dos: timezone, eligibility, supersede semantics (§9) | **done** |
-| WP17 | Plans, `Entitlements`, `UsageCounter`, enforcement (§11) | |
-| WP18 | Integration seams (§12) | |
+| WP17 | Plans, `Entitlements`, `UsageCounter`, enforcement (§11) | **done** |
+| WP18 | Integration seams (§12) | **done** |
 | WP19 | `docs/DECISIONS.md` (§13) | **done** |
 | WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | |
 | WP21 | Owner-with-no-membership backfill, then delete every "owner might have no profile" branch (§10) | **done** |
 | WP22 | Company context returns the membership, accepts an explicit company id (§10) | **done** |
-| WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | |
+| WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | **partial** — plan written, README outstanding |
 
 Three rows were added to this table on 2026-09-08, after a read-back against
 the prompt. WP21 and WP22 are the two tail paragraphs of §10 that are not part
@@ -1122,6 +1122,125 @@ past the endpoint that guards creation.
 
 ---
 
+## WP17 — Plans, entitlements, usage counters
+
+Everything §11 specifies, built and measured. **Enforcement defaults to off**,
+which is the R1 decision and is recorded there rather than here.
+
+### The switch, and why it landed where it did
+
+I built this enforcing, as §11 demands, and ran the suite: **46 failures**.
+Not subtle ones -- department creation, team creation, publishing a project,
+company analytics. Every test company has no subscription, so it resolves to
+Free, and Free allows one department, **zero teams** and no `public_projects`.
+
+That is the R1 conflict stated as evidence rather than as a reading of three
+documents. The product was built without limits; applying them is a decision
+with real customer consequences on the day it ships, not a default somebody
+inherits. `ENTITLEMENTS_ENFORCED` now defaults to `False`, matching what the
+prompt's own OUT OF SCOPE list and `CLAUDE.md` §§15-16 both already asked for.
+
+`has_feature` follows the same flag. The switch has to mean one thing --
+either plan restrictions apply or they do not. Permissive on counts but
+restrictive on features would be the worst of both: lenient where it is
+measurable, and restrictive where it is visible.
+
+Nothing else is deferred. Limits resolve, usage is counted and reconciled, and
+every check reports the true numbers, so a UI can already show "5 of 3 used"
+and an upgrade prompt. Turning enforcement on is an environment variable, and
+the usage history needed to decide when -- the part that genuinely cannot be
+reconstructed later -- is being collected now.
+
+### Checks read rows, not counters
+
+§11 describes incrementing a counter at each point of change and checking
+against it. That works right up until one create path forgets to increment,
+and then the limit is silently wrong in whichever direction the bug went.
+
+So point-in-time metrics are counted **from the rows** at check time, and the
+counter is a cache for dashboards, reconciled nightly. It is the same
+"counters are for speed; rows are for truth" rule §11 states for
+reconciliation, applied one step earlier -- and it deletes a class of bug
+rather than scheduling a job to detect it. A test pins it: a counter drifted
+to 999 cannot refuse anything.
+
+Monthly metrics are the exception and do use the counter, because credits
+spent leave no other trace. There is nothing to recompute them from. They
+reset by period key, so a new month is a new row and no job has to fire at
+midnight on the first.
+
+### plan_snapshot
+
+The field that makes the whole arrangement honest: limits are frozen at
+subscription time and resolved **before** the live `Plan`, so editing `team`'s
+numbers cannot silently change what an existing customer is paying for. An FK
+alone cannot express that -- it follows the row wherever it goes.
+
+A company with no subscription resolves to the seeded `free` plan. That is a
+real, common state, and treating it as "no limits" would mean the limits apply
+to paying customers and nobody else.
+
+### Over-limit behaviour
+
+Soft-block throughout. A downgrade to Free at 6/5 members keeps all six and
+blocks the seventh; nothing is removed and nothing is archived. `past_due`
+gets 14 days measured from `past_due_since` rather than `updated_at`, because
+a grace period any unrelated write silently restarts is not a grace period --
+and `past_due` with no recorded start is treated as *in* grace, since guessing
+against the customer on missing data is how a billing bug becomes a support
+incident.
+
+Every refusal is a `402` naming the limit and the current number. A bare `403`
+on a limit is unactionable.
+
+**48 tests** in `entitlements/tests.py`, covering both switch positions, all
+six scenarios §11 asks for, and the permissive default itself.
+
+---
+
+## WP18 — Integration seams
+
+Models only. §12 asks for the shape and explicitly not the behaviour: no
+provider, no OAuth flow, no webhook dispatcher.
+
+The two rules that matter are on the models, because they are the ones that
+get quietly broken later by somebody wiring a real provider under time
+pressure:
+
+**An integration is a service principal.** It carries its own `scopes` and
+never inherits the connecting user's rights. `connected_by` is `SET_NULL`
+provenance, so the integration survives that person leaving -- and, more
+importantly, does not silently keep their rights if they are demoted.
+
+**External data is evidence, never truth.** `ExternalObjectLink` records that a
+pull request relates to a task. Nothing may read it to move the task. That one
+is enforced by a test that greps the codebase and fails if anything outside
+the model and its own tests references it -- so auto-completing a task from a
+merged PR becomes a deliberate argument rather than a quiet commit.
+
+`IntegrationCredential` is a separate table because it is the row that must
+never be serialized, logged or returned; keeping it apart makes that boundary
+visible rather than remembered. Its columns are named `encrypted_*` and there
+is no encryption helper: writing one before there is a provider to use it
+would be guessing at key management, and a half-built one that looks finished
+is worse than an obviously empty seam.
+
+`WebhookEvent` is unique on `(provider, external_event_id)` in the database
+rather than in a handler that has to remember. Providers retry, and a retry
+processed twice is how one merged pull request becomes two of something.
+
+**19 tests** in `integrations/tests.py`.
+
+---
+
+## WP23 (part) — `docs/MONETIZATION_PLAN.md`
+
+Written. It states the plans, how a limit resolves, how usage is counted, the
+over-limit rules, what is deliberately not built, and the five steps to turn
+enforcement on. The README half of WP23 is still outstanding.
+
+---
+
 ## Test gate in use
 
 Per commit: the affected app's tests, plus `makemigrations --check --dry-run`,
@@ -1183,25 +1302,31 @@ Worth a separate `chore(lint)` commit at some point.
 
 ## DECISIONS NEEDING REVIEW
 
-### R1 — §11 and OUT OF SCOPE contradict each other on entitlement enforcement
+### R1 — RESOLVED: limits are built and measured, enforcement is off
 
-§11 is titled "real limits, real enforcement" and says, in bold, "Implement
-actual plan limits now. Not a document, not a permissive stub." It then
-specifies four seeded plans, an `Entitlements` service, a `UsageCounter` model,
-nineteen enforcement points, over-limit and grace-period behaviour, and six
-tests.
+**Decided 2026-09-09.** `ENTITLEMENTS_ENFORCED` defaults to `False`.
 
-OUT OF SCOPE lists "entitlement *enforcement* (limits must stay permissive)".
+The conflict was three-way, not two:
 
-These cannot both hold. Reading it as a leftover from the earlier draft of the
-prompt (which asked for a documented plan plus an always-yes stub), and
-building §11 as written, because §11 is specific, detailed, and internally
-consistent, whereas the OUT OF SCOPE line is a single clause that would render
-an entire numbered section dead. **Confirm before WP17.**
+- §11 of the V2 prompt: "real limits, real enforcement... not a document, not
+  a permissive stub", with four seeded plans, an `Entitlements` service,
+  `UsageCounter`, nineteen enforcement points, grace behaviour and six tests.
+- The same prompt's OUT OF SCOPE list: "entitlement *enforcement* (limits must
+  stay permissive)".
+- `CLAUDE.md` §15 excludes an "advanced subscriptions/billing product" from
+  V1; §16 says "do not expand billing into a V1 product feature".
 
-The cost of being wrong in this direction is real: enforcement changes what
-existing customers can do the moment it ships. If the permissive stub was
-intended, say so and WP17 shrinks to `MONETIZATION_PLAN.md` plus the seam.
+Two of three said permissive, and `CLAUDE.md` is the repository's own standing
+instruction rather than a one-off prompt. What settled it was building §11 as
+written and running the suite: **46 failures**, because every company without a
+subscription resolves to Free, and Free allows one department, zero teams and
+no public projects. The product was built without limits, so switching them on
+changes what existing customers can do on the day it ships.
+
+Everything §11 specifies is built. Only the refusal is deferred, behind one
+environment variable, and the usage data needed to decide the rollout is being
+collected now. See `docs/MONETIZATION_PLAN.md` for the five steps to turn it
+on.
 
 ### R2 — `docs/MONETIZATION_PLAN.md` is required but never specified
 
