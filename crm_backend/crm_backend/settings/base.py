@@ -308,6 +308,11 @@ ENTITLEMENTS_ENFORCED = env.bool('ENTITLEMENTS_ENFORCED', default=False)
 # FastAPI AI service (Phase 6/7). Django never calls this synchronously from
 # a request -- only the Celery worker does (ai_agent/tasks.py).
 WORKROOM_AI_SERVICE_URL = env('WORKROOM_AI_SERVICE_URL', default='http://localhost:8001')
+# Which provider the AI service is configured to try first. Django does not
+# choose the provider -- it only needs to recognise when the answer came from
+# somewhere else, so a fallback is visible in the generation record rather
+# than being an invisible success.
+WORKROOM_AI_PRIMARY_PROVIDER = env('WORKROOM_AI_PRIMARY_PROVIDER', default='gemini')
 WORKROOM_AI_SERVICE_TOKEN = env('WORKROOM_AI_SERVICE_TOKEN', default='')
 WORKROOM_AI_SERVICE_TIMEOUT = env.float('WORKROOM_AI_SERVICE_TIMEOUT', default=90.0)
 

@@ -1,4 +1,3 @@
-import uuid
 from unittest.mock import Mock, patch
 
 from company.models import Company, Sector
@@ -41,10 +40,11 @@ class ProcessAIGenerationTests(TestCase):
         persist_ai_generated_tasks, the save step)."""
         plan = {'success': True, 'data': {
             'provider': 'gemini', 'model': 'gemini-2.0-flash', 'summary': 'A plan',
+            'usage': {'input_tokens': 500, 'output_tokens': 300},
             'tasks': [
                 {'temporary_id': 't1', 'sequence': 1, 'title': 'Define requirements',
-                 'suggested_department_id': str(self.department.id),
-                 'suggested_task_type_id': str(self.task_type.id), 'estimated_effort': '4h'},
+                 'suggested_department': self.department.name,
+                 'suggested_task_type': self.task_type.name, 'estimated_effort': '4h'},
                 {'temporary_id': 't2', 'sequence': 2, 'title': 'Design DB', 'dependency_ids': ['t1']},
             ],
         }}
@@ -69,6 +69,10 @@ class ProcessAIGenerationTests(TestCase):
         self.assertTrue(Notification.objects.filter(
             recipient=self.owner, type=Notification.Type.AI_GENERATION_COMPLETED,
         ).exists())
+        # Usage recorded on the day it happens -- cannot be reconstructed later.
+        self.assertEqual(self.generation.input_tokens, 500)
+        self.assertEqual(self.generation.output_tokens, 300)
+        self.assertIsNotNone(self.generation.cost)
 
     def test_permanent_failure_marks_generation_failed(self):
         with patch('ai_agent.tasks.requests.post', return_value=make_response(400, {'success': False})):
@@ -88,7 +92,7 @@ class ProcessAIGenerationTests(TestCase):
 
     def test_invalid_department_reference_fails_generation_without_creating_tasks(self):
         plan = {'data': {'tasks': [{
-            'temporary_id': 't1', 'sequence': 1, 'title': 'X', 'suggested_department_id': str(uuid.uuid4()),
+            'temporary_id': 't1', 'sequence': 1, 'title': 'X', 'suggested_department': 'Ministry of Magic',
         }]}}
         with patch('ai_agent.tasks.requests.post', return_value=make_response(200, plan)):
             process_ai_generation(str(self.generation.id))

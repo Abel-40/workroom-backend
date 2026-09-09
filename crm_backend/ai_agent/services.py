@@ -8,9 +8,11 @@ import logging
 from asgiref.sync import sync_to_async
 from company.services import is_company_member
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError
 from django.utils import timezone
 from projects_and_tasks.services import is_eligible_assignee, user_can_manage_project, user_can_view_project
 
+from .context import build_assignee_refs
 from .models import AIGeneration
 from .tasks import process_ai_generation
 
@@ -19,14 +21,58 @@ logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
+async def find_in_flight_plan(project):
+    """A plan generation already running for this project.
+
+    The same guard ``todos.services.find_in_flight_generation`` gives to-do
+    generation, generalised here per §4: a double-click must not buy two
+    provider calls. Scoped to the project rather than the user, because two
+    managers asking at the same moment is the same waste as one manager
+    asking twice.
+    """
+    return await AIGeneration.objects.filter(
+        project=project, status__in=[AIGeneration.STATUS.PENDING, AIGeneration.STATUS.PROCESSING],
+    ).afirst()
+
+
+async def find_by_idempotency_key(project, idempotency_key):
+    """The generation a repeated request is really asking about.
+
+    Scoped to the project so a key cannot reach across tenants, and matched
+    regardless of status: replaying a key must return the original outcome,
+    including a failure. Returning a fresh generation for a retried key is how
+    one user action becomes two bills.
+    """
+    if not idempotency_key:
+        return None
+    return await AIGeneration.objects.filter(
+        project=project, idempotency_key=idempotency_key,
+    ).order_by('-requested_at').afirst()
+
+
 async def request_project_plan(
     user, project, *, prompt: str, mentioned_user_ids: list | None = None,
-    assignee_ids: list | None = None, max_tasks: int = 10,
+    assignee_ids: list | None = None, max_tasks: int = 10, idempotency_key: str = '',
 ):
+    """Returns (generation, error).
+
+    ``error`` is 'forbidden', 'plan_already_saved', 'invalid_assignee',
+    'queue_failed', or None. Two non-errors deserve mention: a repeated
+    ``idempotency_key`` and an in-flight generation both return the *existing*
+    generation with no error, because the caller asked for a plan and there is
+    one -- they did not ask for a second one.
+    """
     if not await user_can_view_project(user, project):
         return None, 'forbidden'
     if await AIGeneration.objects.filter(project=project, saved_at__isnull=False).aexists():
         return None, 'plan_already_saved'
+
+    existing = await find_by_idempotency_key(project, idempotency_key)
+    if existing is not None:
+        return existing, None
+    in_flight = await find_in_flight_plan(project)
+    if in_flight is not None:
+        return in_flight, None
 
     requirements = prompt
     if mentioned_user_ids:
@@ -52,10 +98,24 @@ async def request_project_plan(
         if candidate is None or not await is_eligible_assignee(user, project, candidate):
             return None, 'invalid_assignee'
 
-    generation = await AIGeneration.objects.acreate(
-        project=project, requested_by=user, prompt=requirements,
-        requested_assignee_ids=[str(assignee_id) for assignee_id in assignee_ids], max_tasks=max_tasks,
-    )
+    try:
+        generation = await AIGeneration.objects.acreate(
+            project=project, requested_by=user, prompt=requirements,
+            requested_assignee_ids=[str(assignee_id) for assignee_id in assignee_ids], max_tasks=max_tasks,
+            # Minted once, at creation, from exactly this generation's
+            # approved pool -- see ai_agent.context. The AI never sees a real
+            # user id.
+            assignee_refs=build_assignee_refs(assignee_ids),
+            idempotency_key=idempotency_key or '',
+        )
+    except IntegrityError:
+        # Lost a race against a second request carrying the same key -- the
+        # database-level twin of the check above, for the window between it
+        # and this insert. The other request's row is the answer.
+        winner = await find_by_idempotency_key(project, idempotency_key)
+        if winner is not None:
+            return winner, None
+        raise
     try:
         # thread_sensitive=True: under CELERY_TASK_ALWAYS_EAGER (tests),
         # .delay() runs the task body inline on whatever thread this runs

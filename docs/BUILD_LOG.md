@@ -24,7 +24,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP8 | Task dependencies — `blocks` / `relates_to` (§2) | **done** |
 | WP9 | `ProjectBrief` and brief-assisted creation (§1) | |
 | WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | **done** |
-| WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | |
+| WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | **done** |
 | WP12 | AI assistant privacy; health-summary anonymity (§5) | **done** |
 | WP13 | Events: audience, attendees, RRULE (§6) | **done** |
 | WP14 | Unified `Document` model with scopes (§7) | **done** |
@@ -1788,6 +1788,185 @@ action, and a reviewer queue for override requests. None of it is built —
 
 ---
 
+## WP11 — AI pipeline: what the AI sees, what comes back, what it costs
+
+§4, split across both repos: `workroom-backend` decides what leaves the
+building and re-validates everything that comes back; `workroom-ai` speaks the
+new contract and adds the ordered fallback.
+
+### The allow-list, as an allow-list
+
+`ai_agent/context.py` is new. It replaces `_build_request_payload`'s ad-hoc
+dict, which read real names and ids straight off `User`/`CompanyUserProfile`
+with nothing stopping the next field added to either model from riding along.
+
+The module states two closed sets --  `CONTEXT_FIELDS` and
+`CANDIDATE_FIELDS` -- and asserts the payload against them before it is ever
+sent, in production, not only under test (`_assert_shape`). An exclude-list
+fails silently the day somebody adds a column; this fails loudly the day
+somebody adds a *key* without adding it to the set first, which is a diff a
+reviewer can see.
+
+**Never sent**: contact info, résumés, birthdays, addresses, phone numbers,
+other projects, other users' AI conversations, billing data, and real user
+ids. `ai_agent/test_context.py` proves it by populating a fixture with a
+findable sentinel per forbidden field and asserting none of them appear
+anywhere in the serialized payload -- not "the field is absent", which a typo
+could still satisfy by accident, but "the literal string cannot be found".
+
+### People are opaque, per-generation refs
+
+`AIGeneration.assignee_refs` is a `{opaque_ref: user_id}` map minted once, at
+creation, from exactly that generation's human-approved pool
+(`build_assignee_refs`). The model receives `member_1`, `member_2`, ... and
+returns the same tokens in its suggestions; `resolve_assignee_ref` is the only
+route back to a person, and it only ever reads one generation's own map. Two
+generations can reuse `member_1` for two different people -- a ref carries no
+meaning outside the plan that minted it, by construction, not by convention.
+
+### The candidate-pool shape is §4's, verbatim, and it leans entirely on WP10
+
+`{opaque_ref, display_name, profession, skills, department, team,
+capacity_hours, committed_hours, active_task_count}` -- every field after
+`opaque_ref` comes straight from `workforce.workload.member_workload_sync` and
+`MemberSkill`, which is why WP11 had to follow WP10 rather than the other way
+round. `capacity_hours` is `None`, not `0`, for anybody who has never stated
+one -- the same "unstated is not zero" rule WP10 established, carried through
+to the one place an LLM could otherwise read a null as "fully available."
+
+### Re-validation gained two checks §4 asked for and D9/D10 didn't have
+
+**A DAG check, whole-plan.** The old validator only checked that each
+`dependency_id` named a real task in the same plan; it never checked that the
+edges didn't loop. Kahn's algorithm in `_assert_plan_is_a_dag`: any temp id
+still holding an incoming edge once the queue drains is part of a cycle, and
+the whole generation fails rather than storing a plan with no valid starting
+task.
+
+**Workload flagging, not dropping.** An out-of-pool ref is still dropped (D10
+unchanged) -- unresolvable is unresolvable. But a *resolvable* suggestion that
+would put its target over a configured limit is now flagged
+(`suggested_assignee_over_capacity`) and **kept**, per §4's explicit
+instruction. The old code had no way to express "kept, but the reviewer should
+know" -- it was drop-or-keep, and now it's drop-or-keep-with-a-flag.
+
+Department and task-type matching moved from id lookup to case-normalized name
+lookup, because the request itself now carries names, not ids (see below).
+
+### The AI never chooses; now it can't even try to skip review
+
+`suggested_assignee_accepted` on `AIGeneratedTask`, default `False`.
+`persist_ai_generated_tasks` now applies a suggestion only where this is
+`True` -- V1 auto-applied any suggestion the moment no human had set an
+explicit assignee, which made "review the plan" mean "review the titles."
+Two endpoints: `PATCH .../accept-suggestion/` for one row,
+`POST .../accept-all-suggestions/` for the convenience action §4 names
+alongside "must be explicitly accepted." Eligibility is still re-checked at
+save time regardless of acceptance -- accepting a suggestion records a
+decision, not a guarantee that it is still valid an hour later.
+
+### Usage, recorded whether or not anything bills on it
+
+`input_tokens`, `output_tokens`, `cost`, `fallback_from` on `AIGeneration`.
+Nulls, not zeros, wherever the number is unknown -- a provider that reports no
+usage leaves null token counts, and an unpriced model leaves a null cost next
+to real token counts, because "we don't know" and "it was free" are different
+facts and a zero would quietly under-report a real bill. `estimate_cost`'s
+price table is deliberately small; an unlisted provider/model pair is null,
+not guessed.
+
+### One-shot ordered fallback, in the AI service
+
+`apps/services/fallback.py` (new, `workroom-ai`). Tries the configured
+primary; on a **transient** failure only, tries each name in
+`AI_PROVIDER_FALLBACK` once, in order, then stops. A **permanent** failure
+never falls through -- a bad key or a malformed request will be exactly as
+broken at the next provider, and trying anyway turns one clear failure into
+two confusing ones. Not a retry loop: Django's Celery task already retries
+three times, and a loop here would multiply that into nine paid calls against
+providers that charge per call. `Completion.provider` says which one actually
+answered, so "it worked" and "it worked on the second provider" stay
+distinguishable in the generation record (`fallback_from`).
+
+### The contract moved from ids to names/refs -- both repos, together
+
+`AIProjectPlanRequest` now sends `departments: list[str]`,
+`task_types: list[str]`, `skill_catalog: list[str]`, and
+`candidates: list[CandidateRef]` instead of the old id-bearing ref lists. The
+model's own output correspondingly changed from
+`suggested_department_id`/`suggested_assignee_id` to
+`suggested_department`/`suggested_assignee_ref`, plus a new required
+`suggested_assignee_rationale`. Both repos were branched to
+`feat/v2-foundation` and moved together; the two are not independently
+deployable mid-migration, which is fine for a foundation branch but worth
+flagging for whoever cuts the eventual release.
+
+### Idempotency and the in-flight lock, generalised from to-dos
+
+`find_in_flight_plan` mirrors `todos.services.find_in_flight_generation`,
+scoped to the **project** rather than the user -- two managers asking at the
+same moment is the same waste as one manager double-clicking.
+`idempotency_key` (client-supplied, optional) plus a partial unique
+constraint (`project`, `idempotency_key` where the key is non-empty) give a
+replayed request back its original generation rather than a second one; the
+service also catches the `IntegrityError` from the race window between the
+app-level check and the insert, and returns the winner rather than surfacing
+the collision to the caller.
+
+### Judgment calls
+
+1. **Cross-repo work went on one branch each, same name.** `workroom-ai` had
+   no `feat/v2-foundation` branch before this session; created it here so the
+   pairing with the backend branch is unambiguous.
+2. **`estimate_cost`'s price table lives in Django, not the AI service.**
+   Costing is a business concern (what Workroom pays), not a generation
+   concern (what the model produced) -- the AI service reports tokens and
+   lets Django decide what they're worth.
+3. **A missing `ProjectBrief` (WP9, not yet built) is an absent key, not a
+   null one.** `build_generation_context` reads the brief through `getattr`
+   and only adds `brief` to the payload when one exists, so `CONTEXT_FIELDS`
+   already accounts for it and nothing changes on that front when WP9 lands.
+4. **The candidate pool does not filter by `is_eligible_for_ai_recommendation`
+   (WP10's nudge).** The human already approved the pool by choosing
+   `assignee_ids` at request time; a second, silent filter here would make
+   "I explicitly picked this person" sometimes not true.
+
+### A pre-existing failure found, not caused
+
+Running the full suite surfaced 16 failures in
+`todos/test_ai_generation.py`, all `400 != 202` on `POST /todos/generate/`.
+Reproduced identically with every WP11 change stashed, so it predates this
+work. Cause: the fixture's task carries `deadline = now() + 6h` with no
+timezone override, and `today` mode requires the deadline to fall on the
+requester's calendar day (UTC, by default) -- between roughly 18:00 and
+23:59 UTC, `+6h` rolls into tomorrow and the eligible-task list comes back
+empty. Time-of-day-dependent, not related to any package built this session.
+Left alone -- out of scope for WP11, and the fix belongs with whoever
+next touches `todos/test_ai_generation.py`'s fixtures.
+
+### Files
+
+New: `ai_agent/context.py`, `ai_agent/test_context.py`,
+`ai_agent/test_plan_validation.py` (backend); `apps/services/fallback.py`,
+`apps/tests/test_fallback.py` (AI service).
+Changed (backend): `ai_agent/models.py` (+ migration 0010), `ai_agent/tasks.py`,
+`ai_agent/services.py`, `ai_agent/tests.py`, `api/routers/ai.py`,
+`api/schemas.py`, `api/tests.py`, `projects_and_tasks/services.py`,
+`crm_backend/settings/base.py`.
+Changed (AI service): `apps/schemas/ai_schemas.py`, `apps/services/ai_services.py`,
+`apps/services/providers/{__init__,base,gemini}.py`, `apps/main.py`,
+`apps/core/config.py`, plus their tests.
+
+**126 new/changed tests**: 22 in `test_context.py`, 18 in
+`test_plan_validation.py`, plus updates across `ai_agent/tests.py` and
+`api/tests.py` (backend, 166 total in the touched-area run); 86 in the AI
+service (7 new in `test_fallback.py`).
+
+Touched-area suite (`ai_agent api projects_and_tasks workforce`): **587
+passed, 1 failed** -- the Redis one.
+
+---
+
 ## Test gate in use
 
 Per commit: the affected app's tests, plus `makemigrations --check --dry-run`,
@@ -1942,3 +2121,22 @@ names the branch explicitly.
 `workroom-frontend-main` has 39 uncommitted files on its `hot-fix` branch,
 predating this work. Not touching them; frontend work starts from a clean tree
 or from an explicit instruction about what to do with those changes.
+
+### R7 — `todos/test_ai_generation.py` is time-of-day flaky, pre-existing
+
+Discovered running WP11's full suite: 16 failures, all `400 != 202` on
+`POST /todos/generate/`. Reproduced identically with every WP11 change
+stashed, so it predates this session's work entirely and is not a regression
+from WP11 or WP10.
+
+Cause: the fixture builds its task with `deadline = timezone.now() +
+timedelta(hours=6)` and no timezone override, so the requester (default
+timezone `'UTC'`) sees it fall on tomorrow's calendar date whenever the suite
+runs between roughly 18:00 and 23:59 UTC -- `today` mode's eligibility window
+(§9) then contains nothing, and the endpoint's empty-result path returns 400
+instead of the 202 the tests expect.
+
+Not fixed here -- out of scope for WP11, and it belongs with whoever next
+touches that fixture. The fix is mechanical: anchor the fixture's deadline to
+`timezone.localtime().replace(hour=23, minute=0, ...)` or similar, rather than
+a fixed offset from `now()`.

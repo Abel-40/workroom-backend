@@ -45,6 +45,32 @@ class AIGeneration(UUIDModel):
     requested_assignee_ids = models.JSONField(default=list, blank=True)
     max_tasks = models.PositiveIntegerField(null=True, blank=True)
 
+    # {opaque_ref: user_id} for exactly this generation. The AI never receives
+    # a real user id and never returns one -- it works in refs, and this is
+    # the only thing that can turn a ref back into a person. Regenerated per
+    # generation so a ref leaked from one plan means nothing in another, and
+    # so a ref cannot be correlated across projects.
+    assignee_refs = models.JSONField(default=dict, blank=True)
+
+    # Recorded on every generation from the day this ships, whether or not
+    # anything bills on it yet: usage cannot be reconstructed retroactively,
+    # and the first time somebody asks "what has this cost us" is far too
+    # late to start counting.
+    input_tokens = models.PositiveIntegerField(null=True, blank=True)
+    output_tokens = models.PositiveIntegerField(null=True, blank=True)
+    # Provider-reported or computed at request time, in USD. Nullable because
+    # "we do not know" and "it was free" are different answers.
+    cost = models.DecimalField(max_digits=10, decimal_places=6, null=True, blank=True)
+    # The provider actually used, when the primary failed and the fallback
+    # answered. Null when the primary succeeded -- see ai_agent.providers.
+    fallback_from = models.CharField(max_length=50, blank=True, default='')
+
+    # Supplied by the client, scoped to the project. Two clicks on "Generate"
+    # send the same key and produce one generation, which is the same
+    # protection AITodoGeneration already has and for the same reason: a
+    # double-click must not buy two provider calls.
+    idempotency_key = models.CharField(max_length=64, blank=True, default='')
+
     # Set only once the generated plan has actually been persisted as real
     # backlog tasks (see projects_and_tasks.services.persist_ai_generated_tasks).
     # This, not `status`, is the authoritative "does this project already
@@ -57,6 +83,24 @@ class AIGeneration(UUIDModel):
     # generation -- without this, refreshing the page would resurrect a
     # draft the user explicitly discarded. Never set on a saved plan.
     discarded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            # Two requests carrying the same key are one request, told twice.
+            # A partial constraint -- most rows carry no key at all (an older
+            # client, or one that never sends one), and those must not be
+            # forced to collide with each other.
+            models.UniqueConstraint(
+                fields=['project', 'idempotency_key'],
+                condition=~models.Q(idempotency_key=''),
+                name='one_generation_per_project_idempotency_key',
+            ),
+        ]
+        indexes = [
+            # "does this project already have one in flight" -- checked on
+            # every plan request.
+            models.Index(fields=['project', 'status'], name='ai_gen_project_status_idx'),
+        ]
 
     def __str__(self):
         return f"{self.project_id} - {self.status}"
@@ -111,6 +155,21 @@ class AIGeneratedTask(UUIDModel):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    # A reviewer has explicitly taken the AI's suggestion. Until this is True
+    # the suggestion is shown and nothing else -- persist_ai_generated_tasks
+    # will not apply it. V1 auto-applied every suggestion at save time, which
+    # made "review the plan" mean "review the titles"; who does the work is
+    # the decision least safe to make by default.
+    suggested_assignee_accepted = models.BooleanField(default=False)
+    # One line, from the model, saying why it suggested this person. Shown
+    # beside the name so accepting is a judgement rather than a shrug.
+    suggested_assignee_rationale = models.CharField(max_length=300, blank=True, default='')
+    # The suggestion would put this person past a configured workload limit.
+    # Flagged for the reviewer rather than dropped: the reviewer may know
+    # something the numbers do not, and silently removing the suggestion would
+    # hide the fact that it was ever made.
+    suggested_assignee_over_capacity = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['sequence']

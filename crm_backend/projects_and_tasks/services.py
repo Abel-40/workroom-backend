@@ -1934,11 +1934,21 @@ def persist_ai_generated_tasks(generation):
         if assignee is not None and assignee.id not in eligible_ids:
             invalid_assignee_temp_ids.append(row.temporary_id)
             assignee = None
-        # No human override -- fall back to the AI's suggestion, but only if
-        # that person is still eligible right now (eligibility may have
-        # changed since the suggestion was made, e.g. a team/department
+        # The AI's suggestion applies only where a reviewer has explicitly
+        # accepted it. V1 applied every suggestion here whenever no human had
+        # set an assignee, which made "review the plan" mean "review the
+        # titles" -- who does the work is exactly the decision least safe to
+        # make by default, and the reviewer never had to look at it.
+        #
+        # Eligibility is still re-checked at this moment, because it can have
+        # changed since the suggestion was accepted (a team or department
         # reassignment on the project).
-        if assignee is None and row.suggested_assignee_id and row.suggested_assignee_id in eligible_ids:
+        if (
+            assignee is None
+            and row.suggested_assignee_accepted
+            and row.suggested_assignee_id
+            and row.suggested_assignee_id in eligible_ids
+        ):
             assignee = row.suggested_assignee
         to_create.append(Task(
             project=project, department_id=row.suggested_department_id, task_type_id=row.suggested_task_type_id,

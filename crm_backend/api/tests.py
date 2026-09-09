@@ -1976,14 +1976,29 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
         response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_b))
         self.assertEqual(response.status_code, 403)
 
-    def test_save_applies_the_ai_suggested_assignee_when_no_human_override_exists(self):
+    def test_save_applies_the_ai_suggested_assignee_once_accepted(self):
+        """§4: a suggestion must be explicitly accepted before it applies --
+        V1 auto-applied it whenever there was no human override, which made
+        "review the plan" mean "review the titles"."""
         project = self.create_project(owner=self.owner_a)
         generation, draft = self._make_generation_with_draft(
-            project['id'], self.owner_a, suggested_assignee=self.member_a,
+            project['id'], self.owner_a, suggested_assignee=self.member_a, suggested_assignee_accepted=True,
         )
         response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['tasks'][0]['assigned_to'], str(self.member_a.id))
+
+    def test_save_does_not_apply_an_unaccepted_suggestion(self):
+        """The suggestion sitting on the row is not enough by itself -- an
+        accept action is a positive, recorded act, not a default."""
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, suggested_assignee=self.member_a,
+        )
+        self.assertFalse(draft.suggested_assignee_accepted)
+        response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()['data']['tasks'][0]['assigned_to'])
 
     def test_save_prefers_the_human_override_over_the_ai_suggestion(self):
         project = self.create_project(owner=self.owner_a)
@@ -1992,11 +2007,60 @@ class AIPlanReviewSecurityTests(TwoCompanyTestCase):
             user=other_member, company=self.company_a, role=CompanyUserProfile.Role.DEPARTMENT_MEMBER,
         )
         generation, draft = self._make_generation_with_draft(
-            project['id'], self.owner_a, suggested_assignee=self.member_a, assigned_to=other_member,
+            project['id'], self.owner_a, suggested_assignee=self.member_a, suggested_assignee_accepted=True,
+            assigned_to=other_member,
         )
         response = self.client.post(f"/api/v1/ai/generations/{generation.id}/save/", **auth_header(self.owner_a))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['data']['tasks'][0]['assigned_to'], str(other_member.id))
+
+    def test_accept_suggestion_endpoint_flips_the_flag(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, suggested_assignee=self.member_a,
+        )
+        response = self.client.patch(
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/accept-suggestion/",
+            json.dumps({'accepted': True}), content_type='application/json', **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['data']['generated_task']['suggested_assignee_accepted'])
+        draft.refresh_from_db()
+        self.assertTrue(draft.suggested_assignee_accepted)
+
+    def test_accept_suggestion_endpoint_is_scoped_to_the_callers_own_company(self):
+        project = self.create_project(owner=self.owner_a)
+        generation, draft = self._make_generation_with_draft(
+            project['id'], self.owner_a, suggested_assignee=self.member_a,
+        )
+        response = self.client.patch(
+            f"/api/v1/ai/generations/{generation.id}/tasks/{draft.id}/accept-suggestion/",
+            json.dumps({'accepted': True}), content_type='application/json', **auth_header(self.owner_b),
+        )
+        self.assertEqual(response.status_code, 403)
+        draft.refresh_from_db()
+        self.assertFalse(draft.suggested_assignee_accepted)
+
+    def test_accept_all_suggestions_endpoint(self):
+        project = self.create_project(owner=self.owner_a)
+        generation = AIGeneration.objects.create(
+            project_id=project['id'], requested_by=self.owner_a, status=AIGeneration.STATUS.COMPLETED,
+        )
+        with_suggestion = AIGeneratedTask.objects.create(
+            generation=generation, temporary_id='t1', sequence=1, title='A',
+            suggested_assignee=self.member_a,
+        )
+        without_suggestion = AIGeneratedTask.objects.create(
+            generation=generation, temporary_id='t2', sequence=2, title='B',
+        )
+        response = self.client.post(
+            f"/api/v1/ai/generations/{generation.id}/accept-all-suggestions/", **auth_header(self.owner_a),
+        )
+        self.assertEqual(response.status_code, 200)
+        with_suggestion.refresh_from_db()
+        without_suggestion.refresh_from_db()
+        self.assertTrue(with_suggestion.suggested_assignee_accepted)
+        self.assertFalse(without_suggestion.suggested_assignee_accepted)
 
 
 class AITaskContentRegenerationSecurityTests(TwoCompanyTestCase):
