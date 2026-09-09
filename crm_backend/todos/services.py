@@ -17,7 +17,7 @@ Two rules drive everything here:
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from django.db.models import Count, Q
+from django.db.models import Case, Count, Exists, IntegerField, OuterRef, Q, Value, When
 from django.utils import timezone
 from projects_and_tasks.models import Task
 
@@ -41,13 +41,31 @@ def user_today(user) -> date:
     return timezone.now().astimezone(tz).date()
 
 
-def validate_due_date(user, due_date: date) -> str | None:
-    """Returns an error code, or None when the date is acceptable. Past dates
-    are allowed on purpose -- an overdue todo is a real, useful state, and
-    backfilling yesterday is legitimate."""
+def validate_due_date(user, due_date: date, *, allow_past: bool = False) -> str | None:
+    """Returns an error code, or None when the date is acceptable.
+
+    §9: a manually created to-do must be dated today or later, **in the
+    owner's own timezone**, computed at request time. The timezone part is the
+    whole point -- "today" for somebody in Addis is a different day from the
+    server's for several hours out of every day, and a UTC comparison would
+    silently reject a legitimate today, or accept a yesterday, depending on
+    the hour they happened to be working.
+
+    Past dates were previously allowed here on the reasoning that backfilling
+    yesterday is legitimate. §9 reverses that, and the reversal is right: an
+    overdue to-do is a state a to-do *arrives at* by time passing, not one it
+    should be created in. Creating something already late is almost always a
+    mistyped date.
+
+    ``allow_past`` exists for the AI path, which deliberately includes overdue
+    work -- see eligible_tasks_for_generation.
+    """
     if due_date is None:
         return 'due_date_required'
-    if due_date > user_today(user) + timedelta(days=MAX_FUTURE_DAYS):
+    today = user_today(user)
+    if not allow_past and due_date < today:
+        return 'due_date_in_past'
+    if due_date > today + timedelta(days=MAX_FUTURE_DAYS):
         return 'due_date_too_far'
     return None
 
@@ -244,7 +262,11 @@ async def _next_position(user, due_date: date) -> int:
 
 async def create_todo(user, company, *, title: str, due_date: date, notes: str = '',
                       task=None, source: str = TodoItem.SOURCE.MANUAL):
-    error = validate_due_date(user, due_date)
+    # AI-generated rows may carry a past date, because §9 requires overdue
+    # work to be included and ranked first. A person typing one may not.
+    error = validate_due_date(
+        user, due_date, allow_past=source == TodoItem.SOURCE.AI_GENERATED,
+    )
     if error:
         return None, error
     todo = await TodoItem.objects.acreate(
@@ -328,6 +350,72 @@ async def resolve_generation_window(user, *, mode, task=None, days: int = 7):
     return today, end
 
 
+def eligible_tasks_for_generation(user, company, *, window_end=None):
+    """The tasks an AI generation may draw on, in the order it should see them.
+
+    §9 spells the rule out, and every clause earns its place:
+
+    - **assigned to the requester right now** -- not "was assigned"; a task
+      reassigned away this morning is not their work this afternoon
+    - **To Do or In Progress** -- In Review is waiting on somebody else, and
+      Done needs nothing
+    - **not archived, and its project not archived**
+    - **the project is Active** -- an inactive project's work is not today's
+    - **not blocked by an unfinished `blocks` dependency** (WP8) -- planning
+      steps for work that cannot start is worse than planning nothing
+    - **deadline inside the window, or already overdue**
+
+    Overdue work is included deliberately and sorted first. It is the most
+    urgent thing the person owns, and a "what am I doing today" list that
+    silently omits everything already late is worse than useless -- it reads
+    as reassurance.
+
+    The window is the generation's own window, so in `today` mode this is a
+    **due-today-or-overdue** list rather than "everything open". §9 says so
+    twice -- "deadline is inside the window or already overdue", and "only
+    exclude completed, archived, and out-of-window-future work" -- and it is a
+    coherent product: a daily focus list, not a backlog. The consequence worth
+    knowing is that a person with a full fortnight of work and nothing due
+    today gets an empty result, so the caller's empty message has to say
+    *nothing due today* rather than *no tasks assigned*.
+    """
+    from projects_and_tasks.models import Project, TaskDependency
+
+    if window_end is None:
+        window_end = user_today(user)
+
+    blocked_ids = TaskDependency.objects.filter(
+        kind=TaskDependency.Kind.BLOCKS,
+        successor=OuterRef('pk'),
+        predecessor__is_deleted=False,
+    ).exclude(predecessor__status=Task.STATUS.DONE)
+
+    queryset = (
+        Task.objects.filter(
+            assigned_to=user,
+            is_deleted=False,
+            project__company=company,
+            project__is_deleted=False,
+            project__status=Project.STATUS.ACTIVE,
+            status__in=[Task.STATUS.TODO, Task.STATUS.IN_PROGRESS],
+        )
+        .filter(Q(deadline__date__lte=window_end) | Q(deadline__lt=timezone.now()))
+        .annotate(is_blocked=Exists(blocked_ids))
+        .filter(is_blocked=False)
+        .select_related('project')
+    )
+    # Overdue first, then by deadline. The annotation rather than a Python
+    # sort so the cap below takes the most urgent tasks, not an arbitrary
+    # slice of them.
+    return queryset.annotate(
+        is_overdue=Case(
+            When(deadline__lt=timezone.now(), then=Value(0)),
+            default=Value(1),
+            output_field=IntegerField(),
+        ),
+    ).order_by('is_overdue', 'deadline', 'created_at')
+
+
 async def resolve_generation_sources(user, company, *, mode, task=None):
     """Which tasks a generation may draw on.
 
@@ -340,7 +428,8 @@ async def resolve_generation_sources(user, company, *, mode, task=None):
     """
     if mode == 'task':
         return [task], None
-    queryset = list_assigned_tasks(user, company, open_only=True)
+    _, window_end = await resolve_generation_window(user, mode=mode)
+    queryset = eligible_tasks_for_generation(user, company, window_end=window_end)
     tasks = [t async for t in queryset[:MAX_SOURCE_TASKS]]
     if not tasks:
         return None, 'no_assigned_tasks'
@@ -366,6 +455,76 @@ async def find_in_flight_generation(user):
     return await AITodoGeneration.objects.filter(
         user=user, status__in=[AITodoGeneration.STATUS.PENDING, AITodoGeneration.STATUS.PROCESSING],
     ).afirst()
+
+
+# §9: at most 10 generations per user per day. A cap rather than a rate
+# limiter in Redis, because the thing being protected is provider spend, which
+# is counted per day anyway, and because it must survive Redis being down.
+MAX_GENERATIONS_PER_DAY = 10
+
+
+async def generations_used_today(user) -> int:
+    """How many generations this user has started today, in their own
+    timezone -- the same "today" the window is computed from, so the cap and
+    the plan agree about which day it is."""
+    from ai_agent.models import AITodoGeneration
+
+    today = user_today(user)
+    return await AITodoGeneration.objects.filter(
+        user=user, requested_at__date=today,
+    ).acount()
+
+
+async def check_generation_quota(user) -> str | None:
+    """Returns 'daily_limit_reached' or None."""
+    if await generations_used_today(user) >= MAX_GENERATIONS_PER_DAY:
+        return 'daily_limit_reached'
+    return None
+
+
+async def find_superseded_generation(user, *, mode, task=None):
+    """The generation a new one replaces, if any.
+
+    §9: one active plan per (user, task) and per (user, today). Asking twice
+    for the same thing means "this one is wrong, try again", not "give me two
+    lists" -- and two overlapping AI checklists for the same day is exactly
+    the duplication people report as the feature being broken.
+    """
+    from ai_agent.models import AITodoGeneration
+
+    queryset = AITodoGeneration.objects.filter(
+        user=user, mode=mode, status=AITodoGeneration.STATUS.COMPLETED,
+    )
+    if mode == 'task' and task is not None:
+        queryset = queryset.filter(task=task)
+    else:
+        queryset = queryset.filter(window_start=user_today(user))
+    return await queryset.order_by('-requested_at').afirst()
+
+
+async def supersede_generation(user, generation) -> dict:
+    """Retire a previous generation's to-dos in favour of a new one.
+
+    Three rules, and the reasons matter more than the code:
+
+    - **Completed items are kept, and detached.** The owner did that work.
+      Deleting it would be destroying their record, not tidying ours. Detached
+      (``ai_generation`` cleared) so a later dismissal of the old generation
+      cannot reach back and take them.
+    - **Incomplete AI items are removed.** They are the stale plan being
+      replaced.
+    - **Manual to-dos are never touched.** No AI operation in this codebase
+      may delete something a person typed. That is the single rule the whole
+      supersede path exists to not break.
+    """
+    kept = await TodoItem.objects.filter(
+        ai_generation=generation, user=user, is_done=True, is_deleted=False,
+    ).aupdate(ai_generation=None)
+    removed = await TodoItem.objects.filter(
+        ai_generation=generation, user=user, is_done=False, is_deleted=False,
+        source=TodoItem.SOURCE.AI_GENERATED,
+    ).aupdate(is_deleted=True)
+    return {'kept': kept, 'removed': removed}
 
 
 async def dismiss_generation(user, generation) -> int:

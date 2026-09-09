@@ -38,6 +38,20 @@ class TodoTestCase(TwoCompanyTestCase):
         )
         return response
 
+    def make_overdue_todo(self, title='Overdue', days=2, user=None):
+        """A to-do dated in the past.
+
+        §9 stops the API accepting one -- creating something already late is
+        almost always a mistyped date. Becoming overdue by time passing is a
+        different thing, and still a real, common state, so these tests build
+        it the way reality does: written directly, past the endpoint that
+        guards creation.
+        """
+        return TodoItem.objects.create(
+            user=user or self.owner_a, company=self.company_a, title=title,
+            due_date=self.today - timedelta(days=days),
+        )
+
     def create_task(self, assigned_to=None, title='Ship the landing page'):
         return Task.objects.create(
             project=self.project_a, title=title, created_by=self.owner_a, assigned_to=assigned_to,
@@ -110,9 +124,13 @@ class TodoCreationTests(TodoTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse(TodoItem.objects.exists())
 
-    def test_a_past_due_date_is_allowed_because_overdue_is_a_real_state(self):
+    def test_a_past_due_date_is_refused(self):
+        """This asserted the opposite. §9 requires a manual to-do to be dated
+        today or later, in the owner's own timezone: an overdue to-do is a
+        state a to-do arrives at by time passing, not one worth being able to
+        create, and creating one already late is almost always a typo."""
         response = self.create_todo(due_date=(self.today - timedelta(days=3)).isoformat())
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 400, response.content)
 
     def test_new_todos_append_to_the_end_of_their_day(self):
         first = self.create_todo(title='First').json()['data']['todo']
@@ -183,7 +201,7 @@ class TodoOrderingTests(TodoTestCase):
     def test_todos_come_back_nearest_day_first_with_overdue_at_the_top(self):
         self.create_todo(title='Next week', due_date=(self.today + timedelta(days=7)).isoformat())
         self.create_todo(title='Today', due_date=self.today.isoformat())
-        self.create_todo(title='Overdue', due_date=(self.today - timedelta(days=2)).isoformat())
+        self.make_overdue_todo('Overdue')
         self.create_todo(title='Tomorrow', due_date=(self.today + timedelta(days=1)).isoformat())
 
         listing = self.client.get('/api/v1/todos/', **auth_header(self.owner_a))
@@ -213,7 +231,7 @@ class TodoOrderingTests(TodoTestCase):
         self.assertEqual(len(shown.json()['data']['results']), 1)
 
     def test_scope_filters_narrow_to_the_right_days(self):
-        self.create_todo(title='Overdue', due_date=(self.today - timedelta(days=1)).isoformat())
+        self.make_overdue_todo('Overdue', days=1)
         self.create_todo(title='Today')
         self.create_todo(title='Later', due_date=(self.today + timedelta(days=3)).isoformat())
 
@@ -282,7 +300,7 @@ class TodoStateTransitionTests(TodoTestCase):
 
 class TodoSummaryTests(TodoTestCase):
     def test_summary_counts_only_the_callers_open_todos(self):
-        self.create_todo(title='Overdue', due_date=(self.today - timedelta(days=1)).isoformat())
+        self.make_overdue_todo('Overdue', days=1)
         self.create_todo(title='Today')
         self.create_todo(title='Later', due_date=(self.today + timedelta(days=2)).isoformat())
         self.create_todo(user=self.member_a, title='Not mine')
