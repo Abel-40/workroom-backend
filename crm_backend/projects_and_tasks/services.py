@@ -46,6 +46,8 @@ from users.models import CompanyUserProfile
 
 from documents import services as documents_services
 from documents.services import validate_upload
+from entitlements import services as entitlements
+from entitlements.models import UsageCounter
 
 from .access import AccessLevel, resolve_project_access
 from .models import (
@@ -350,6 +352,13 @@ async def create_project(user, *, title, description, visibility, priority, star
         # is visible to nobody. Refused here too so the two ways into the state
         # cannot disagree.
         return None, 'department_required'
+    # Only Active projects count -- an archived or finished one never blocks a
+    # new one (§11). The check reads live rows, so it cannot disagree with the
+    # project list the user is looking at.
+    entitlement = await entitlements.check(company, UsageCounter.Metric.ACTIVE_PROJECTS)
+    if not entitlement.allowed:
+        return entitlement, 'plan_limit'
+
     department, error = await _resolve_department(company, department_id)
     if error:
         return None, error
@@ -503,6 +512,12 @@ async def can_set_visibility(user, project, target_visibility) -> tuple[bool, st
     if target_visibility == project.visibility:
         return True, None
 
+    if target_visibility == Project.VISIBILITY.PUBLIC and not await entitlements.has_feature(
+        project.company, 'public_projects',
+    ):
+        # The third condition, alongside the company flag and the Owner/CM
+        # check. All three must hold (§11).
+        return False, 'public_projects_not_in_plan'
     if target_visibility == Project.VISIBILITY.PUBLIC and not project.company.allow_public_projects:
         # Checked before the role, so the message a Department Member sees is
         # "this company does not publish projects" rather than "you personally

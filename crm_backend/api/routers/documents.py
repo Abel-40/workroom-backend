@@ -48,6 +48,17 @@ class DocumentShareIn(Schema):
     user_id: UUID
 
 
+def _storage_message(entitlement) -> str:
+    """Name the number rather than saying no. An upgrade prompt somebody can
+    act on beats a 402 they have to guess at."""
+    used_gb = entitlement.current / (1024 ** 3)
+    limit_gb = (entitlement.limit or 0) / (1024 ** 3)
+    return (
+        f'Your plan includes {limit_gb:.0f} GB of storage and {used_gb:.2f} GB is in use. '
+        'Delete something, or upgrade your plan.'
+    )
+
+
 def document_data(document: Document) -> dict:
     return {
         'id': str(document.id),
@@ -91,7 +102,7 @@ async def _document_for_reading(user, document_id, *, include_deleted=False):
 
 @router.post(
     '/projects/{project_id}/documents/', auth=auth,
-    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 402: ApiResponse, 404: ApiResponse},
 )
 async def upload_project_document(request, project_id: UUID, file: UploadedFile = File(...),
                                   label: str = Form(''), task_id: UUID | None = Form(None)):
@@ -113,6 +124,8 @@ async def upload_project_document(request, project_id: UUID, file: UploadedFile 
     )
     if error == 'forbidden':
         return payload('You do not have permission to upload documents to this project.', 403, False)
+    if error == 'storage_limit':
+        return payload(_storage_message(document), 402, False, errors={'plan': ['storage limit reached']})
     if error:
         return payload(UPLOAD_ERRORS.get(error, 'That file could not be accepted.'), 400, False)
     return payload('Document uploaded successfully.', 201, True, {'document': document_data(document)})
@@ -160,7 +173,7 @@ async def list_documents(request, scope: str | None = None, page: int = 1,
 
 @router.post(
     '/documents/', auth=auth,
-    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 402: ApiResponse, 404: ApiResponse},
 )
 async def upload_document(
     request,
@@ -191,6 +204,8 @@ async def upload_document(
     )
     if error == 'forbidden':
         return payload('You do not have permission to add a document here.', 403, False)
+    if error == 'storage_limit':
+        return payload(_storage_message(document), 402, False, errors={'plan': ['storage limit reached']})
     if error:
         return payload(UPLOAD_ERRORS.get(error, 'That file could not be accepted.'), 400, False)
     return payload('Document uploaded successfully.', 201, True, {'document': document_data(document)})
@@ -273,7 +288,7 @@ async def restore_document(request, document_id: UUID):
 
 @router.post(
     '/documents/{document_id}/share/', auth=auth,
-    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse, 402: ApiResponse, 404: ApiResponse},
 )
 async def share_document(request, document_id: UUID, data: DocumentShareIn):
     """Personal documents only. Every other scope already has an audience, and

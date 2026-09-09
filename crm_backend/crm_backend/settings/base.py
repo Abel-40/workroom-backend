@@ -87,6 +87,8 @@ INSTALLED_APPS = [
     'todos',
     'audit',
     'documents',
+    'entitlements',
+    'integrations',
 ]
 
 MIDDLEWARE = [
@@ -272,11 +274,35 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'documents.tasks.purge_expired_documents_task',
         'schedule': crontab(hour=4, minute=0),
     },
+    # Recomputes usage counters from rows and logs any drift. Nothing depends
+    # on it for correctness -- limit decisions read rows directly -- so it runs
+    # once nightly, offset from the other jobs.
+    'reconcile-usage-counters': {
+        'task': 'entitlements.tasks.reconcile_usage_counters_task',
+        'schedule': crontab(hour=4, minute=30),
+    },
 }
 
 # utils/rate_limit.py guard on signup/signin/invite endpoints. Off by
 # default in tests (conftest.py) so the suite never needs a real Redis.
 RATE_LIMIT_ENABLED = env.bool('RATE_LIMIT_ENABLED', default=True)
+
+# Whether plan restrictions apply at all: limits refuse, and features gate.
+#
+# Default OFF, which is the V1 position. The source documents disagree -- the
+# V2 prompt's section 11 demands real enforcement, while the same prompt's OUT
+# OF SCOPE list and CLAUDE.md sections 15 and 16 both say billing stays
+# permissive in V1 -- and turning it on makes that disagreement concrete: 46
+# existing tests fail, because every company without a subscription resolves to
+# Free, and Free allows one department, zero teams, and no public projects.
+# The product was built without limits, so switching them on is a product
+# decision with real customer consequences, not a default.
+#
+# Everything else in `entitlements` is live either way. Limits resolve, usage
+# is counted and reconciled, and every check reports the true numbers, so the
+# UI can already say "5 of 3 used" and the data needed to decide the rollout
+# exists. Only the refusal is deferred. See R1 in docs/BUILD_LOG.md.
+ENTITLEMENTS_ENFORCED = env.bool('ENTITLEMENTS_ENFORCED', default=False)
 
 # FastAPI AI service (Phase 6/7). Django never calls this synchronously from
 # a request -- only the Celery worker does (ai_agent/tasks.py).

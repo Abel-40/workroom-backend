@@ -106,7 +106,7 @@ async def project_data(project: Project) -> dict:
     }
 
 
-@router.post('/', auth=auth, response={201: ApiResponse, 400: ApiResponse, 403: ApiResponse})
+@router.post('/', auth=auth, response={201: ApiResponse, 400: ApiResponse, 402: ApiResponse, 403: ApiResponse})
 async def create_project(request, data: ProjectIn):
     project, error = await services.create_project(
         request.auth,
@@ -141,6 +141,20 @@ async def create_project(request, data: ProjectIn):
         return payload(
             "Your department is fixed to your own -- you can't create a project in another department.", 400, False,
             errors={'department_id': ['Must be your own department']},
+        )
+    if error == 'plan_limit':
+        # Never a bare 403. Section 11: name the limit that was hit and point
+        # at the plans page, because "denied" with no number is indisput-
+        # able and useless.
+        return payload(
+            f'Your plan allows {project.limit} active projects and you have {project.current}. '
+            'Archive one, or upgrade your plan.', 402, False,
+            errors={'plan': ['active_projects limit reached']},
+        )
+    if error == 'public_projects_not_in_plan':
+        return payload(
+            'Public projects are not included in your plan.', 402, False,
+            errors={'plan': ['public_projects not available']},
         )
     if error == 'public_projects_disabled':
         return payload(

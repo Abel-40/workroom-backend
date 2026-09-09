@@ -5,7 +5,7 @@ shapes all of them: **a number about a named person is a different thing from
 a number about a project**, and the tier boundaries are drawn where names
 appear.
 
-    PERSONAL          everyone, about themselves
+    PERSONAL          everyone, about themselves -- never plan-gated
     PROJECT_AGGREGATE project VIEW -- counts and percentages, no names
     PROJECT_PEOPLE    project MANAGE -- per-member counts, that project only
     DEPARTMENT        DL (own department), CM, Owner
@@ -16,6 +16,11 @@ their open task counts -- was readable by every role including a Department
 Member. That is one join away from a performance dashboard, which §8 is
 explicit about not building.
 
+The department and company tiers additionally require a plan feature (§11).
+The personal and project-aggregate tiers are **never** gated by plan: §11 says
+so explicitly, and a product that hides your own workload behind an upsell is
+a worse product.
+
 What is deliberately absent, and must stay absent: any per-person on-time
 percentage, velocity, productivity score, or ranking. §8 rules those out "not
 now, not later without a separate explicit decision". They are a liability
@@ -24,6 +29,7 @@ objective, they are not, and once shipped they end up in performance reviews.
 """
 
 from company.services import get_company_role, get_member_department_id
+from entitlements import services as entitlements
 from projects_and_tasks.access import AccessLevel, resolve_project_access
 from users.models import CompanyUserProfile
 
@@ -32,9 +38,17 @@ DEPARTMENT_TIER_ROLES = COMPANY_TIER_ROLES + (CompanyUserProfile.Role.DEPARTMENT
 
 
 async def can_view_company_analytics(user, company) -> bool:
-    """Company-wide figures, including the member roster. CM and Owner only."""
+    """Company-wide figures, including the member roster. CM and Owner only,
+    and only on a plan that includes them (§11).
+
+    Both conditions, not either: a plan that includes company analytics still
+    does not give them to a Department Member, and being the Owner does not
+    conjure a feature the company is not paying for.
+    """
     role = await get_company_role(user, company)
-    return role in COMPANY_TIER_ROLES
+    if role not in COMPANY_TIER_ROLES:
+        return False
+    return await entitlements.has_feature(company, 'company_analytics')
 
 
 async def can_view_department_analytics(user, company, department_id=None) -> bool:
@@ -45,6 +59,8 @@ async def can_view_department_analytics(user, company, department_id=None) -> bo
     company", which is a company-tier question -- a DL asking it would be
     reading every other department's numbers through a different door.
     """
+    if not await entitlements.has_feature(company, 'department_analytics'):
+        return False
     role = await get_company_role(user, company)
     if role in COMPANY_TIER_ROLES:
         return True

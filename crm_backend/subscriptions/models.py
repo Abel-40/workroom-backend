@@ -18,8 +18,22 @@ class Subscription(UUIDModel):
     stripe_customer_id = models.CharField(max_length=255, blank=True, null=True)
     stripe_subscription_id = models.CharField(max_length=255, blank=True, null=True)
 
+    # The plan's limits as they were when this subscription started, resolved
+    # *before* the live Plan row (see entitlements.services.resolve).
+    #
+    # This is the point of the whole field: changing `team`'s numbers must
+    # never silently alter what an existing customer is already paying for.
+    # An FK alone cannot express that -- it follows the row wherever it goes.
+    # Empty for subscriptions that predate this, which fall back to the live
+    # plan; see the resolver.
+    plan_snapshot = models.JSONField(default=dict, blank=True)
+
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='incomplete')
     is_trial = models.BooleanField(default=False)
+    # When `status` became past_due. The grace period is measured from here
+    # rather than from `updated_at`, which any unrelated write would reset --
+    # and a grace period that silently restarts is not a grace period.
+    past_due_since = models.DateTimeField(null=True, blank=True)
 
     start_date = models.DateTimeField(default=timezone.now)
     current_period_end = models.DateTimeField(blank=True, null=True)

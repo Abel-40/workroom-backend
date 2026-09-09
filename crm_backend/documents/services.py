@@ -13,6 +13,8 @@ from asgiref.sync import sync_to_async
 from company.services import get_company_role, is_company_member
 from django.db.models import Q, Sum
 from django.utils import timezone
+from entitlements import services as entitlements
+from entitlements.models import UsageCounter
 from projects_and_tasks.access import AccessLevel, resolve_project_access
 from users.models import CompanyUserProfile
 
@@ -203,6 +205,14 @@ async def create_document(user, company, uploaded_file, *, scope, label='',
     error = validate_upload(uploaded_file)
     if error:
         return None, error
+
+    # Checked before the file is stored, not after -- accepting bytes and then
+    # refusing them still costs the write.
+    entitlement = await entitlements.check(
+        company, UsageCounter.Metric.STORAGE_BYTES, requested=uploaded_file.size,
+    )
+    if not entitlement.allowed:
+        return entitlement, 'storage_limit'
 
     if scope == Document.Scope.PROJECT:
         access = await resolve_project_access(user, project)

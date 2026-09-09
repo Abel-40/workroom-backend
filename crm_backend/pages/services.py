@@ -11,6 +11,8 @@ app's service layer.
 """
 
 from asgiref.sync import sync_to_async
+from entitlements import services as entitlements
+from entitlements.models import UsageCounter
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 
@@ -166,6 +168,9 @@ async def create_page(user, folder, *, title: str, blocks=None, project=None):
         return None, 'forbidden'
     if project is not None and project.company_id != folder.company_id:
         return None, 'invalid_project'
+    entitlement = await entitlements.check(folder.company, UsageCounter.Metric.INFO_PORTAL_PAGES)
+    if not entitlement.allowed:
+        return entitlement, 'plan_limit'
     page = await Page.objects.acreate(
         folder=folder, title=title, blocks=_blocks_to_dicts(blocks), project=project, created_by=user,
     )
