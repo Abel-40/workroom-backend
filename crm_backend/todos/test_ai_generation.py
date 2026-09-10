@@ -8,8 +8,9 @@ the requests.post boundary; no test ever reaches a real provider.
 """
 
 import json
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from ai_agent.models import AITodoGeneration
 from api.tests import TwoCompanyTestCase, auth_header
@@ -19,6 +20,22 @@ from projects_and_tasks.models import Project, Task
 
 from todos.models import TodoItem
 from todos.services import user_today
+
+
+def midday_for(user, day):
+    """An aware datetime at noon on ``day`` in ``user``'s own timezone.
+
+    Anchored to a fixed time *of* a known day rather than an offset from
+    ``now()``. A deadline written as ``now() + 6h`` lands on tomorrow's date
+    whenever the suite runs after ~18:00 in the user's timezone, which silently
+    emptied ``today`` mode's eligibility window and turned every expected 202
+    into a 400 -- for six hours out of every twenty-four (R7 in BUILD_LOG.md).
+
+    Noon rather than end-of-day so the value is unambiguous in either
+    direction; §9's window includes work that is already overdue, so the hour
+    within the day never matters to eligibility, only the date does.
+    """
+    return datetime.combine(day, time(12, 0), tzinfo=ZoneInfo(user.timezone or 'UTC'))
 
 
 class FakeResponse:
@@ -52,7 +69,7 @@ class AITodoGenerationTestCase(TwoCompanyTestCase):
         # for, and these tests exercise the daily checklist.
         self.task = Task.objects.create(
             project=self.project_a, title='Ship the landing page', created_by=self.owner_a,
-            assigned_to=self.owner_a, deadline=timezone.now() + timedelta(hours=6),
+            assigned_to=self.owner_a, deadline=midday_for(self.owner_a, self.today),
         )
 
     def generate(self, user=None, **body):
@@ -180,7 +197,7 @@ class GenerationHappyPathTests(AITodoGenerationTestCase):
         self.assertEqual(generation.window_end, self.today)
 
     def test_task_mode_never_plans_past_the_tasks_own_deadline(self):
-        self.task.deadline = timezone.now() + timedelta(days=2)
+        self.task.deadline = midday_for(self.owner_a, self.today + timedelta(days=2))
         self.task.save(update_fields=['deadline'])
         with patch('ai_agent.tasks_todos.requests.post', return_value=ai_ok([self.todo_payload()])):
             self.generate(mode='task', task_id=str(self.task.id), days=14)
