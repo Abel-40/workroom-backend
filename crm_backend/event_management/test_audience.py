@@ -491,3 +491,62 @@ class AudienceBackfillTests(AudienceFixture):
         # "Repeats, somehow" was never a rule.
         self.assertEqual(flag_only.recurrence_rule, '')
         self.assertEqual(never.recurrence_rule, '')
+
+
+class ReportedManageFlagTests(AudienceFixture):
+    """The server tells the client who may manage each event, so the client
+    never re-derives the audience matrix and drifts (the mistake
+    lib/projectPermissions.ts made for projects)."""
+
+    def event_payload(self, actor, event):
+        response = self.client.get(f"/api/v1/events/{event['id']}/", **auth_header(actor))
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()['data']['event']
+
+    def test_the_organizer_is_told_they_may_manage(self):
+        event = self.make_event(self.member_a, audience='custom')
+        self.assertTrue(self.event_payload(self.member_a, event)['can_manage'])
+
+    def test_an_attendee_who_cannot_manage_is_told_so(self):
+        event = self.make_event(
+            self.member_a, audience='custom', attendee_ids=[str(self.sales_member.id)],
+        )
+        self.assertFalse(self.event_payload(self.sales_member, event)['can_manage'])
+
+    def test_the_owner_may_manage_a_shared_event(self):
+        event = self.make_event(self.member_a, audience='custom')
+        self.assertTrue(self.event_payload(self.owner_a, event)['can_manage'])
+
+    def test_a_department_leader_may_manage_their_own_departments_event(self):
+        event = self.make_event(
+            self.owner_a, audience='department', department_id=str(self.department_a.id),
+        )
+        self.assertTrue(self.event_payload(self.lead_eng, event)['can_manage'])
+        self.assertFalse(self.event_payload(self.member_a, event)['can_manage'])
+
+    def test_the_flag_matches_what_delete_actually_does(self):
+        """The whole point: if the flag says no, the endpoint must also say
+        no, and vice versa. A flag that disagrees with the server is worse
+        than no flag.
+
+        Both actors are chosen so they can *view* the event -- an attendee and
+        the company owner -- since a viewer is the only caller for whom the
+        flag is even reachable."""
+        event = self.make_event(
+            self.member_a, audience='custom', attendee_ids=[str(self.sales_member.id)],
+        )
+        for actor, expected in ((self.sales_member, False), (self.owner_a, True)):
+            flag = self.event_payload(actor, event)['can_manage']
+            self.assertEqual(flag, expected, f'{actor.username} flag')
+            status = self.client.delete(
+                f"/api/v1/events/{event['id']}/", **auth_header(actor),
+            ).status_code
+            self.assertEqual(status == 200, expected, f'{actor.username}: flag={flag} status={status}')
+
+    def test_the_list_reports_the_flag_per_row(self):
+        self.make_event(self.owner_a, audience='company', title='Theirs')
+        self.make_event(self.member_a, audience='personal', title='Mine')
+        response = self.client.get('/api/v1/events/?page_size=100', **auth_header(self.member_a))
+        rows = {row['title']: row['can_manage'] for row in response.json()['data']['results']}
+        self.assertFalse(rows['Theirs'])   # company event, member is not admin
+        self.assertTrue(rows['Mine'])      # their own personal entry

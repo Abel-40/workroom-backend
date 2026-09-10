@@ -6,6 +6,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
+from company.services import resolve_company_context
 from event_management import services
 from event_management.models import Event, EventAttendee
 from event_management.recurrence import rrule_from_legacy
@@ -100,7 +101,13 @@ def resolve_recurrence_rule(data) -> str:
     )
 
 
-async def event_data(event: Event) -> dict:
+async def event_data(event: Event, context=None, user=None) -> dict:
+    """``context``/``user`` are optional only so a caller that genuinely has
+    neither can still serialize an event; supply both wherever the response
+    goes to a person, or ``can_manage`` comes back False for everybody.
+
+    Resolved by the caller rather than here, once per request instead of once
+    per row -- see services.can_manage_event_with_context."""
     attendees = [
         {
             'id': str(row.user.id),
@@ -116,6 +123,13 @@ async def event_data(event: Event) -> dict:
         'description': event.description,
         'company_id': str(event.company_id),
         'audience': event.audience,
+        # The server's own answer, so the client never re-derives the
+        # audience matrix and drifts out of date (the mistake the project
+        # access level already exists to prevent).
+        'can_manage': (
+            services.can_manage_event_with_context(user, event, context)
+            if user is not None else False
+        ),
         'event_type_id': str(event.event_type_id) if event.event_type_id else None,
         'event_type_name': event.event_type.name if event.event_type_id else None,
         'department_id': str(event.department_id) if event.department_id else None,
@@ -163,7 +177,10 @@ async def create_event(request, data: EventIn):
     if error:
         field = error.removeprefix('invalid_')
         return payload(f'Invalid {field} for this company.', 400, False, errors={error: ['Invalid reference']})
-    return payload('Event created successfully.', 201, True, {'event': await event_data(event)})
+    context = await resolve_company_context(request.auth, company_id=event.company_id)
+    return payload('Event created successfully.', 201, True, {
+        'event': await event_data(event, context, request.auth),
+    })
 
 
 @router.get('/', auth=auth, response={200: ApiResponse})
@@ -177,9 +194,11 @@ async def list_events(
         request.auth, event_type_id=event_type_id, department_id=department_id, team_id=team_id,
         start_date=start_date, end_date=end_date, mine=mine, audience=audience,
     )
+    context = await resolve_company_context(request.auth)
     items, meta = await paginate(queryset, page, page_size)
     return payload('Events retrieved successfully.', 200, True, {
-        'results': [await event_data(event) for event in items], 'meta': meta,
+        # Resolved once for the whole page, not once per row.
+        'results': [await event_data(event, context, request.auth) for event in items], 'meta': meta,
     })
 
 
@@ -190,7 +209,10 @@ async def get_event(request, event_id: UUID):
         return payload('Event not found.', 404, False)
     if error == 'forbidden':
         return payload('You do not have permission to view this event.', 403, False)
-    return payload('Event retrieved successfully.', 200, True, {'event': await event_data(event)})
+    context = await resolve_company_context(request.auth, company_id=event.company_id)
+    return payload('Event retrieved successfully.', 200, True, {
+        'event': await event_data(event, context, request.auth),
+    })
 
 
 @router.patch(
@@ -221,7 +243,10 @@ async def update_event(request, event_id: UUID, data: EventUpdateIn):
         return payload(AUDIENCE_ERROR_MESSAGES[error], 400, False, errors={error: ['Invalid request']})
     if error:
         return payload('Invalid reference for this company.', 400, False)
-    return payload('Event updated successfully.', 200, True, {'event': await event_data(updated)})
+    context = await resolve_company_context(request.auth, company_id=updated.company_id)
+    return payload('Event updated successfully.', 200, True, {
+        'event': await event_data(updated, context, request.auth),
+    })
 
 
 @router.post(
@@ -243,7 +268,10 @@ async def respond_to_event(request, event_id: UUID, data: AttendeeResponseIn):
     _, error = await services.set_attendee_response(request.auth, event, data.response)
     if error == 'not_an_attendee':
         return payload('You are not on the attendee list for this event.', 403, False)
-    return payload('Response recorded.', 200, True, {'event': await event_data(event)})
+    context = await resolve_company_context(request.auth, company_id=event.company_id)
+    return payload('Response recorded.', 200, True, {
+        'event': await event_data(event, context, request.auth),
+    })
 
 
 @router.delete('/{event_id}/', auth=auth, response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse})

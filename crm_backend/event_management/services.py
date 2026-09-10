@@ -192,6 +192,18 @@ async def user_can_manage_event(user, event) -> bool:
     being the organizer is a per-event grant and grants a non-member nothing.
     """
     context = await resolve_company_context(user, company_id=event.company_id)
+    return can_manage_event_with_context(user, event, context)
+
+
+def can_manage_event_with_context(user, event, context) -> bool:
+    """:func:`user_can_manage_event` with the company context already resolved.
+
+    The same decision, split out so a list endpoint can resolve the caller's
+    context **once** and answer for every row, instead of one
+    ``resolve_company_context`` per event. The async version above is the one
+    to reach for when you hold a single event and no context; this is the one
+    the response builders use.
+    """
     if context is None:
         return False
     if event.organizer_id == user.id:
