@@ -5,11 +5,13 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
+from ai_agent import brief_services
 from ai_agent.models import AIGeneration
 from asgiref.sync import sync_to_async
 from django.db.models import Count
 from django.http import FileResponse
 from django.utils import timezone
+from documents.services import validate_upload
 from ninja import File, Router, Schema
 from ninja.files import UploadedFile
 from projects_and_tasks import services
@@ -652,3 +654,220 @@ async def update_project_brief(request, project_id: UUID, data: ProjectBriefUpda
             errors={'required_skill_ids': ['Invalid skill']},
         )
     return payload('Brief updated successfully.', 200, True, {'brief': await services.brief_data(brief)})
+
+
+# --------------------------------------------------------------------------
+# AI-assisted brief, and its two human gates (§1)
+# --------------------------------------------------------------------------
+
+# Text formats only. Extracting prose from PDF or DOCX needs a parser this
+# project has no dependency for, and a half-extracted binary produces a
+# confident, wrong brief -- precisely what the confirmation gates exist to
+# catch, so it should not be manufactured upstream of them. A clear refusal is
+# the honest behaviour until a parser is a deliberate decision.
+BRIEF_SOURCE_CONTENT_TYPES = {'text/plain', 'text/markdown', 'text/csv', ''}
+MAX_BRIEF_SOURCE_BYTES = 2 * 1024 * 1024
+
+
+class BriefExtractIn(Schema):
+    """Pasted text. The upload form of the same thing is the multipart
+    endpoint below; both end in the identical service call."""
+
+    source_text: str = Field(min_length=1, max_length=brief_services.MAX_SOURCE_CHARS)
+    source_filename: str = Field(default='', max_length=255)
+
+
+class BriefExtractionConfirmIn(Schema):
+    """The reviewer's edits, applied over what the model extracted. Every
+    field optional: confirming as-extracted is the common case, and making
+    somebody retype six fields to accept them is how a gate stops being read.
+    """
+
+    objective: str | None = Field(default=None, max_length=10_000)
+    background: str | None = Field(default=None, max_length=10_000)
+    scope_in: str | None = Field(default=None, max_length=10_000)
+    scope_out: str | None = Field(default=None, max_length=10_000)
+    expected_outcome: str | None = Field(default=None, max_length=10_000)
+    constraints: str | None = Field(default=None, max_length=10_000)
+
+
+def brief_assist_data(assist) -> dict:
+    return {
+        'id': str(assist.id),
+        'project_id': str(assist.project_id),
+        'status': assist.status,
+        'source_filename': assist.source_filename,
+        'source_chars': assist.source_chars,
+        'extracted': assist.extracted,
+        'interpretation': assist.interpretation,
+        'extraction_confirmed_at': (
+            assist.extraction_confirmed_at.isoformat() if assist.extraction_confirmed_at else None
+        ),
+        'interpretation_confirmed_at': (
+            assist.interpretation_confirmed_at.isoformat() if assist.interpretation_confirmed_at else None
+        ),
+        'provider': assist.provider or None,
+        'model': assist.model or None,
+        'input_tokens': assist.input_tokens,
+        'output_tokens': assist.output_tokens,
+        'cost': float(assist.cost) if assist.cost is not None else None,
+        'error_message': assist.error_message,
+        'created_at': assist.created_at.isoformat(),
+    }
+
+
+async def _viewable_project_or_error(request, project_id):
+    project, error = await services.get_viewable_project(request.auth, project_id)
+    if error == 'not_found':
+        return None, payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return None, payload('You do not have permission to view this project.', 403, False)
+    return project, None
+
+
+def _assist_error_response(error):
+    messages = {
+        'forbidden': ('Assisting a brief requires permission to manage this project.', 403),
+        'empty_source': ('The document had no readable text.', 400),
+        'source_too_large': ('That document is too long to extract a brief from.', 400),
+        'wrong_state': ('This step has already been confirmed, or is not ready to confirm yet.', 400),
+    }
+    message, status = messages.get(error, ('Could not process the brief.', 400))
+    return payload(message, status, False, errors={error: ['Invalid request']})
+
+
+@router.post(
+    '/{project_id}/brief/extract/', auth=auth,
+    response={202: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def extract_brief_from_text(request, project_id: UUID, data: BriefExtractIn):
+    """Start the assisted route from pasted text.
+
+    202: extraction runs in the background and the caller polls. Nothing is
+    written to the project by this call -- that is the confirm endpoint, which
+    is gate 1.
+    """
+    project, error_response = await _viewable_project_or_error(request, project_id)
+    if error_response:
+        return error_response
+    assist, error = await brief_services.start_extraction(
+        request.auth, project, source_text=data.source_text, source_filename=data.source_filename,
+    )
+    if error == 'already_in_flight':
+        return payload(
+            'A brief is already being processed for this project.', 202, True,
+            {'assist': brief_assist_data(assist)},
+        )
+    if error:
+        return _assist_error_response(error)
+    return payload('Extracting the brief.', 202, True, {'assist': brief_assist_data(assist)})
+
+
+@router.post(
+    '/{project_id}/brief/extract-file/', auth=auth,
+    response={202: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def extract_brief_from_upload(request, project_id: UUID, file: UploadedFile = File(...)):
+    """The same thing, from an uploaded text document.
+
+    The file is read once, turned into characters, and dropped -- never
+    stored. A brief is the artifact worth keeping; keeping the upload too
+    would quietly make this a second document store, with none of
+    ``documents.Document``'s retention rules.
+    """
+    project, error_response = await _viewable_project_or_error(request, project_id)
+    if error_response:
+        return error_response
+
+    upload_error = validate_upload(
+        file, max_bytes=MAX_BRIEF_SOURCE_BYTES, allowed_types=BRIEF_SOURCE_CONTENT_TYPES,
+    )
+    if upload_error == 'invalid_content_type':
+        return payload(
+            'Upload a plain-text document, or paste the text instead.', 400, False,
+            errors={'file': ['Unsupported document type']},
+        )
+    if upload_error:
+        return payload('That file could not be read.', 400, False, errors={'file': [upload_error]})
+
+    raw = await sync_to_async(file.read, thread_sensitive=True)()
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        # Content-type said text; the bytes disagree. Refusing beats
+        # extracting a brief from mojibake.
+        return payload(
+            'That file is not readable as text.', 400, False, errors={'file': ['Not valid UTF-8']},
+        )
+
+    assist, error = await brief_services.start_extraction(
+        request.auth, project, source_text=text, source_filename=file.name or '',
+    )
+    if error == 'already_in_flight':
+        return payload(
+            'A brief is already being processed for this project.', 202, True,
+            {'assist': brief_assist_data(assist)},
+        )
+    if error:
+        return _assist_error_response(error)
+    return payload('Extracting the brief.', 202, True, {'assist': brief_assist_data(assist)})
+
+
+@router.get(
+    '/{project_id}/brief/assist/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def get_brief_assist(request, project_id: UUID, assist_id: UUID | None = None):
+    """Poll the current (or a named) assist. VIEW is enough -- this reports
+    progress on the project's own brief, and reading it changes nothing."""
+    project, error_response = await _viewable_project_or_error(request, project_id)
+    if error_response:
+        return error_response
+    assist, error = await brief_services.get_assist_for_user(request.auth, project, assist_id)
+    if error:
+        return payload('No brief assistance has been requested for this project.', 404, False)
+    return payload('Assist retrieved successfully.', 200, True, {'assist': brief_assist_data(assist)})
+
+
+@router.post(
+    '/{project_id}/brief/assist/{assist_id}/confirm-extraction/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def confirm_brief_extraction(request, project_id: UUID, assist_id: UUID, data: BriefExtractionConfirmIn):
+    """**Gate 1.** Writes the brief, then starts the interpretation pass.
+
+    Whatever the reviewer edited wins over what the model produced -- that is
+    the point of the gate. The write goes through the same validated path the
+    guided form uses, never straight from the stored extraction.
+    """
+    project, error_response = await _viewable_project_or_error(request, project_id)
+    if error_response:
+        return error_response
+    assist, error = await brief_services.get_assist_for_user(request.auth, project, assist_id)
+    if error:
+        return payload('Brief assistance not found.', 404, False)
+    updated, error = await brief_services.confirm_extraction(
+        request.auth, project, assist, overrides=data.model_dump(exclude_unset=True),
+    )
+    if error:
+        return _assist_error_response(error)
+    return payload('Brief confirmed. Interpreting it now.', 200, True, {'assist': brief_assist_data(updated)})
+
+
+@router.post(
+    '/{project_id}/brief/assist/{assist_id}/confirm-interpretation/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def confirm_brief_interpretation(request, project_id: UUID, assist_id: UUID):
+    """**Gate 2.** The last thing between a brief and a plan. Only after this
+    will a decomposition request be accepted for this project."""
+    project, error_response = await _viewable_project_or_error(request, project_id)
+    if error_response:
+        return error_response
+    assist, error = await brief_services.get_assist_for_user(request.auth, project, assist_id)
+    if error:
+        return payload('Brief assistance not found.', 404, False)
+    updated, error = await brief_services.confirm_interpretation(request.auth, project, assist)
+    if error:
+        return _assist_error_response(error)
+    return payload('Interpretation confirmed. Ready to plan.', 200, True, {'assist': brief_assist_data(updated)})

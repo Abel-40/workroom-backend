@@ -22,7 +22,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP7a | Task field-level authority; `created_by` stops granting MANAGE (§2) | **done** |
 | WP7b | Task creation behind MANAGE; task proposals; break-into-steps (§2) | **done** |
 | WP8 | Task dependencies — `blocks` / `relates_to` (§2) | **done** |
-| WP9 | `ProjectBrief` and brief-assisted creation (§1) | **partial** — the model/API/completeness score are done; the two-human-gate AI-extraction creation flow is deferred, see the WP9 entry |
+| WP9 | `ProjectBrief` and brief-assisted creation (§1) | **done** |
 | WP10 | Skills, professions, capacity, workload, `AssignmentPolicy` (§3) | **done** |
 | WP11 | AI pipeline: allow-list serializer, re-validation, token accounting (§4) | **done** |
 | WP12 | AI assistant privacy; health-summary anonymity (§5) | **done** |
@@ -2255,6 +2255,124 @@ branch. `vite build` succeeds. 31 frontend tests pass.
 respond` on every file -- vitest's parallel worker pool does not cope with
 this workspace's path (spaces and commas). It is an infrastructure failure,
 not a broken suite. Use `npx vitest run --no-file-parallelism`.
+
+---
+
+## WP9 (completion) — the brief-assisted route, and its two human gates
+
+The half of §1 the first WP9 pass deferred. `ProjectBrief` was the structure;
+this is the assisted way into it, and the two confirmations that make it safe.
+
+### The shape, and why it is two gates rather than one
+
+```
+upload a doc / paste text
+  -> AI extracts into the form
+  -> HUMAN CONFIRMS            gate 1: writes ProjectBrief
+  -> AI interprets the brief
+  -> HUMAN CONFIRMS            gate 2: marks the assist READY
+  -> only now may a plan be generated
+```
+
+The second gate is the one that earns its place. A model can extract a brief
+perfectly faithfully and still have misunderstood what the project is *for* --
+and the cheapest possible moment to discover that is before a full
+decomposition is built on top of it. So the interpretation pass says back a
+restated objective, the assumptions it is making, and the questions it cannot
+answer, and proposes **no tasks, no schedule, no estimates and no
+assignments**. It is not a small plan; it is a comprehension check.
+
+### The AI never writes project state
+
+`BriefAssist.extracted` holds what the model returned, exactly as returned,
+and nothing reads it into the project. Gate 1 applies it through
+`projects_and_tasks.services.update_brief` -- the same validated path the
+guided form uses -- so:
+
+- an extraction nobody read cannot become a brief, and
+- **the reviewer's edits win.** `confirm-extraction` takes overrides, and what
+  gets written is what a person agreed to, which may be nothing the model
+  said. There is a test that edits the objective and asserts the edit is what
+  lands.
+
+This is the same rule `ApprovalRequest` already follows everywhere else in
+this codebase: approving applies a change through the path a direct action
+would take, never straight from stored JSON.
+
+### "Then and only then"
+
+`request_project_plan` now refuses with `brief_not_confirmed` while an assist
+is in `EXTRACTING`, `EXTRACTED`, `INTERPRETING` or `INTERPRETED`. Two cases
+deliberately do **not** block, and both have tests:
+
+- **A project that never used the assisted route.** The guided form is still
+  the default way in and needs no gate -- a person wrote every word of it.
+- **A `FAILED` assist.** A provider outage must not strand a project forever.
+  FAILED is terminal and is not an awaiting-confirmation state.
+
+### The document is read once and dropped
+
+Only its filename and character count are kept. `source_text` is passed as a
+Celery argument rather than stored on the row: the upload is a means to the
+brief, not something this feature should quietly become a store of -- doing
+that would make it a second document store with none of
+`documents.Document`'s retention rules. A test asserts the source text
+appears in no string field of the row.
+
+### Text formats only, on purpose
+
+`text/plain`, `text/markdown`, `text/csv`, or pasted text. PDF and DOCX are
+refused with a message that says what to do instead.
+
+Extracting prose from those needs a parser this project has no dependency
+for, and a half-extracted binary produces a *confident, wrong* brief -- which
+is precisely what the gates exist to catch, so manufacturing one upstream of
+them would be perverse. A clear refusal is the honest behaviour until adding
+a parser is a deliberate decision. A file whose content-type claims text but
+whose bytes are not UTF-8 is refused for the same reason rather than
+extracted from mojibake.
+
+### Recomputed, not trusted
+
+The AI service returns `missing_fields`, and the service recomputes it from
+the fields themselves rather than believing the list. A model that leaves
+`objective` blank and forgets to say so is exactly the case the person
+confirming needs flagged, and the flag should come from the data rather than
+from a second thing the model was asked to remember. Tests cover both
+directions -- under-reported and over-reported.
+
+An extraction where *every* field came back empty is rejected outright:
+nothing was learned from the document, and handing somebody an empty form to
+confirm is worse than saying so.
+
+### Usage accumulates across both calls
+
+One assist makes two paid provider calls, so `input_tokens`/`output_tokens`/
+`cost` accumulate rather than being overwritten by the second step. The row
+ends up holding what the whole thing cost, not what its last step did.
+
+### A real bug the tests caught
+
+Adding the `brief_not_confirmed` error to `request_project_plan` without
+adding a branch for it in `api/routers/ai.py` meant the router fell through
+to `generation_data(None)` and returned a **500** instead of the 400 it
+should. Caught immediately by the two "planning is refused while..." tests.
+The lesson is the ordinary one about a service growing a new error code: the
+router's error mapping is part of the change, not a follow-up to it.
+
+### Files
+
+New (backend): `ai_agent/brief_services.py`, `ai_agent/tasks_brief.py`,
+`ai_agent/test_brief_assist.py`, migration `0011_briefassist`.
+Changed (backend): `ai_agent/models.py`, `ai_agent/services.py`,
+`api/routers/ai.py`, `api/routers/projects.py`.
+New (AI service): `apps/schemas/brief_schemas.py`,
+`apps/services/brief_services.py`, `apps/tests/test_brief_services.py`,
+`apps/tests/test_brief_endpoints.py`. Changed: `apps/main.py`.
+
+**50 tests**: 25 in `ai_agent/test_brief_assist.py` (extraction, both gates,
+the planning gate, tenant isolation, authority), and 25 in the AI service
+(validation both ways, status mapping, size and emptiness refusals).
 
 ---
 

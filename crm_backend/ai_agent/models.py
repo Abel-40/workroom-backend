@@ -395,3 +395,90 @@ class AITodoGeneration(UUIDModel):
 
     def __str__(self):
         return f'{self.user_id} - {self.mode} - {self.status}'
+
+
+class BriefAssist(UUIDModel):
+    """Lifecycle record for the AI-assisted route into a project brief (§1).
+
+    The guided form is the default way to fill in a ``ProjectBrief``. This is
+    the other way: upload a document, let a model read it, and confirm what it
+    understood -- **twice**, before any planning happens.
+
+    The two confirmations are the whole point of the feature, so they are
+    modelled as states rather than left to the client to remember::
+
+        EXTRACTING -> EXTRACTED
+                        |  confirm_extraction()   <- human gate 1
+                        v
+                   INTERPRETING -> INTERPRETED
+                        |  confirm_interpretation()  <- human gate 2
+                        v
+                      READY   (and only now may a plan be generated)
+
+    Nothing here writes to ``ProjectBrief``. Gate 1 does -- through the same
+    validated ``update_brief`` path the guided form uses -- so an extraction
+    nobody read cannot become project state, and a stale payload cannot become
+    one either. That is the same rule ``ApprovalRequest`` follows for every
+    other kind of approval in this codebase: approving applies the change
+    through the path a direct action would take, never straight from stored
+    JSON.
+
+    A project may accumulate several of these over time (a second document, a
+    restart after a failure); ``READY`` is a property of this attempt, and
+    ``projects_and_tasks`` reads the most recent one.
+    """
+
+    class STATUS(models.TextChoices):
+        EXTRACTING = 'extracting', 'Extracting'
+        EXTRACTED = 'extracted', 'Extracted, awaiting confirmation'
+        INTERPRETING = 'interpreting', 'Interpreting'
+        INTERPRETED = 'interpreted', 'Interpreted, awaiting confirmation'
+        READY = 'ready', 'Confirmed, ready to plan'
+        FAILED = 'failed', 'Failed'
+
+    project = models.ForeignKey(
+        'projects_and_tasks.Project', on_delete=models.CASCADE, related_name='brief_assists',
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='brief_assists',
+    )
+    status = models.CharField(max_length=20, choices=STATUS.choices, default=STATUS.EXTRACTING)
+
+    # The document's name only. The file itself is never stored here -- it is
+    # read once, turned into text, and dropped. A brief is the artifact worth
+    # keeping; the upload was a means to it, and storing it would quietly make
+    # this a document store with none of documents.Document's retention rules.
+    source_filename = models.CharField(max_length=255, blank=True, default='')
+    source_chars = models.PositiveIntegerField(default=0)
+
+    # What the model returned at each step, exactly as returned. Read by the
+    # reviewer and never applied to anything directly -- see the class
+    # docstring.
+    extracted = models.JSONField(default=dict, blank=True)
+    interpretation = models.JSONField(default=dict, blank=True)
+
+    # Set when a human confirms each step. Timestamps rather than booleans:
+    # "who agreed to this, and when" is the question somebody asks later, and
+    # a boolean cannot answer it.
+    extraction_confirmed_at = models.DateTimeField(null=True, blank=True)
+    interpretation_confirmed_at = models.DateTimeField(null=True, blank=True)
+
+    provider = models.CharField(max_length=50, blank=True, default='')
+    model = models.CharField(max_length=100, blank=True, default='')
+    input_tokens = models.PositiveIntegerField(null=True, blank=True)
+    output_tokens = models.PositiveIntegerField(null=True, blank=True)
+    cost = models.DecimalField(max_digits=10, decimal_places=6, null=True, blank=True)
+
+    error_message = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            # "the current attempt for this project" -- every read starts here.
+            models.Index(fields=['project', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.project_id} - {self.status}'

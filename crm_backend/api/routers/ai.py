@@ -115,6 +115,12 @@ async def request_ai_plan(request, project_id: UUID, data: AIPlanRequestIn):
         return payload('You do not have permission to request an AI plan for this project.', 403, False)
     if error == 'plan_already_saved':
         return payload('This project already has a saved AI-generated plan.', 409, False)
+    if error == 'brief_not_confirmed':
+        return payload(
+            'This project has an AI-assisted brief still waiting to be confirmed. '
+            'Review and confirm it before generating a plan.', 400, False,
+            errors={'brief': ['Awaiting confirmation']},
+        )
     if error == 'invalid_assignee':
         return payload(
             'One or more selected assignees are not eligible for this project.', 400, False,

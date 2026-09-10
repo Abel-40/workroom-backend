@@ -12,6 +12,7 @@ from django.db import IntegrityError
 from django.utils import timezone
 from projects_and_tasks.services import is_eligible_assignee, user_can_manage_project, user_can_view_project
 
+from .brief_services import assist_blocks_planning
 from .context import build_assignee_refs
 from .models import AIGeneration
 from .tasks import process_ai_generation
@@ -66,6 +67,13 @@ async def request_project_plan(
         return None, 'forbidden'
     if await AIGeneration.objects.filter(project=project, saved_at__isnull=False).aexists():
         return None, 'plan_already_saved'
+    # §1's "then and only then": a brief that is part-way through the assisted
+    # route has not been confirmed by anyone yet, and planning from it would
+    # skip the gate that exists to catch a misunderstanding while it is still
+    # cheap. A project with no assist at all is unaffected -- the guided form
+    # needs no gate, because a person wrote every word of it.
+    if await assist_blocks_planning(project):
+        return None, 'brief_not_confirmed'
 
     existing = await find_by_idempotency_key(project, idempotency_key)
     if existing is not None:
