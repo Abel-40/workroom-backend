@@ -54,8 +54,8 @@ from workforce import workload
 
 from .access import AccessLevel, resolve_project_access
 from .models import (
-    ApprovalRequest, Attachment, DefaultTaskType, Project, ProjectMembership, ProjectVisibilityRequest, Task,
-    TaskApproval, TaskDependency, TaskTimeLog, TaskType,
+    ApprovalRequest, Attachment, DefaultTaskType, Project, ProjectBrief, ProjectMembership,
+    ProjectVisibilityRequest, Task, TaskApproval, TaskDependency, TaskTimeLog, TaskType,
 )
 
 User = get_user_model()
@@ -2242,3 +2242,124 @@ async def list_workload_overrides_for_user(user, *, status=None):
     if status:
         queryset = queryset.filter(status=status)
     return queryset.order_by('-created_at')
+
+
+# --------------------------------------------------------------------------
+# Project brief (§1)
+# --------------------------------------------------------------------------
+
+# The free-text fields that count toward completeness. Deliberately not
+# ``body`` or the M2Ms: body is unstructured by design (there is no single
+# right shape to check for), and a brief with a strong objective/scope but no
+# required skills yet is still meaningfully further along than an empty one --
+# weighting every field, including two M2Ms whose natural size varies per
+# project, would make the score bounce around for reasons that have nothing
+# to do with how filled-in the brief actually is.
+BRIEF_TEXT_FIELDS = ('objective', 'background', 'scope_in', 'scope_out', 'expected_outcome', 'constraints')
+
+BRIEF_UPDATABLE_FIELDS = frozenset({*BRIEF_TEXT_FIELDS, 'body'})
+
+
+def _brief_completeness_sync(brief: ProjectBrief) -> int:
+    """0-100. Each text field is worth an equal share; a non-empty ``body``
+    (any key with a truthy value) is worth one more share, so a brief that
+    has filled in every prose field but never touched deliverables/
+    stakeholders still reads as incomplete rather than as done."""
+    total_slots = len(BRIEF_TEXT_FIELDS) + 1
+    filled = sum(1 for field in BRIEF_TEXT_FIELDS if (getattr(brief, field) or '').strip())
+    if isinstance(brief.body, dict) and any(brief.body.values()):
+        filled += 1
+    return round((filled / total_slots) * 100)
+
+
+async def get_or_create_brief(user, project):
+    """Returns (brief, error) with error 'forbidden' or None.
+
+    VIEW is enough to read a brief -- it's project context, not a capability
+    -- created empty on first read rather than requiring a separate "start a
+    brief" action, so there is never a project a caller can see but whose
+    brief 404s.
+    """
+    access = await resolve_project_access(user, project)
+    if access is None:
+        return None, 'forbidden'
+    brief, _ = await ProjectBrief.objects.aget_or_create(project=project)
+    return brief, None
+
+
+async def update_brief(user, project, updates: dict):
+    """Returns (brief, error) with error 'forbidden', 'invalid_department',
+    'invalid_skill', or None. Requires MANAGE -- the same authority that can
+    edit the project itself.
+
+    ``required_departments``/``required_skills``, when present in
+    ``updates``, replace the set rather than merging into it -- the caller is
+    editing a list they can see in full, the same convention
+    ``workforce.set_member_skills`` uses.
+    """
+    if not await user_can_manage_project(user, project):
+        return None, 'forbidden'
+    brief, _ = await ProjectBrief.objects.aget_or_create(project=project)
+
+    department_ids = updates.pop('required_department_ids', None)
+    skill_ids = updates.pop('required_skill_ids', None)
+
+    if department_ids is not None:
+        # str() both sides before comparing: the queryset yields UUID
+        # objects, the request body yields strings, and a set of one never
+        # equals a set of the other even for the same records.
+        valid_ids = {
+            str(dept_id) async for dept_id in Department.objects.filter(
+                id__in=department_ids, company=project.company,
+            ).values_list('id', flat=True)
+        }
+        if valid_ids != {str(v) for v in department_ids}:
+            return None, 'invalid_department'
+
+    if skill_ids is not None:
+        from workforce.models import Skill
+        valid_skill_ids = {
+            str(skill_id) async for skill_id in Skill.objects.filter(
+                id__in=skill_ids, company=project.company,
+            ).values_list('id', flat=True)
+        }
+        if valid_skill_ids != {str(v) for v in skill_ids}:
+            return None, 'invalid_skill'
+
+    for field, value in updates.items():
+        if field in BRIEF_UPDATABLE_FIELDS:
+            setattr(brief, field, value)
+    await brief.asave()
+
+    if department_ids is not None:
+        await sync_to_async(brief.required_departments.set, thread_sensitive=True)(department_ids)
+    if skill_ids is not None:
+        await sync_to_async(brief.required_skills.set, thread_sensitive=True)(skill_ids)
+
+    return brief, None
+
+
+async def brief_data(brief: ProjectBrief) -> dict:
+    departments = [
+        {'id': str(d.id), 'name': d.name}
+        async for d in brief.required_departments.all()
+    ]
+    skills = [
+        {'id': str(s.id), 'name': s.name, 'category': s.category}
+        async for s in brief.required_skills.all()
+    ]
+    completeness = await sync_to_async(_brief_completeness_sync, thread_sensitive=True)(brief)
+    return {
+        'project_id': str(brief.project_id),
+        'objective': brief.objective,
+        'background': brief.background,
+        'scope_in': brief.scope_in,
+        'scope_out': brief.scope_out,
+        'expected_outcome': brief.expected_outcome,
+        'constraints': brief.constraints,
+        'body': brief.body,
+        'required_departments': departments,
+        'required_skills': skills,
+        'completeness_pct': completeness,
+        'updated_at': brief.updated_at.isoformat(),
+    }

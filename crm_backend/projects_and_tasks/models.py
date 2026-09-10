@@ -79,6 +79,59 @@ class Project(UUIDModel):
         return (completed / total) * 100
 
 
+class ProjectBrief(UUIDModel):
+    """The structured "what and why" behind a project (§1).
+
+    Deliberately not part of project creation. Creation stays fast --
+    title/deadline/visibility, nothing more -- and this is filled in
+    afterward, on its own tab, at whatever pace the project's owner works at.
+    One row per project, created empty (all fields blank) the first time
+    anybody asks for it, so a project that never gets a brief is simply a
+    project with an empty one rather than a null relation every read site has
+    to guard against.
+
+    Free-text fields answer distinct questions on purpose rather than being
+    one big description box: *why* (objective, background), *what's in and
+    out* (scope_in, scope_out), *what done looks like* (expected_outcome),
+    and *what constrains it* (constraints). A brief that only had "notes"
+    would answer none of these reliably.
+
+    ``required_departments``/``required_skills`` are catalog references
+    (§3's ``workforce.Skill``, never free text) -- what the AI decomposition
+    call reads to staff-check a plan against, once that lands. ``body`` is
+    the deliberately loose remainder: deliverables/stakeholders/resources,
+    shaped however the project needs, because forcing every company's list of
+    deliverables into fixed columns is exactly the kind of premature
+    structure the rest of this model avoids.
+    """
+
+    project = models.OneToOneField(Project, on_delete=models.CASCADE, related_name='brief')
+
+    objective = models.TextField(blank=True, default='')
+    background = models.TextField(blank=True, default='')
+    scope_in = models.TextField(blank=True, default='')
+    scope_out = models.TextField(blank=True, default='')
+    expected_outcome = models.TextField(blank=True, default='')
+    constraints = models.TextField(blank=True, default='')
+    # {"deliverables": [...], "stakeholders": [...], "resources": [...],
+    # "notes": "..."} -- shaped by convention, not a schema, and never
+    # authoritative for anything the rest of the system enforces.
+    body = models.JSONField(default=dict, blank=True)
+
+    required_departments = models.ManyToManyField(
+        'departments_and_teams.Department', related_name='required_by_briefs', blank=True,
+    )
+    required_skills = models.ManyToManyField(
+        'workforce.Skill', related_name='required_by_briefs', blank=True,
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'Brief for {self.project_id}'
+
+
 class ProjectMembership(UUIDModel):
     """An explicit grant of access to one project, for one person.
 

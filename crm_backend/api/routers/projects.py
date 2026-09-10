@@ -583,3 +583,72 @@ async def deny_visibility_request(request, request_id: UUID, data: VisibilityDec
     if error == 'not_pending':
         return payload('This request has already been decided.', 400, False)
     return payload('Visibility request denied.', 200, True, {'request': _visibility_request_data(updated)})
+
+
+# --------------------------------------------------------------------------
+# Project brief (§1)
+# --------------------------------------------------------------------------
+
+class ProjectBriefUpdateIn(Schema):
+    objective: str | None = Field(default=None, max_length=10_000)
+    background: str | None = Field(default=None, max_length=10_000)
+    scope_in: str | None = Field(default=None, max_length=10_000)
+    scope_out: str | None = Field(default=None, max_length=10_000)
+    expected_outcome: str | None = Field(default=None, max_length=10_000)
+    constraints: str | None = Field(default=None, max_length=10_000)
+    body: dict | None = None
+    required_department_ids: list[UUID] | None = None
+    required_skill_ids: list[UUID] | None = None
+
+
+@router.get(
+    '/{project_id}/brief/', auth=auth,
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def get_project_brief(request, project_id: UUID):
+    """VIEW is enough to read -- a brief is project context, not a
+    capability. Created empty on first read, so a project the caller can see
+    never 404s here."""
+    project, error = await services.get_viewable_project(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    brief, error = await services.get_or_create_brief(request.auth, project)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    return payload('Brief retrieved successfully.', 200, True, {'brief': await services.brief_data(brief)})
+
+
+@router.patch(
+    '/{project_id}/brief/', auth=auth,
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+)
+async def update_project_brief(request, project_id: UUID, data: ProjectBriefUpdateIn):
+    """MANAGE required -- the same authority that edits the project itself.
+    Never gates project creation (§1): this is a tab filled in later, on its
+    own, at whatever pace the owner works at."""
+    project, error = await services.get_viewable_project(request.auth, project_id)
+    if error == 'not_found':
+        return payload('Project not found.', 404, False)
+    if error == 'forbidden':
+        return payload('You do not have permission to view this project.', 403, False)
+    updates = data.model_dump(exclude_unset=True)
+    if 'required_department_ids' in updates:
+        updates['required_department_ids'] = [str(v) for v in (updates['required_department_ids'] or [])]
+    if 'required_skill_ids' in updates:
+        updates['required_skill_ids'] = [str(v) for v in (updates['required_skill_ids'] or [])]
+    brief, error = await services.update_brief(request.auth, project, updates)
+    if error == 'forbidden':
+        return payload('Editing the brief requires permission to manage this project.', 403, False)
+    if error == 'invalid_department':
+        return payload(
+            'One or more departments are not in this company.', 400, False,
+            errors={'required_department_ids': ['Invalid department']},
+        )
+    if error == 'invalid_skill':
+        return payload(
+            'One or more skills are not in this company catalog.', 400, False,
+            errors={'required_skill_ids': ['Invalid skill']},
+        )
+    return payload('Brief updated successfully.', 200, True, {'brief': await services.brief_data(brief)})

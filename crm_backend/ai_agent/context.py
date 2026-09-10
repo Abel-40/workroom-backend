@@ -147,10 +147,15 @@ def _assignment_limits(company) -> dict:
 def _project_brief(project) -> dict | None:
     """The structured brief, if the project has one.
 
-    Reads through ``getattr`` because ``ProjectBrief`` is WP9 and does not
-    exist yet. When it lands this starts sending it and nothing else changes;
-    until then the key is simply absent, which is the honest representation of
-    "there is no brief".
+    Reads through ``getattr`` rather than ``project.brief`` directly: a
+    project's brief row is created on first read of the brief endpoint (see
+    ``projects_and_tasks.services.get_or_create_brief``), not at project
+    creation, so most projects genuinely have none yet.
+    ``Project.brief.RelatedObjectDoesNotExist`` is deliberately also an
+    ``AttributeError`` in Django's reverse-OneToOne descriptor, which is what
+    makes the ``getattr`` default work here instead of raising. The key is
+    simply absent from the payload for such a project -- the honest
+    representation of "there is no brief" -- rather than sent as a null.
     """
     brief = getattr(project, 'brief', None)
     if brief is None:
