@@ -33,7 +33,7 @@ it, and the audit log has to exist before the mutations that record through it.
 | WP17 | Plans, `Entitlements`, `UsageCounter`, enforcement (§11) | **done** |
 | WP18 | Integration seams (§12) | **done** |
 | WP19 | `docs/DECISIONS.md` (§13) | **done** |
-| WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | **partial** — composable + task panel done; remaining views outstanding |
+| WP20 | Frontend consolidation: `useProjectAccess`, regenerated types (§ throughout) | **done** for project access — `lib/projectPermissions.ts` deleted; event permissions still predate WP13's audience matrix, see the WP20 entry |
 | WP21 | Owner-with-no-membership backfill, then delete every "owner might have no profile" branch (§10) | **done** |
 | WP22 | Company context returns the membership, accepts an explicit company id (§10) | **done** |
 | WP23 | `docs/MONETIZATION_PLAN.md` + README authorization/audit sections (DEFINITION OF DONE) | **done** |
@@ -2050,6 +2050,98 @@ field, catalog-reference validation and tenant isolation, completeness
 scoring including the whitespace/empty-body edge cases), 3 added to
 `test_context.py` (a real brief's prose fields reach the AI payload; `body`
 never does).
+
+---
+
+## WP20 (completion) — the last two project-permission call sites
+
+Finishing what the earlier WP20 pass left: the composable and
+`TaskDetailPanel.vue` were already done, and `lib/projectPermissions.ts` was
+kept alive "until the remaining views move across". They have now moved, and
+it is deleted.
+
+### The two that were left were the two that mattered
+
+An audit found only **two** live callers of the stale rules, not the twenty
+the file count suggested:
+
+- `views/Dashboard/ProjectsView.vue` → `canManageProject(...)`, driving
+  `canManageSelectedProject`, which gates the project detail panel's entire
+  edit surface.
+- `components/projects/TaskInfoSidebar.vue` → `canManageTask(...)`, driving
+  `canReassign`.
+
+Everything else that "imported" `projectPermissions` turned out to reference
+it only in comments. `usePermissions()` re-exported `canManageProject`/
+`canManageTask` as methods, but **nothing anywhere called them** -- dead
+code carrying a wrong rule, which is the worst combination: invisible until
+somebody reaches for it.
+
+### Why this was a real defect, not a tidy-up
+
+`canManageProject` still granted management on `project.createdById`, and
+`canManageTask` on `task.createdById`. The backend stopped doing both when
+`created_by` became provenance rather than a standing claim (WP3/WP4 for
+projects, WP7a for tasks). It also had no concept of `ProjectMembership` at
+all -- the mechanism that replaced co-ownership in WP4.
+
+So the client was wrong in both directions at once: it offered edit controls
+to a project's original creator, who would then take a 403 on save; and it
+hid them from a `ProjectMembership(role="manager")` holder, who was entitled
+to them and had no way to reach them. Both now read `project.accessLevel`,
+which is `resolve_project_access`'s own answer, reported by the server.
+
+`usePermissions()` keeps the questions that genuinely belong to it -- the
+company-role axis (`isDL`, `isAdmin`, `can(code)`, `isMemberRowLocked`).
+Those are a different question from project-scoped access and were never the
+thing that drifted.
+
+### Deliberately not touched: `canManageEvent`
+
+`lib/eventPermissions.ts` is stale in the same way -- organizer / company
+admin / DL-of-own-department, with no idea that WP13 gave events an
+`audience`, that `personal` has **no administrative override**, or that
+membership is checked before the organizer branch. Unlike the project
+functions, it has two live callers (`EventCard.vue`,
+`EventDetailView.vue`), so deleting it would break working UI.
+
+Left alone on purpose. Fixing it properly means either mirroring the whole
+five-value audience matrix client-side -- the exact "second source of truth
+that goes stale" mistake this package exists to undo -- or, better, having
+the events API report a per-event access flag the way projects now report
+`accessLevel`, and reading that. That is a backend change plus a frontend
+change, and it belongs with WP13's frontend work rather than being rushed in
+here.
+
+### Checks
+
+`vue-tsc --noEmit` clean apart from the one pre-existing `authStore.ts`
+error already on record. **31 frontend tests pass** across 5 files.
+
+The first `vitest run` failed outright with `Timeout waiting for worker to
+respond` on every file -- an infrastructure failure, not a code one:
+vitest's parallel worker pool does not cope with this workspace's path
+(spaces and commas, URL-encoded in the stack traces) under load.
+`vitest run --no-file-parallelism` runs the same suite green in ~2 minutes.
+Worth knowing before anybody debugs a "broken" frontend suite that is not
+broken.
+
+### A concurrent session committed this work
+
+Worth recording because the history reads oddly. These edits were made in
+the working tree while another session was active in the same repo. That
+session committed everything present at the time as
+`9d5db4e "feat:landing package enhancement"` and fast-forwarded `main`,
+`develop` and `hot-fix` onto it.
+
+The code is intact and correct -- verified after the fact: the file is
+deleted, both call sites read `accessLevel`, tests and type-check pass. But
+the WP20 changes are attributed to a landing-page commit and were never
+reviewable on their own. The standing rule already in memory ("diff against
+the last commit before committing; another session may be editing the same
+files") needs its converse too: **check `git branch --show-current` and
+`git status` before *and* after a long-running command in a shared repo,**
+because the branch can move underneath an uncommitted change.
 
 ---
 
