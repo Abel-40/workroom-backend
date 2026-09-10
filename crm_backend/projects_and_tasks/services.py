@@ -178,25 +178,53 @@ async def user_can_delete_time_log(user, log, task) -> bool:
     return await user_can_manage_task(user, task)
 
 
-async def user_can_approve_task(user, task) -> bool:
-    """Who may approve/reject a task's submitted evidence: the task's
-    creator, or -- if that creator has since left the company (created_by
-    is NULL after SET_NULL) -- the project's current owner, then the
-    project's own creator.
+async def user_can_approve_task(user, task, *, submitted_by_id=None) -> bool:
+    """Who may approve/reject a task's submitted evidence.
 
-    The fallback chain is unchanged. What is added is that whoever it lands on
-    must still be an active member of the company: approving work is a
-    company action, and a reference left behind by someone who has gone must
-    not authorize it.
+    The chain is **task creator -> project owner -> project creator**, in that
+    order, and is preserved exactly. A link is skipped for two reasons:
+
+    1. it is missing -- ``created_by``/``current_owner`` go NULL (SET_NULL)
+       when that person's User row is removed; and
+    2. **it is the person who submitted the work** (R5).
+
+    (2) is the separation-of-duties rule. Anyone who can create a task, assign
+    it to themselves and submit evidence for it could otherwise sign it off
+    too, which makes the whole approval step decorative for exactly the person
+    it should bind.
+
+    Refusing outright is not the answer either: a project with one manager who
+    is also doing the work would have tasks that can never reach Done by any
+    route -- the same dead end WP5 removed from late submission. So the
+    submitter is skipped *while somebody else in the chain can act*, and is
+    allowed only once the chain is exhausted. That case is recorded rather
+    than hidden; see ``approve_task``.
+
+    ``submitted_by_id`` is optional so that callers asking the general
+    question ("may this person approve things here?") get the pre-R5 answer;
+    the approve/reject paths, which know who submitted, pass it and get the
+    separation-of-duties answer.
+
+    Whoever it lands on must still be an active member of the company:
+    approving work is a company action, and a reference left behind by
+    somebody who has gone must not authorize it.
     """
     if not await is_company_member(user, task.project.company):
         return False
-    if task.created_by_id is not None:
-        return task.created_by_id == user.id
     project = task.project
-    if project.current_owner_id is not None:
-        return project.current_owner_id == user.id
-    return project.created_by_id == user.id
+    skipped_self = False
+    for candidate_id in (task.created_by_id, project.current_owner_id, project.created_by_id):
+        if candidate_id is None:
+            continue
+        if submitted_by_id is not None and candidate_id == submitted_by_id:
+            skipped_self = True
+            continue
+        return candidate_id == user.id
+    # Every remaining link was the submitter. Allowing them through is the
+    # lesser evil, and only here -- note this stays False when the chain was
+    # empty for the *other* reason (all links NULL), which is unapprovable by
+    # anybody, exactly as before.
+    return skipped_self and user.id == submitted_by_id
 
 
 async def user_can_extend_deadline(user, project) -> bool:
@@ -1725,13 +1753,15 @@ async def approve_task(user, task):
     """Approver-only (see user_can_approve_task). Sets the task Done and
     auto-completes the parent project when eligible. Returns (task, error)
     where error is 'forbidden', 'no_pending_approval', or None."""
-    if not await user_can_approve_task(user, task):
-        return None, 'forbidden'
+    # The pending submission is fetched before the authority check, because
+    # who submitted it is part of that check now (R5).
     approval = await TaskApproval.objects.filter(
         task=task, status=TaskApproval.STATUS.PENDING,
     ).order_by('-submitted_at').afirst()
     if approval is None:
         return None, 'no_pending_approval'
+    if not await user_can_approve_task(user, task, submitted_by_id=approval.submitted_by_id):
+        return None, 'forbidden'
 
     approval.status = TaskApproval.STATUS.APPROVED
     approval.decided_by = user
@@ -1743,7 +1773,19 @@ async def approve_task(user, task):
 
     await arecord_event(
         company=task.project.company, actor=user, action=AuditAction.TASK_APPROVED, target=task,
-        before={'status': Task.STATUS.IN_REVIEW}, after={'status': Task.STATUS.DONE, 'approval': approval.pk},
+        before={'status': Task.STATUS.IN_REVIEW},
+        after={
+            'status': Task.STATUS.DONE, 'approval': approval.pk,
+            # True only where the chain held nobody but the submitter. Worth a
+            # field of its own: it is the one case where the approval step did
+            # not actually separate anybody from their own work, and the row
+            # is the only place that fact survives.
+            'self_approved': approval.submitted_by_id == user.id,
+        },
+        reason=(
+            'Approved by the submitter -- no other approver in the chain'
+            if approval.submitted_by_id == user.id else ''
+        ),
     )
     await sync_to_async(notify_task_approved, thread_sensitive=True)(approval)
     await sync_to_async(_maybe_auto_complete_project, thread_sensitive=True)(task.project)
@@ -1757,15 +1799,15 @@ async def reject_task_approval(user, task, comment: str):
     In Progress so the assignee can rework and resubmit. Returns
     (task, error) where error is 'forbidden', 'comment_required',
     'no_pending_approval', or None."""
-    if not await user_can_approve_task(user, task):
-        return None, 'forbidden'
-    if not comment or not comment.strip():
-        return None, 'comment_required'
     approval = await TaskApproval.objects.filter(
         task=task, status=TaskApproval.STATUS.PENDING,
     ).order_by('-submitted_at').afirst()
     if approval is None:
         return None, 'no_pending_approval'
+    if not await user_can_approve_task(user, task, submitted_by_id=approval.submitted_by_id):
+        return None, 'forbidden'
+    if not comment or not comment.strip():
+        return None, 'comment_required'
 
     approval.status = TaskApproval.STATUS.REJECTED
     approval.decided_by = user

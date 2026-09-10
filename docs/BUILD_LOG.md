@@ -2145,6 +2145,119 @@ because the branch can move underneath an uncommitted change.
 
 ---
 
+## Follow-up pass — closing R5, R7, and the last stale client rules
+
+Four things that were each recorded as "known, deferred" rather than fixed.
+None of them were new work packages; all four were debts this session's own
+notes were carrying.
+
+### R5 — nobody signs off their own work while somebody else can
+
+`user_can_approve_task` resolved to exactly one person: the task's creator,
+falling back to the project owner and then the project creator only when a
+link was NULL. Anyone who could create a task, assign it to themselves and
+submit evidence could then approve it, which makes the approval step
+decorative for precisely the person it should bind.
+
+The chain is **preserved exactly** (PRESERVE EXACTLY names it), in the same
+order. One condition is added to the existing skip: a link is now skipped
+when it is missing *or when it is the person who submitted*.
+
+The reason this needed a decision rather than a guard is the dead end. A flat
+"the submitter may never approve" strands any project whose only manager is
+also doing the work -- the task can never reach Done by any route, which is
+the same trap WP5 removed from late submission. So:
+
+- another link available → the submitter is refused (403), and that link
+  approves instead;
+- chain exhausted because every remaining link *is* the submitter → allowed,
+  and the audit row records `self_approved: true` with a reason. It is the
+  one case where the approval step separated nobody from their own work, and
+  the row is the only place that fact survives.
+
+The other way a chain can empty -- every link NULL because those users were
+deleted -- stays unapprovable by anybody, exactly as before. The last-resort
+branch is deliberately conditional on having skipped the submitter, not on
+the chain merely being empty, so it cannot quietly widen that case. There is
+a test for precisely that.
+
+Both `approve_task` and `reject_task_approval` now fetch the pending
+submission *before* the authority check, because who submitted is part of
+that check. Rejection is included on purpose: withdrawing your own work from
+review unilaterally is the same conflict wearing a different hat.
+
+`user_can_approve_task(user, task)` without the new keyword still answers the
+general question ("may this person approve things here?") the pre-R5 way, so
+the characterization matrix and the notification helper are unaffected.
+
+**10 tests** in `projects_and_tasks/test_self_approval.py`.
+
+### R7 — a test that failed for six hours out of every twenty-four
+
+`todos/test_ai_generation.py` built its fixture task with
+`deadline = timezone.now() + timedelta(hours=6)`. Between roughly 18:00 and
+23:59 in the requester's timezone that lands on *tomorrow*, `today` mode's
+eligibility window comes back empty, and sixteen tests fail with 400 where
+they expect 202.
+
+Anchored to noon on a known day (`midday_for(user, day)`) instead of an
+offset from `now()`. Noon rather than end-of-day because §9's window includes
+work that is already overdue, so the hour never matters -- only the date
+does, and now the date is chosen rather than inherited from the clock.
+
+### Events: the server now says who may manage each one
+
+`lib/eventPermissions.ts` mirrored `user_can_manage_event` in TypeScript and
+had gone stale: it knew nothing about WP13's `audience`, including that a
+`personal` event has **no administrative override**, and it checked the
+organizer before company membership.
+
+Rather than re-mirroring a five-value matrix on the client -- the exact
+second-source-of-truth mistake WP20 had just finished undoing for projects --
+the event payload now carries `can_manage`, computed by the same service the
+endpoints use.
+
+Resolved **once per request, not once per row**:
+`can_manage_event_with_context` takes an already-resolved `CompanyContext`,
+so a fifty-event calendar page costs one context lookup rather than fifty.
+`user_can_manage_event` is now a thin async wrapper over it.
+
+`eventPermissions.ts` is deleted, both call sites read the flag, and
+`usePermissions()` -- which had already lost its project functions -- keeps
+only the company-role questions that genuinely belong to it. A test asserts
+the flag and the delete endpoint agree for the same actor, because a flag
+that disagrees with the server is worse than no flag.
+
+### Two frontend defects found while checking the above
+
+**A case-only import mismatch that would break Linux CI.**
+`router/index.ts` imported `@/views/landing/LandingPage.vue` against a
+directory actually named `Landing`. It resolves on Windows and macOS, so
+nothing noticed -- but TypeScript registered the module under two spellings
+(TS1261 across every landing component), and on a case-sensitive filesystem,
+which is what CI and any Linux container are, it would not resolve at all.
+
+**`ApiResponse.errors` described a shape the server never sends.** It was
+typed `Record<string, string[]> | string[]`, while every consumer declares
+`errors?: Record<string, string[]>` -- an unassignable union, and the source
+of the one type error that had been sitting on record as "pre-existing" all
+session. Checked before changing: all ~80 `errors=` call sites in the backend
+pass a dict, and the envelope schema types it `dict[str, Any] | None`. The
+`| string[]` half was simply wrong, so it is gone rather than papered over at
+the call sites.
+
+**`vue-tsc --noEmit` is now completely clean** -- zero errors, first time this
+branch. `vite build` succeeds. 31 frontend tests pass.
+
+### Note on running the frontend suite
+
+`npx vitest run` fails outright here with `Timeout waiting for worker to
+respond` on every file -- vitest's parallel worker pool does not cope with
+this workspace's path (spaces and commas). It is an infrastructure failure,
+not a broken suite. Use `npx vitest run --no-file-parallelism`.
+
+---
+
 ## Test gate in use
 
 Per commit: the affected app's tests, plus `makemigrations --check --dry-run`,
@@ -2246,7 +2359,16 @@ The prompt cites `docs/workroom-v1-reference.md`. The file in the workspace is
 committed to any repo. Using it in place; not copying a 180 KB PDF into the
 repo without being asked.
 
-### R5 — A manager can approve their own submitted work
+### R5 — RESOLVED: the submitter is skipped while somebody else can act
+
+**Decided 2026-09-10.** The chain is preserved exactly and gains one skip
+condition: a link that *is* the submitter is passed over, and self-approval
+is permitted only once the chain holds nobody else -- recorded on the audit
+row when it happens. See the "Follow-up pass" entry above for why refusing
+outright was not an option (it strands a project whose only manager is also
+doing the work). Original analysis follows.
+
+#### Original analysis
 
 Not introduced here, and not fixed here: `user_can_approve_task` resolves to
 `task.created_by` (then `current_owner`, then the project's creator) and never
@@ -2300,7 +2422,12 @@ names the branch explicitly.
 predating this work. Not touching them; frontend work starts from a clean tree
 or from an explicit instruction about what to do with those changes.
 
-### R7 — `todos/test_ai_generation.py` is time-of-day flaky, pre-existing
+### R7 — RESOLVED: fixture anchored to a known day
+
+**Fixed 2026-09-10.** `midday_for(user, day)` replaces the
+`now() + 6h` offset. Original analysis follows.
+
+#### Original analysis
 
 Discovered running WP11's full suite: 16 failures, all `400 != 202` on
 `POST /todos/generate/`. Reproduced identically with every WP11 change
